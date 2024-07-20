@@ -27,11 +27,13 @@ type ComposeFile struct {
 }
 
 type ComposeService struct {
-	Image       string      `yaml:"image"`
-	Environment []string    `yaml:"environment,omitempty"`
-	Ports       []string    `yaml:"ports,omitempty"`
-	Volumes     []string    `yaml:"volumes,omitempty"`
-	HealthCheck HealthCheck `yaml:"healthcheck,omitempty"`
+	Image       string            `yaml:"image"`
+	Environment []string          `yaml:"environment,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"`
+	Volumes     []string          `yaml:"volumes,omitempty"`
+	Command     []string          `yaml:"command,omitempty"`
+	Labels      map[string]string `yaml:"labels,omitempty"`
+	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 }
 
 type HealthCheck struct {
@@ -180,28 +182,6 @@ func areContainersRunning(cli *client.Client, serviceName string) bool {
 	return len(containers) > 0
 }
 
-func isImageTagDifferent(cli *client.Client, serviceName, imageTag string) bool {
-	ctx := context.Background()
-	filter := filters.NewArgs()
-	filter.Add("name", serviceName)
-
-	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{Filters: filter})
-	if err != nil {
-		log.Printf("Failed to list containers: %v", err)
-		return false
-	}
-
-	for _, container := range containers {
-		log.Printf("Found existing container %s with image tag: %s", container.ID, container.Image)
-		log.Printf("New image tag: %s", imageTag)
-		if container.Image != imageTag {
-			return true
-		}
-	}
-
-	return false
-}
-
 func deployService(cli *client.Client, serviceName, repoDir string, service ComposeService, scale int) error {
 	ctx := context.Background()
 
@@ -214,12 +194,14 @@ func deployService(cli *client.Client, serviceName, repoDir string, service Comp
 
 	latestImageTag := service.Image
 	containersToRemove := []string{}
+	containersFound := false
 
 	// Inspect existing containers and determine which to remove
 	for _, container := range existingContainers {
 		if !containsServiceName(container.Names, serviceName) {
 			continue
 		}
+		containersFound = true
 
 		log.Printf("Found existing container %s with image tag: %s", container.ID, container.Image)
 		log.Printf("New image tag: %s", latestImageTag)
@@ -243,8 +225,23 @@ func deployService(cli *client.Client, serviceName, repoDir string, service Comp
 		}
 	}
 
-	// Create and start new containers
-	if len(containersToRemove) != 0 {
+	// If no containers were found, it's the first deployment
+	if !containersFound {
+		log.Printf("No existing containers found, deploying service %s for the first time", serviceName)
+		for i := 0; i < scale; i++ {
+			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
+			err := createAndStartContainer(ctx, cli, instanceName, repoDir, service)
+			if err != nil {
+				return err
+			}
+			log.Printf("Waiting for health check to complete for new container %s", instanceName)
+			err = waitForHealthCheck(ctx, cli, instanceName)
+			if err != nil {
+				return fmt.Errorf("health check failed for new container %s: %w", instanceName, err)
+			}
+			log.Printf("New container %s created and started successfully", instanceName)
+		}
+	} else if len(containersToRemove) > 0 {
 		log.Printf("Creating and starting new containers for service: %s", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
@@ -322,8 +319,10 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 	log.Printf("Creating container %s with image %s", name, service.Image)
 
 	containerConfig := &container.Config{
-		Image: service.Image,
-		Env:   service.Environment,
+		Image:  service.Image,
+		Env:    service.Environment,
+		Labels: service.Labels,
+		Cmd:    service.Command,
 	}
 
 	// Add health check if it's defined
