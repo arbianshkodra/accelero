@@ -1,0 +1,6 @@
+curl -X POST http://localhost:8000/webhook -H "Content-Type: application/json" -d '{"text": "New Docker image has been pushed"}'
+
+change docker image and then
+docker compose up -d --no-deps --scale web=2 --no-recreate web
+
+export $(grep -v '^#' dev.env | xargs)
