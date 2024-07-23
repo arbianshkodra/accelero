@@ -24,6 +24,12 @@ import (
 type ComposeFile struct {
 	Version  string                    `yaml:"version"`
 	Services map[string]ComposeService `yaml:"services"`
+	Networks map[string]ComposeNetwork `yaml:"networks,omitempty"`
+}
+
+type ComposeNetwork struct {
+	Driver     string            `yaml:"driver,omitempty"`
+	DriverOpts map[string]string `yaml:"driver_opts,omitempty"`
 }
 
 type ComposeService struct {
@@ -34,6 +40,7 @@ type ComposeService struct {
 	Command     []string          `yaml:"command,omitempty"`
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
+	Networks    []string          `yaml:"networks,omitempty"`
 }
 
 type HealthCheck struct {
@@ -83,6 +90,15 @@ func RunDockerCompose(repoDir string) error {
 	}
 	log.Printf("Created Docker client")
 
+	// Create networks
+	for netName, netConfig := range composeFile.Networks {
+		log.Printf("Creating network %s with config %+v", netName, netConfig)
+		err := createNetwork(cli, netName, netConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create network %s: %w", netName, err)
+		}
+	}
+
 	for _, serviceName := range servicesToDeploy {
 		service, exists := composeFile.Services[serviceName]
 		if !exists {
@@ -109,6 +125,38 @@ func RunDockerCompose(repoDir string) error {
 		}
 	}
 
+	return nil
+}
+
+func createNetwork(cli *client.Client, name string, config ComposeNetwork) error {
+	ctx := context.Background()
+
+	// Check if the network already exists
+	existingNetworks, err := cli.NetworkList(ctx, types.NetworkListOptions{})
+	if err != nil {
+		log.Printf("Failed to list networks: %v", err)
+		return err
+	}
+
+	for _, net := range existingNetworks {
+		if net.Name == name {
+			log.Printf("Network %s already exists, skipping creation", name)
+			return nil
+		}
+	}
+
+	networkCreate := types.NetworkCreate{
+		Driver:  config.Driver,
+		Options: config.DriverOpts,
+	}
+
+	_, err = cli.NetworkCreate(ctx, name, networkCreate)
+	if err != nil {
+		log.Printf("Failed to create network %s: %v", name, err)
+		return err
+	}
+
+	log.Printf("Successfully created network: %s", name)
 	return nil
 }
 
@@ -341,14 +389,20 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 		Binds:        service.Volumes,
 	}
 
-	networkConfig := &network.NetworkingConfig{}
+	networkingConfig := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{},
+	}
 
-	log.Printf("Creating container with config: %+v, hostConfig: %+v", containerConfig, hostConfig)
+	for _, net := range service.Networks {
+		networkingConfig.EndpointsConfig[net] = &network.EndpointSettings{}
+	}
+
+	log.Printf("Creating container with config: %+v, hostConfig: %+v, networkingConfig: %+v", containerConfig, hostConfig, networkingConfig)
 
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	resp, err := cli.ContainerCreate(ctxWithTimeout, containerConfig, hostConfig, networkConfig, nil, name)
+	resp, err := cli.ContainerCreate(ctxWithTimeout, containerConfig, hostConfig, networkingConfig, nil, name)
 	if err != nil {
 		log.Printf("Failed to create container: %v", err)
 		return fmt.Errorf("failed to create container: %w", err)
