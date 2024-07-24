@@ -2,7 +2,6 @@ services:
 
   traefik:
     image: traefik:v2.9
-    # container_name: traefik
     command:
       - "--api.insecure=true"
       - "--providers.docker=true"
@@ -13,7 +12,6 @@ services:
       # - "8080:8080"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      # - "/Users/arbianshkodra/.docker/run/docker.sock:/var/run/docker.sock:ro"
     # healthcheck:
     #   test: ["wget", "-q", "-O", "-", "http://localhost:80"]
     #   interval: 10s
