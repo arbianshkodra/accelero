@@ -449,10 +449,14 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 		}
 	}
 
+	portBindings, exposedPorts := mapPorts(service.Ports)
+
 	hostConfig := &container.HostConfig{
-		PortBindings: mapPorts(service.Ports),
+		PortBindings: portBindings,
 		Binds:        service.Volumes,
 	}
+
+	containerConfig.ExposedPorts = exposedPorts
 
 	networkingConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{},
@@ -491,18 +495,20 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 	return nil
 }
 
-func mapPorts(ports []string) nat.PortMap {
+func mapPorts(ports []string) (nat.PortMap, nat.PortSet) {
 	portMap := nat.PortMap{}
+	exposedPorts := nat.PortSet{}
 	for _, port := range ports {
 		hostPort, containerPort, _ := net.SplitHostPort(port)
-		portMap[nat.Port(containerPort+"/tcp")] = []nat.PortBinding{
-			{
-				HostIP:   "0.0.0.0",
-				HostPort: hostPort,
-			},
+		portBinding := nat.PortBinding{
+			HostIP:   "0.0.0.0",
+			HostPort: hostPort,
 		}
+		port := nat.Port(containerPort + "/tcp")
+		portMap[port] = append(portMap[port], portBinding)
+		exposedPorts[port] = struct{}{}
 	}
-	return portMap
+	return portMap, exposedPorts
 }
 
 func parseDuration(duration string) time.Duration {
