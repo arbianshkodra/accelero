@@ -32,15 +32,37 @@ type ComposeNetwork struct {
 	DriverOpts map[string]string `yaml:"driver_opts,omitempty"`
 }
 
+type EnvVars []string
+
+func (e *EnvVars) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw []string
+	if err := unmarshal(&raw); err == nil {
+		*e = raw
+		return nil
+	}
+
+	var rawMap map[string]string
+	if err := unmarshal(&rawMap); err == nil {
+		for k, v := range rawMap {
+			*e = append(*e, fmt.Sprintf("%s=%s", k, v))
+		}
+		return nil
+	}
+
+	return fmt.Errorf("failed to unmarshal environment variables")
+}
+
 type ComposeService struct {
 	Image       string            `yaml:"image"`
-	Environment []string          `yaml:"environment,omitempty"`
+	Environment EnvVars           `yaml:"environment,omitempty"`
+	EnvFile     []string          `yaml:"env_file,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
 	Command     []string          `yaml:"command,omitempty"`
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
+	DependsOn   []string          `yaml:"depends_on,omitempty"`
 }
 
 type HealthCheck struct {
@@ -104,6 +126,21 @@ func RunDockerCompose(repoDir string) error {
 		if !exists {
 			log.Printf("Service %s not defined in docker-compose.yaml, skipping", serviceName)
 			continue
+		}
+
+		// Deploy dependencies first
+		for _, dependency := range service.DependsOn {
+			dependentService, exists := composeFile.Services[dependency]
+			if !exists {
+				log.Printf("Dependent service %s not defined in docker-compose.yaml, skipping", dependency)
+				continue
+			}
+
+			log.Printf("Deploying dependent service: %s", dependency)
+			err := deployService(cli, dependency, repoDir, dependentService, 1)
+			if err != nil {
+				return fmt.Errorf("failed to deploy dependent service %s: %w", dependency, err)
+			}
 		}
 
 		log.Printf("Pulling image for service: %s", serviceName)
@@ -278,7 +315,7 @@ func deployService(cli *client.Client, serviceName, repoDir string, service Comp
 		log.Printf("No existing containers found, deploying service %s for the first time", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			err := createAndStartContainer(ctx, cli, instanceName, repoDir, service)
+			err := createAndStartContainer(ctx, cli, instanceName, repoDir, service, serviceName)
 			if err != nil {
 				return err
 			}
@@ -293,7 +330,7 @@ func deployService(cli *client.Client, serviceName, repoDir string, service Comp
 		log.Printf("Creating and starting new containers for service: %s", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			err := createAndStartContainer(ctx, cli, instanceName, repoDir, service)
+			err := createAndStartContainer(ctx, cli, instanceName, repoDir, service, serviceName)
 			if err != nil {
 				return err
 			}
@@ -363,12 +400,40 @@ func waitForHealthCheck(ctx context.Context, cli *client.Client, containerID str
 	}
 }
 
-func createAndStartContainer(ctx context.Context, cli *client.Client, name, repoDir string, service ComposeService) error {
+func loadEnvFiles(envFiles []string, repoDir string) ([]string, error) {
+	var envVars []string
+
+	for _, file := range envFiles {
+		filePath := file // filepath.Join(repoDir, file)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read env file %s: %w", filePath, err)
+		}
+
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			envVars = append(envVars, line)
+		}
+	}
+
+	return envVars, nil
+}
+
+func createAndStartContainer(ctx context.Context, cli *client.Client, name, repoDir string, service ComposeService, serviceName string) error {
 	log.Printf("Creating container %s with image %s", name, service.Image)
+
+	envVars, err := loadEnvFiles(service.EnvFile, repoDir)
+	if err != nil {
+		return err
+	}
+	envVars = append(envVars, service.Environment...)
 
 	containerConfig := &container.Config{
 		Image:  service.Image,
-		Env:    service.Environment,
+		Env:    envVars,
 		Labels: service.Labels,
 		Cmd:    service.Command,
 	}
@@ -394,7 +459,9 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 	}
 
 	for _, net := range service.Networks {
-		networkingConfig.EndpointsConfig[net] = &network.EndpointSettings{}
+		networkingConfig.EndpointsConfig[net] = &network.EndpointSettings{
+			Aliases: []string{serviceName},
+		}
 	}
 
 	log.Printf("Creating container with config: %+v, hostConfig: %+v, networkingConfig: %+v", containerConfig, hostConfig, networkingConfig)
