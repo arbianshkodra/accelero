@@ -63,6 +63,15 @@ type ComposeService struct {
 	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
 	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	Restart     string            `yaml:"restart,omitempty"`
+}
+
+func getAllServices(composeFile ComposeFile) []string {
+	var services []string
+	for service := range composeFile.Services {
+		services = append(services, service)
+	}
+	return services
 }
 
 type HealthCheck struct {
@@ -74,16 +83,6 @@ type HealthCheck struct {
 }
 
 func RunDockerCompose(repoDir string) error {
-	// Retrieve the service names from the .env file
-	serviceNames := os.Getenv("SERVICE_NAMES")
-	if serviceNames == "" {
-		serviceNames = "web"
-	}
-	log.Printf("Services to deploy: %s", serviceNames)
-
-	// Split the service names into a slice
-	servicesToDeploy := splitServiceNames(serviceNames)
-
 	composePath := filepath.Join(repoDir, "docker-compose.yaml")
 	composeConfig, err := os.ReadFile(composePath)
 	if err != nil {
@@ -97,6 +96,15 @@ func RunDockerCompose(repoDir string) error {
 		return fmt.Errorf("failed to parse docker-compose file: %w", err)
 	}
 	log.Printf("Parsed docker-compose.yaml successfully")
+
+	// Retrieve the service names from the .env file
+	serviceNames := os.Getenv("SERVICE_NAMES")
+	if serviceNames == "" {
+		serviceNames = strings.Join(getAllServices(composeFile), ",")
+	}
+	log.Printf("Services to deploy: %s", serviceNames)
+
+	servicesToDeploy := splitServiceNames(serviceNames)
 
 	dockerSock := os.Getenv("DOCKER_SOCK")
 	if dockerSock == "" {
@@ -454,6 +462,13 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 	hostConfig := &container.HostConfig{
 		PortBindings: portBindings,
 		Binds:        service.Volumes,
+	}
+
+	// Handle the restart policy
+	if service.Restart != "" {
+		hostConfig.RestartPolicy = container.RestartPolicy{
+			Name: service.Restart,
+		}
 	}
 
 	containerConfig.ExposedPorts = exposedPorts
