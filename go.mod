@@ -1,4 +1,4 @@
-module accelero
+module github.com/arbianshkodra/accelero
 
 go 1.22.5
 
