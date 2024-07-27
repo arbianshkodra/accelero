@@ -1,11 +1,12 @@
 package handler
 
 import (
-	"accelero/internal/compose"
-	"accelero/internal/git"
 	"encoding/json"
 	"log"
 	"net/http"
+
+	"github.com/arbianshkodra/accelero/internal/compose"
+	"github.com/arbianshkodra/accelero/internal/git"
 )
 
 func Webhook(w http.ResponseWriter, r *http.Request) {
