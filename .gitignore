@@ -28,3 +28,6 @@ go.work.sum
 # Created new files
 data
 database
+
+# Environment variables
+envs/
