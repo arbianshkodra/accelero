@@ -1,10 +1,11 @@
 package main
 
 import (
-	"accelero/internal/handler"
 	"log"
 	"net/http"
 	"os"
+
+	"github.com/arbianshkodra/accelero/internal/handler"
 
 	"github.com/gorilla/mux"
 )
