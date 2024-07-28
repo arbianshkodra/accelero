@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"gopkg.in/yaml.v2"
@@ -218,15 +219,15 @@ func pullImage(cli *client.Client, image string) error {
 	// Check if Docker registry credentials are provided
 	username := os.Getenv("DOCKER_USERNAME")
 	password := os.Getenv("DOCKER_PASSWORD")
-	registry := os.Getenv("DOCKER_REGISTRY")
+	serverAddress := os.Getenv("DOCKER_REGISTRY")
 
-	var authConfig types.AuthConfig
+	var authConfig registry.AuthConfig
 	var authStr string
 	if username != "" && password != "" {
-		authConfig = types.AuthConfig{
+		authConfig = registry.AuthConfig{
 			Username:      username,
 			Password:      password,
-			ServerAddress: registry,
+			ServerAddress: serverAddress,
 		}
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
@@ -376,7 +377,8 @@ func containsServiceName(names []string, serviceName string) bool {
 
 func waitForHealthCheck(ctx context.Context, cli *client.Client, containerID string) error {
 	timeout := time.After(90 * time.Second)
-	tick := time.Tick(3 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop() // Ensure the ticker is stopped when the function exits
 
 	// Add a short delay to allow Docker to register the health check
 	time.Sleep(5 * time.Second)
@@ -385,7 +387,7 @@ func waitForHealthCheck(ctx context.Context, cli *client.Client, containerID str
 		select {
 		case <-timeout:
 			return fmt.Errorf("health check timeout for container %s", containerID)
-		case <-tick:
+		case <-ticker.C:
 			containerInfo, err := cli.ContainerInspect(ctx, containerID)
 			if err != nil {
 				return fmt.Errorf("failed to inspect container %s: %w", containerID, err)
