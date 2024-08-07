@@ -25,14 +25,14 @@ builds:
       - darwin
     goarch:
       - amd64
-      - 386
+      - '386'
       - arm
       - arm64
     ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
 
 checksum:
   name_template: 'checksums.txt'
-  
+
 archives:
   - 
     format: tar.gz
@@ -54,7 +54,48 @@ archives:
         format: zip
     files:
       - LICENSE.md
-      # - accelero
+
+dockers:
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/amd64" ]
+    goos: linux
+    goarch: amd64
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:amd64-{{.Version}}
+      - arbianshkodra/accelero:amd64-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/386" ]
+    goos: linux
+    goarch: '386'
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:386-{{.Version}}
+      - arbianshkodra/accelero:386-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/arm64" ]
+    goos: linux
+    goarch: arm64
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:arm64-{{.Version}}
+      - arbianshkodra/accelero:arm64-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/arm" ]
+    goos: linux
+    goarch: arm
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:arm-{{.Version}}
+      - arbianshkodra/accelero:arm-latest
 
 changelog:
   sort: asc
