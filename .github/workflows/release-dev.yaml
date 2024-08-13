@@ -58,8 +58,34 @@ jobs:
       - name: Manifest
         run: |
           export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest create arbianshkodra/accelero:$TAG \
+          docker manifest create \
+            arbianshkodra/accelero:$TAG \
             arbianshkodra/accelero:amd64-${TAG} \
             arbianshkodra/accelero:386-${TAG} \
             arbianshkodra/accelero:arm64-${TAG} \
             arbianshkodra/accelero:arm-${TAG}
+        - name: Annotation
+          run: |
+            export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
+            docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:i386-${TAG} --os linux --arch 386
+            docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm64-${TAG} --os linux --arch arm64
+            docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm-${TAG} --os linux --arch arm
+        - name: Create Latest Manifest
+          run: |
+            export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
+            docker manifest create arbianshkodra/accelero:latest \
+              arbianshkodra/accelero:amd64-latest \
+              arbianshkodra/accelero:i386-latest \
+              arbianshkodra/accelero:arm64-latest \
+              arbianshkodra/accelero:arm-latest
+        - name: Annotate Latest
+          run: |
+            export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
+            docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:i386-latest --os linux --arch 386
+            docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:arm64-latest --os linux --arch arm64
+            docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:arm-latest --os linux --arch arm
+        - name: Push Manifest
+          run: |
+            export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
+            docker manifest push arbianshkodra/accelero:$TAG
+            docker manifest push arbianshkodra/accelero:latest
