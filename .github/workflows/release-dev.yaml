@@ -57,7 +57,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       - name: Manifest
         run: |
-          TAG=$(git show-ref --tags -d | awk -v sha=$(git rev-parse HEAD) '$1 == sha {sub(/^refs\/tags\/v*/, "", $2); print $2}')
+          TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
           docker manifest create arbianshkodra/accelero:$TAG \
             arbianshkodra/accelero:amd64-${TAG} \
             arbianshkodra/accelero:386-${TAG} \
@@ -69,7 +69,7 @@ jobs:
           docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm-${TAG} --os linux --arch arm
       - name: Docker Push
         run: |
-          TAG=$(git show-ref --tags -d | awk -v sha=$(git rev-parse HEAD) '$1 == sha {sub(/^refs\/tags\/v*/, "", $2); print $2}')
+          TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
           docker push arbianshkodra/accelero:$TAG
           docker push arbianshkodra/accelero:amd64-${TAG}
           docker push arbianshkodra/accelero:386-${TAG}
