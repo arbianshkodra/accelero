@@ -82,3 +82,4 @@ jobs:
 			- name: Push Manifest for Latest
 				run: |
 					docker manifest push arbianshkodra/accelero:latest
+	
