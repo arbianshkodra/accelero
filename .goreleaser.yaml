@@ -1,0 +1,105 @@
+# This is an example .goreleaser.yml file with some sensible defaults.
+# Make sure to check the documentation at https://goreleaser.com
+
+# The lines below are called `modelines`. See `:help modeline`
+# Feel free to remove those if you don't want/need to use them.
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+  hooks:
+    # You may remove this if you don't use go modules.
+    - go mod tidy
+
+builds:
+  - 
+    main: ./cmd/main.go
+    binary: accelero
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - '386'
+      - arm
+      - arm64
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
+
+checksum:
+  name_template: 'checksums.txt'
+
+archives:
+  - 
+    format: tar.gz
+    # this name template makes the OS and Arch compatible with the results of `uname`.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}amd64
+      {{- else if eq .Arch "386" }}386
+      {{- else if eq .Arch "arm64" }}arm64
+      {{- else if eq .Arch "arm" }}arm
+      {{- else if eq .Arch "darwin" }}macOS
+      {{- else if eq .Arch "linux" }}linux
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE.md
+
+dockers:
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/amd64" ]
+    goos: linux
+    goarch: amd64
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:amd64-{{.Version}}
+      - arbianshkodra/accelero:amd64-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/386" ]
+    goos: linux
+    goarch: '386'
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:i386-{{.Version}}
+      - arbianshkodra/accelero:i386-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/arm64" ]
+    goos: linux
+    goarch: arm64
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:arm64-{{.Version}}
+      - arbianshkodra/accelero:arm64-latest
+  -
+    use: buildx
+    build_flag_templates: [ "--platform=linux/arm" ]
+    goos: linux
+    goarch: arm
+    goarm: ''
+    dockerfile: Dockerfile
+    image_templates:
+      - arbianshkodra/accelero:arm-{{.Version}}
+      - arbianshkodra/accelero:arm-latest
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
