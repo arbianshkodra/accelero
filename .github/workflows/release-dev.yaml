@@ -58,8 +58,7 @@ jobs:
       - name: Manifest
         run: |
           TAG=$(git show-ref --tags -d | awk -v sha=$(git rev-parse HEAD) '$1 == sha {sub(/^refs\/tags\/v*/, "", $2); print $2}')
-          docker manifest create \
-						arbianshkodra/accelero:$TAG \
+          docker manifest create arbianshkodra/accelero:$TAG \
             arbianshkodra/accelero:amd64-${TAG} \
             arbianshkodra/accelero:386-${TAG} \
             arbianshkodra/accelero:arm64-${TAG} \
