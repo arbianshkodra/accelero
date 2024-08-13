@@ -4,3 +4,5 @@ change docker image and then
 docker compose up -d --no-deps --scale web=2 --no-recreate web
 
 export $(grep -v '^#' dev.env | xargs)
+
+docker run --rm --name accelero -p 8000:8000 --env-file envs/dev/dev.env -v /var/run/docker.sock:/var/run/docker.sock accelero
