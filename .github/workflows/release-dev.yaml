@@ -3,7 +3,8 @@ name: Release Dev
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '**/v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -56,7 +57,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
       - name: Manifest
         run: |
-          TAG=$(git describe --tags --abbrev=0 | sed -e 's/^v//')
+          TAG=$(git show-ref --tags -d | awk -v sha=$(git rev-parse HEAD) '$1 == sha {sub(/^refs\/tags\/v*/, "", $2); print $2}')
           docker manifest create \
 						arbianshkodra/accelero:$TAG \
             arbianshkodra/accelero:amd64-${TAG} \
@@ -69,7 +70,7 @@ jobs:
           docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm-${TAG} --os linux --arch arm
       - name: Docker Push
         run: |
-          TAG=$(git describe --tags --abbrev=0 | sed -e 's/^v//')
+          TAG=$(git show-ref --tags -d | awk -v sha=$(git rev-parse HEAD) '$1 == sha {sub(/^refs\/tags\/v*/, "", $2); print $2}')
           docker push arbianshkodra/accelero:$TAG
           docker push arbianshkodra/accelero:amd64-${TAG}
           docker push arbianshkodra/accelero:386-${TAG}
