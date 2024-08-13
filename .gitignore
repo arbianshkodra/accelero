@@ -32,3 +32,5 @@ database
 # Environment variables
 envs/
 test.env
+dist/
+samples.env
