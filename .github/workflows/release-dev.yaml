@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - workflow-setup
+	tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '**/v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -54,3 +57,28 @@ jobs:
 				args: release --clean
 			env:
 				GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+		- name: Manifest
+			run: |
+				TAG=$(git describe --tags --first-parent --abbrev=7 --long --dirty --always | sed -e "s/^v//g")
+
+				docker manifest create arbianshkodra/accelero:$TAG \
+					arbianshkodra/accelero:amd64-${TAG} \
+					arbianshkodra/accelero:386-${TAG} \
+					arbianshkodra/accelero:arm64-${TAG} \
+					arbianshkodra/accelero:arm-${TAG}
+				
+				docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:amd64-${TAG} --os linux --arch amd64
+				docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:386-${TAG} --os linux --arch 386
+				docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm64-${TAG} --os linux --arch arm64
+				docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm-${TAG} --os linux --arch arm
+		- name: Docker Push
+			run: |
+				TAG=$(git describe --tags --first-parent --abbrev=7 --long --dirty --always | sed -e "s/^v//g")
+				docker push arbianshkodra/accelero:$TAG
+				docker push arbianshkodra/accelero:amd64-${TAG}
+				docker push arbianshkodra/accelero:386-${TAG}
+				docker push arbianshkodra/accelero:arm64-${TAG}
+				docker push arbianshkodra/accelero:arm-${TAG}
+		- name: Push Manifest for Latest
+			run: |
+				docker manifest push arbianshkodra/accelero:latest
