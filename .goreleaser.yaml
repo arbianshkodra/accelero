@@ -74,8 +74,8 @@ dockers:
     goarm: ''
     dockerfile: Dockerfile
     image_templates:
-      - arbianshkodra/accelero:386-{{.Version}}
-      - arbianshkodra/accelero:386-latest
+      - arbianshkodra/accelero:i386-{{.Version}}
+      - arbianshkodra/accelero:i386-latest
   -
     use: buildx
     build_flag_templates: [ "--platform=linux/arm64" ]
