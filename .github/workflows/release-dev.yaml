@@ -58,7 +58,8 @@ jobs:
       - name: Manifest
         run: |
           TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest create arbianshkodra/accelero:$TAG \
+          docker manifest create \
+						arbianshkodra/accelero:$TAG \
             arbianshkodra/accelero:amd64-${TAG} \
             arbianshkodra/accelero:386-${TAG} \
             arbianshkodra/accelero:arm64-${TAG} \
