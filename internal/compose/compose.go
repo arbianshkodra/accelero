@@ -2,7 +2,6 @@ package compose
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/utils"
 
 	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
 
@@ -27,16 +27,16 @@ func RunDockerCompose(repoDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read compose file: %w", err)
 	}
-	log.Printf("Read compose file from %s", composePath)
+	logrus.Infof("Read compose file from %s", composePath)
 
 	var composeFile ComposeFile
 	err = yaml.Unmarshal(composeConfig, &composeFile)
 	if err != nil {
 		return fmt.Errorf("failed to parse docker-compose file: %w", err)
 	}
-	log.Printf("Parsed docker-compose.yaml successfully")
+	logrus.Info("Parsed docker-compose.yaml successfully")
 
-	// Retrieve the service names from the .env file
+	// Retrieve the service names from the environment variable
 	serviceNames := os.Getenv("SERVICE_NAMES")
 	if serviceNames == "" {
 		serviceMap := make(map[string]interface{})
@@ -45,7 +45,7 @@ func RunDockerCompose(repoDir string) error {
 		}
 		serviceNames = strings.Join(utils.GetAllServices(serviceMap), ",")
 	}
-	log.Printf("Services to deploy: %s", serviceNames)
+	logrus.Infof("Services to deploy: %s", serviceNames)
 
 	servicesToDeploy := utils.SplitServiceNames(serviceNames)
 
@@ -61,13 +61,12 @@ func RunDockerCompose(repoDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create docker client: %w", err)
 	}
-	log.Printf("Created Docker client")
+	logrus.Info("Created Docker client")
 
 	// Create networks
 	for netName, netConfig := range composeFile.Networks {
-		log.Printf("Creating network %s with config %+v", netName, netConfig)
-		err := network.CreateNetwork(cli, netName, netConfig)
-		if err != nil {
+		logrus.Infof("Creating network %s with config %+v", netName, netConfig)
+		if err := network.CreateNetwork(cli, netName, netConfig); err != nil {
 			return fmt.Errorf("failed to create network %s: %w", netName, err)
 		}
 	}
@@ -75,7 +74,7 @@ func RunDockerCompose(repoDir string) error {
 	for _, serviceName := range servicesToDeploy {
 		svc, exists := composeFile.Services[serviceName]
 		if !exists {
-			log.Printf("Service %s not defined in docker-compose.yaml, skipping", serviceName)
+			logrus.Warnf("Service %s not defined in docker-compose.yaml, skipping", serviceName)
 			continue
 		}
 
@@ -83,33 +82,34 @@ func RunDockerCompose(repoDir string) error {
 		for _, dependency := range svc.DependsOn {
 			dependentService, exists := composeFile.Services[dependency]
 			if !exists {
-				log.Printf("Dependent service %s not defined in docker-compose.yaml, skipping", dependency)
+				logrus.Warnf("Dependent service %s not defined in docker-compose.yaml, skipping", dependency)
 				continue
 			}
 
-			log.Printf("Deploying dependent service: %s", dependency)
-			err := service.DeployService(cli, dependency, repoDir, dependentService, 1)
-			if err != nil {
+			logrus.Infof("Deploying dependent service: %s", dependency)
+			if err := service.DeployService(cli, dependency, repoDir, dependentService, 1); err != nil {
 				return fmt.Errorf("failed to deploy dependent service %s: %w", dependency, err)
 			}
 		}
 
-		log.Printf("Pulling image for service: %s", serviceName)
-		err := service.PullImage(cli, svc.Image)
-		if err != nil {
+		logrus.Infof("Pulling image for service: %s", serviceName)
+		if err := service.PullImage(cli, svc.Image); err != nil {
 			return fmt.Errorf("failed to pull image for service %s: %w", serviceName, err)
 		}
 
-		isFirstDeployment := !service.AreContainersRunning(cli, serviceName)
-		err = service.DeployService(cli, serviceName, repoDir, svc, 1)
+		isFirstDeployment, err := service.AreContainersRunning(cli, serviceName)
 		if err != nil {
-			return fmt.Errorf("failed to deploy service: %w", err)
+			return fmt.Errorf("failed to check if containers are running for service %s: %w", serviceName, err)
 		}
 
-		if isFirstDeployment {
-			log.Printf("Deployed %s for the first time", serviceName)
+		if err := service.DeployService(cli, serviceName, repoDir, svc, 1); err != nil {
+			return fmt.Errorf("failed to deploy service %s: %w", serviceName, err)
+		}
+
+		if !isFirstDeployment {
+			logrus.Infof("Deployed %s for the first time", serviceName)
 		} else {
-			log.Printf("Updated %s with new container", serviceName)
+			logrus.Infof("Updated %s with new container", serviceName)
 		}
 	}
 
