@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,12 +13,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func CloneRepo(dir string) error {
+func CloneRepo(ctx context.Context, dir string) error {
 	repoURL := os.Getenv("REPO_URL")
 	username := os.Getenv("REPO_USERNAME")
 	token := os.Getenv("REPO_TOKEN")
 	branch := os.Getenv("REPO_BRANCH")
 	composePath := os.Getenv("COMPOSE_PATH")
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("clone operation canceled")
+	default:
+	}
 
 	cloneOptions := &git.CloneOptions{
 		URL: repoURL,

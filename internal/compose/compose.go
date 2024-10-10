@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ type ComposeFile struct {
 	Networks map[string]network.ComposeNetwork `yaml:"networks,omitempty"`
 }
 
-func RunDockerCompose(repoDir string) error {
+func RunDockerCompose(ctx context.Context, repoDir string) error {
 	composePath := filepath.Join(repoDir, "docker-compose.yaml")
 	composeConfig, err := os.ReadFile(composePath)
 	if err != nil {
