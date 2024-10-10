@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
 )
 
 type ComposeService struct {
@@ -51,8 +51,7 @@ func PullImage(cli *client.Client, image string) error {
 		}
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
-			log.Printf("Failed to encode auth config: %v", err)
-			return err
+			return fmt.Errorf("failed to encode auth config: %w", err)
 		}
 		authStr = base64.URLEncoding.EncodeToString(encodedJSON)
 	}
@@ -64,13 +63,12 @@ func PullImage(cli *client.Client, image string) error {
 
 	out, err := cli.ImagePull(ctx, image, options)
 	if err != nil {
-		log.Printf("Error pulling image %s: %v", image, err)
-		return err
+		return fmt.Errorf("error pulling image %s: %w", image, err)
 	}
 	defer out.Close()
 
 	// Read the output to ensure the image is pulled
-	buf := make([]byte, 8)
+	buf := make([]byte, 1024)
 	for {
 		_, err := out.Read(buf)
 		if err != nil {
@@ -78,22 +76,21 @@ func PullImage(cli *client.Client, image string) error {
 		}
 	}
 
-	log.Printf("Successfully pulled image: %s", image)
+	logrus.Infof("Successfully pulled image: %s", image)
 	return nil
 }
 
-func AreContainersRunning(cli *client.Client, serviceName string) bool {
+func AreContainersRunning(cli *client.Client, serviceName string) (bool, error) {
 	ctx := context.Background()
 	filter := filters.NewArgs()
 	filter.Add("name", serviceName)
 
 	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{Filters: filter})
 	if err != nil {
-		log.Printf("Failed to list containers: %v", err)
-		return false
+		return false, fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	return len(containers) > 0
+	return len(containers) > 0, nil
 }
 
 func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeService, scale int) error {
@@ -104,10 +101,10 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
-	log.Printf("Found %d existing containers", len(existingContainers))
+	logrus.Debugf("Found %d existing containers", len(existingContainers))
 
 	latestImageTag := svc.Image
-	containersToRemove := []string{}
+	var containersToRemove []string
 	containersFound := false
 
 	// Inspect existing containers and determine which to remove
@@ -117,80 +114,74 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 		}
 		containersFound = true
 
-		log.Printf("Found existing container %s with image tag: %s", container.ID, container.Image)
-		log.Printf("New image tag: %s", latestImageTag)
+		logrus.Infof("Found existing container %s with image tag: %s", container.ID, container.Image)
+		logrus.Infof("New image tag: %s", latestImageTag)
 
 		containerInfo, err := cli.ContainerInspect(ctx, container.ID)
 		if err != nil {
-			return fmt.Errorf("failed to inspect container: %w", err)
+			return fmt.Errorf("failed to inspect container %s: %w", container.ID, err)
 		}
 
 		if container.Image != latestImageTag {
-			log.Printf("Preparing to remove existing container %s with outdated image tag", container.ID)
+			logrus.Infof("Preparing to remove existing container %s with outdated image tag", container.ID)
 			containersToRemove = append(containersToRemove, container.ID)
 		} else if containerInfo.State.Health != nil && containerInfo.State.Health.Status != "healthy" {
-			log.Printf("Waiting for health check to complete for container %s", container.ID)
-			err := utils.WaitForHealthCheck(ctx, cli, container.ID)
-			if err != nil {
+			logrus.Infof("Waiting for health check to complete for container %s", container.ID)
+			if err := utils.WaitForHealthCheck(ctx, cli, container.ID); err != nil {
 				return fmt.Errorf("health check failed for container %s: %w", container.ID, err)
 			}
 		} else {
-			log.Printf("Existing container %s has the same image tag, no action needed", container.ID)
+			logrus.Infof("Existing container %s has the same image tag, no action needed", container.ID)
 		}
 	}
 
 	// If no containers were found, it's the first deployment
 	if !containersFound {
-		log.Printf("No existing containers found, deploying service %s for the first time", serviceName)
+		logrus.Infof("No existing containers found, deploying service %s for the first time", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName)
-			if err != nil {
-				return err
+			if err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
+				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
-			log.Printf("Waiting for health check to complete for new container %s", instanceName)
-			err = utils.WaitForHealthCheck(ctx, cli, instanceName)
-			if err != nil {
+			logrus.Infof("Waiting for health check to complete for new container %s", instanceName)
+			if err := utils.WaitForHealthCheck(ctx, cli, instanceName); err != nil {
 				return fmt.Errorf("health check failed for new container %s: %w", instanceName, err)
 			}
-			log.Printf("New container %s created and started successfully", instanceName)
+			logrus.Infof("New container %s created and started successfully", instanceName)
 		}
 	} else if len(containersToRemove) > 0 {
-		log.Printf("Creating and starting new containers for service: %s", serviceName)
+		logrus.Infof("Creating and starting new containers for service: %s", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName)
-			if err != nil {
-				return err
+			if err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
+				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
-			log.Printf("Waiting for health check to complete for new container %s", instanceName)
-			err = utils.WaitForHealthCheck(ctx, cli, instanceName)
-			if err != nil {
+			logrus.Infof("Waiting for health check to complete for new container %s", instanceName)
+			if err := utils.WaitForHealthCheck(ctx, cli, instanceName); err != nil {
 				return fmt.Errorf("health check failed for new container %s: %w", instanceName, err)
 			}
-			log.Printf("New container %s created and started successfully", instanceName)
+			logrus.Infof("New container %s created and started successfully", instanceName)
 		}
 
 		for _, containerID := range containersToRemove {
-			log.Printf("Removing container %s", containerID)
-			err := cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
-			if err != nil {
-				return fmt.Errorf("failed to remove container: %w", err)
+			logrus.Infof("Removing container %s", containerID)
+			if err := cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true}); err != nil {
+				return fmt.Errorf("failed to remove container %s: %w", containerID, err)
 			}
 		}
 	} else {
-		log.Printf("No existing containers with outdated image tags found, no action needed")
+		logrus.Info("No existing containers with outdated image tags found, no action needed")
 	}
 
 	return nil
 }
 
 func createAndStartContainer(ctx context.Context, cli *client.Client, name, repoDir string, svc ComposeService, serviceName string) error {
-	log.Printf("Creating container %s with image %s", name, svc.Image)
+	logrus.Infof("Creating container %s with image %s", name, svc.Image)
 
 	envVars, err := utils.LoadEnvFiles(svc.EnvFile, repoDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load environment files: %w", err)
 	}
 	envVars = append(envVars, svc.Environment...)
 
@@ -238,29 +229,27 @@ func createAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 		}
 	}
 
-	log.Printf("Creating container with config: %+v, hostConfig: %+v, networkingConfig: %+v", containerConfig, hostConfig, networkingConfig)
+	// logrus.Debugf("Creating container with config: %+v, hostConfig: %+v, networkingConfig: %+v", containerConfig, hostConfig, networkingConfig)
 
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	resp, err := cli.ContainerCreate(ctxWithTimeout, containerConfig, hostConfig, networkingConfig, nil, name)
 	if err != nil {
-		log.Printf("Failed to create container: %v", err)
-		return fmt.Errorf("failed to create container: %w", err)
+		return fmt.Errorf("failed to create container %s: %w", name, err)
 	}
 
-	log.Printf("Container created successfully with ID: %s", resp.ID)
+	logrus.Infof("Container created successfully with ID: %s", resp.ID)
 
-	log.Printf("Starting container %s", resp.ID)
+	logrus.Infof("Starting container %s", resp.ID)
 	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer startCancel()
 
 	if err := cli.ContainerStart(startCtx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		log.Printf("Failed to start container: %v", err)
-		return fmt.Errorf("failed to start container: %w", err)
+		return fmt.Errorf("failed to start container %s: %w", resp.ID, err)
 	}
 
-	log.Printf("Container started successfully with ID: %s", resp.ID)
+	logrus.Infof("Container started successfully with ID: %s", resp.ID)
 
 	return nil
 }

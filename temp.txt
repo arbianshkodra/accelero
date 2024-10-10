@@ -6,3 +6,32 @@ docker compose up -d --no-deps --scale web=2 --no-recreate web
 export $(grep -v '^#' dev.env | xargs)
 
 docker run --rm --name accelero -p 8000:8000 --env-file envs/dev/dev.env -v /var/run/docker.sock:/var/run/docker.sock accelero
+
+
+Usage Instructions
+Setting Log Level:
+
+You can control the verbosity of the logs by setting the LOG_LEVEL environment variable. Valid levels are panic, fatal, error, warn, info, debug, and trace.
+Example:
+bash
+Copy code
+export LOG_LEVEL=debug
+Setting Log Format:
+
+To output logs in JSON format (which is useful for logging systems like ELK stack), set LOG_FORMAT to json.
+Example:
+bash
+Copy code
+export LOG_FORMAT=json
+Running the Application:
+
+Ensure all required environment variables are set:
+REPO_URL, REPO_USERNAME, REPO_TOKEN, COMPOSE_PATH
+Start the application as usual:
+bash
+Copy code
+go run main.go
+Benefits of These Changes
+Structured Logging: Logs are now structured and can be easily parsed and analyzed by log management systems.
+Log Levels: Different log levels allow you to control the verbosity and importance of log messages.
+Configurable Logging: Log level and format can be configured without changing the code, making it flexible for different environments (development, staging, production).
