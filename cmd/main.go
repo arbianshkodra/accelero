@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/arbianshkodra/accelero/internal/handler"
 	"github.com/gorilla/mux"
@@ -37,12 +41,52 @@ func main() {
 		}
 	}
 
+	// Create a context that can be used to shutdown the worker pool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize the worker pool
+	numWorkers := 5 // Adjust this number based on your needs
+	taskQueue := make(chan handler.WebhookTask, 100)
+	handler.StartWorkerPool(ctx, numWorkers, taskQueue)
+
+	// Set up the HTTP server
 	r := mux.NewRouter()
-	r.HandleFunc("/webhook", handler.Webhook).Methods("POST")
-	http.Handle("/", r)
+	r.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+		handler.Webhook(w, r, taskQueue)
+	}).Methods("POST")
+
+	server := &http.Server{
+		Addr:    ":8000",
+		Handler: r,
+	}
+
+	// Set up signal handling to gracefully shut down
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		<-sigs
+		logrus.Info("Shutting down...")
+		cancel()
+
+		// Close the task queue to unblock workers waiting on it
+		close(taskQueue)
+
+		// Create a context with timeout for the server shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logrus.Errorf("HTTP server Shutdown: %v", err)
+		} else {
+			logrus.Info("HTTP server stopped")
+		}
+	}()
 
 	logrus.Info("Starting server on :8000")
-	if err := http.ListenAndServe(":8000", nil); err != nil {
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logrus.Fatalf("Could not listen on port 8000: %v", err)
 	}
+
+	logrus.Info("Application exited")
 }
