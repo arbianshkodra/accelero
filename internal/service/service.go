@@ -36,8 +36,6 @@ type ComposeService struct {
 func PullImage(cli *client.Client, image string) error {
 	ctx := context.Background()
 
-	log.Printf("Attempting to pull image: %s", image)
-
 	// Check if Docker registry credentials are provided
 	username := os.Getenv("DOCKER_USERNAME")
 	password := os.Getenv("DOCKER_PASSWORD")
