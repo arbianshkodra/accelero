@@ -34,3 +34,4 @@ envs/
 test.env
 dist/
 samples.env
+.venv/
