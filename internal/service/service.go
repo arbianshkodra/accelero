@@ -2,82 +2,28 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/utils"
-
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
 )
 
 type ComposeService struct {
 	Image       string            `yaml:"image"`
-	Environment utils.EnvVars     `yaml:"environment,omitempty"`
+	Environment EnvVars           `yaml:"environment,omitempty"`
 	EnvFile     []string          `yaml:"env_file,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
 	Command     []string          `yaml:"command,omitempty"`
 	Labels      map[string]string `yaml:"labels,omitempty"`
-	HealthCheck utils.HealthCheck `yaml:"healthcheck,omitempty"`
+	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
 	DependsOn   []string          `yaml:"depends_on,omitempty"`
 	Restart     string            `yaml:"restart,omitempty"`
-}
-
-func PullImage(cli *client.Client, image string) error {
-	ctx := context.Background()
-
-	// Check if Docker registry credentials are provided
-	username := os.Getenv("DOCKER_USERNAME")
-	password := os.Getenv("DOCKER_PASSWORD")
-	serverAddress := os.Getenv("DOCKER_REGISTRY")
-
-	var authConfig registry.AuthConfig
-	var authStr string
-	if username != "" && password != "" {
-		authConfig = registry.AuthConfig{
-			Username:      username,
-			Password:      password,
-			ServerAddress: serverAddress,
-		}
-		encodedJSON, err := json.Marshal(authConfig)
-		if err != nil {
-			return fmt.Errorf("failed to encode auth config: %w", err)
-		}
-		authStr = base64.URLEncoding.EncodeToString(encodedJSON)
-	}
-
-	options := types.ImagePullOptions{}
-	if authStr != "" {
-		options.RegistryAuth = authStr
-	}
-
-	out, err := cli.ImagePull(ctx, image, options)
-	if err != nil {
-		return fmt.Errorf("error pulling image %s: %w", image, err)
-	}
-	defer out.Close()
-
-	// Read the output to ensure the image is pulled
-	buf := make([]byte, 1024)
-	for {
-		_, err := out.Read(buf)
-		if err != nil {
-			break
-		}
-	}
-
-	logrus.Infof("Successfully pulled image: %s", image)
-	return nil
 }
 
 func AreContainersRunning(cli *client.Client, serviceName string) (bool, error) {
@@ -140,7 +86,8 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 		logrus.Infof("No existing containers found, deploying service %s for the first time", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			if err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
+			// Update the function call here
+			if err := CreateAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
 				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
 			logrus.Infof("Waiting for health check to complete for new container %s", instanceName)
@@ -153,7 +100,8 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 		logrus.Infof("Creating and starting new containers for service: %s", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			if err := createAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
+			// Update the function call here
+			if err := CreateAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
 				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
 			logrus.Infof("Waiting for health check to complete for new container %s", instanceName)
@@ -172,84 +120,6 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 	} else {
 		logrus.Info("No existing containers with outdated image tags found, no action needed")
 	}
-
-	return nil
-}
-
-func createAndStartContainer(ctx context.Context, cli *client.Client, name, repoDir string, svc ComposeService, serviceName string) error {
-	logrus.Infof("Creating container %s with image %s", name, svc.Image)
-
-	envVars, err := utils.LoadEnvFiles(svc.EnvFile, repoDir)
-	if err != nil {
-		return fmt.Errorf("failed to load environment files: %w", err)
-	}
-	envVars = append(envVars, svc.Environment...)
-
-	containerConfig := &container.Config{
-		Image:  svc.Image,
-		Env:    envVars,
-		Labels: svc.Labels,
-		Cmd:    svc.Command,
-	}
-
-	// Add health check if it's defined
-	if svc.HealthCheck.Test != nil {
-		containerConfig.Healthcheck = &container.HealthConfig{
-			Test:        svc.HealthCheck.Test,
-			Interval:    utils.ParseDuration(svc.HealthCheck.Interval),
-			Timeout:     utils.ParseDuration(svc.HealthCheck.Timeout),
-			Retries:     svc.HealthCheck.Retries,
-			StartPeriod: utils.ParseDuration(svc.HealthCheck.StartPeriod),
-		}
-	}
-
-	portBindings, exposedPorts := utils.MapPorts(svc.Ports)
-
-	hostConfig := &container.HostConfig{
-		PortBindings: portBindings,
-		Binds:        svc.Volumes,
-	}
-
-	// Handle the restart policy
-	if svc.Restart != "" {
-		hostConfig.RestartPolicy = container.RestartPolicy{
-			Name: svc.Restart,
-		}
-	}
-
-	containerConfig.ExposedPorts = exposedPorts
-
-	networkingConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{},
-	}
-
-	for _, net := range svc.Networks {
-		networkingConfig.EndpointsConfig[net] = &network.EndpointSettings{
-			Aliases: []string{serviceName},
-		}
-	}
-
-	// logrus.Debugf("Creating container with config: %+v, hostConfig: %+v, networkingConfig: %+v", containerConfig, hostConfig, networkingConfig)
-
-	ctxWithTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	resp, err := cli.ContainerCreate(ctxWithTimeout, containerConfig, hostConfig, networkingConfig, nil, name)
-	if err != nil {
-		return fmt.Errorf("failed to create container %s: %w", name, err)
-	}
-
-	logrus.Infof("Container created successfully with ID: %s", resp.ID)
-
-	logrus.Infof("Starting container %s", resp.ID)
-	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer startCancel()
-
-	if err := cli.ContainerStart(startCtx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		return fmt.Errorf("failed to start container %s: %w", resp.ID, err)
-	}
-
-	logrus.Infof("Container started successfully with ID: %s", resp.ID)
 
 	return nil
 }

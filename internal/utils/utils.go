@@ -14,34 +14,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type EnvVars []string
-
-func (e *EnvVars) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var raw []string
-	if err := unmarshal(&raw); err == nil {
-		*e = raw
-		return nil
-	}
-
-	var rawMap map[string]string
-	if err := unmarshal(&rawMap); err == nil {
-		for k, v := range rawMap {
-			*e = append(*e, fmt.Sprintf("%s=%s", k, v))
-		}
-		return nil
-	}
-
-	return fmt.Errorf("failed to unmarshal environment variables")
-}
-
-type HealthCheck struct {
-	Test        []string `yaml:"test"`
-	Interval    string   `yaml:"interval,omitempty"`
-	Timeout     string   `yaml:"timeout,omitempty"`
-	Retries     int      `yaml:"retries,omitempty"`
-	StartPeriod string   `yaml:"start_period,omitempty"`
-}
-
 func GetAllServices(services map[string]interface{}) []string {
 	var svcNames []string
 	for service := range services {
@@ -50,7 +22,7 @@ func GetAllServices(services map[string]interface{}) []string {
 	return svcNames
 }
 
-// Utility function to split service names
+// SplitServiceNames splits a comma-separated string of service names.
 func SplitServiceNames(serviceNames string) []string {
 	return strings.Split(serviceNames, ",")
 }
@@ -140,16 +112,4 @@ func MapPorts(ports []string) (nat.PortMap, nat.PortSet) {
 		exposedPorts[containerNatPort] = struct{}{}
 	}
 	return portMap, exposedPorts
-}
-
-func ParseDuration(duration string) time.Duration {
-	if duration == "" {
-		return 0
-	}
-	parsedDuration, err := time.ParseDuration(duration)
-	if err != nil {
-		logrus.Warnf("Failed to parse duration '%s', using default 0", duration)
-		return 0
-	}
-	return parsedDuration
 }
