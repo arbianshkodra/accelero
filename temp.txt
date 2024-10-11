@@ -8,6 +8,7 @@ export $(grep -v '^#' dev.env | xargs)
 docker run --rm --name accelero -p 8000:8000 --env-file envs/dev/dev.env -v /var/run/docker.sock:/var/run/docker.sock accelero
 
 
+================================================================================================
 Usage Instructions
 Setting Log Level:
 
@@ -35,3 +36,9 @@ Benefits of These Changes
 Structured Logging: Logs are now structured and can be easily parsed and analyzed by log management systems.
 Log Levels: Different log levels allow you to control the verbosity and importance of log messages.
 Configurable Logging: Log level and format can be configured without changing the code, making it flexible for different environments (development, staging, production).
+
+================================================================================================
+
+6. Testing and Continuous Integration
+
+12. Container Management Enhancements

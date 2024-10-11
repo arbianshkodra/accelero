@@ -20,11 +20,12 @@ func CloneRepo(ctx context.Context, dir string) error {
 	branch := os.Getenv("REPO_BRANCH")
 	composePath := os.Getenv("COMPOSE_PATH")
 
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("clone operation canceled")
-	default:
+	if repoURL == "" || username == "" || token == "" {
+		return fmt.Errorf("repository credentials are not set")
 	}
+
+	// Do not log sensitive information
+	logrus.Info("Starting repository clone")
 
 	cloneOptions := &git.CloneOptions{
 		URL: repoURL,
@@ -39,7 +40,7 @@ func CloneRepo(ctx context.Context, dir string) error {
 		cloneOptions.ReferenceName = plumbing.NewBranchReferenceName(branch)
 	}
 
-	_, err := git.PlainClone(dir, false, cloneOptions)
+	_, err := git.PlainCloneContext(ctx, dir, false, cloneOptions)
 	if err != nil {
 		return fmt.Errorf("failed to clone repository: %w", err)
 	}
