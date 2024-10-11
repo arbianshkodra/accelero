@@ -36,7 +36,7 @@ func main() {
 	// Load environment variables
 	requiredEnvVars := []string{"REPO_URL", "REPO_USERNAME", "REPO_TOKEN", "COMPOSE_PATH"}
 	for _, envVar := range requiredEnvVars {
-		if os.Getenv(envVar) == "" {
+		if value := os.Getenv(envVar); value == "" {
 			logrus.Fatalf("Environment variable %s must be set", envVar)
 		}
 	}

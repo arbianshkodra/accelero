@@ -91,11 +91,31 @@ func Webhook(w http.ResponseWriter, r *http.Request, taskQueue chan<- WebhookTas
 	// Generate a unique request ID (e.g., UUID)
 	requestID := generateRequestID()
 
+	// Validate HTTP method
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Validate content type if necessary
+	if r.Header.Get("Content-Type") != "application/json" {
+		http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+		return
+	}
+
 	// Read the request payload if necessary
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
 		logrus.Errorf("Failed to read request body: %v", err)
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate payload structure if expecting JSON
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		logrus.Errorf("Invalid JSON payload: %v", err)
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
