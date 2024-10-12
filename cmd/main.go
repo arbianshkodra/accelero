@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/handler"
+	"github.com/arbianshkodra/accelero/internal/service"
+	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
@@ -50,6 +52,24 @@ func main() {
 	taskQueue := make(chan handler.WebhookTask, 100)
 	handler.StartWorkerPool(ctx, numWorkers, taskQueue)
 
+	// Create Docker client
+	dockerSock := os.Getenv("DOCKER_SOCK")
+	if dockerSock == "" {
+		dockerSock = "unix:///var/run/docker.sock"
+	}
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(dockerSock),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		logrus.Fatalf("Failed to create docker client: %v", err)
+	}
+	logrus.Info("Created Docker client")
+
+	// Start cleanup routine
+	startCleanupRoutine(cli)
+
 	// Set up the HTTP server
 	r := mux.NewRouter()
 	r.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
@@ -89,4 +109,19 @@ func main() {
 	}
 
 	logrus.Info("Application exited")
+}
+
+// startCleanupRoutine starts a goroutine that periodically cleans up Docker resources
+func startCleanupRoutine(cli *client.Client) {
+	ticker := time.NewTicker(24 * time.Hour) // Adjust the interval as needed
+	go func() {
+		for range ticker.C {
+			logrus.Info("Starting cleanup of Docker resources")
+			if err := service.CleanupResources(cli); err != nil {
+				logrus.Errorf("Failed to clean up Docker resources: %v", err)
+			} else {
+				logrus.Info("Docker resources cleaned up successfully")
+			}
+		}
+	}()
 }
