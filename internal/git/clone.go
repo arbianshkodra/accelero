@@ -1,23 +1,31 @@
 package git
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/sirupsen/logrus"
 )
 
-func CloneRepo(dir string) error {
+func CloneRepo(ctx context.Context, dir string) error {
 	repoURL := os.Getenv("REPO_URL")
 	username := os.Getenv("REPO_USERNAME")
 	token := os.Getenv("REPO_TOKEN")
 	branch := os.Getenv("REPO_BRANCH")
 	composePath := os.Getenv("COMPOSE_PATH")
+
+	if repoURL == "" || username == "" || token == "" {
+		return fmt.Errorf("repository credentials are not set")
+	}
+
+	// Do not log sensitive information
+	logrus.Info("Starting repository clone")
 
 	cloneOptions := &git.CloneOptions{
 		URL: repoURL,
@@ -32,18 +40,14 @@ func CloneRepo(dir string) error {
 		cloneOptions.ReferenceName = plumbing.NewBranchReferenceName(branch)
 	}
 
-	_, err := git.PlainClone(dir, false, cloneOptions)
+	_, err := git.PlainCloneContext(ctx, dir, false, cloneOptions)
 	if err != nil {
-		log.Printf("Failed to clone repo: %v", err)
-		return err
-	} else {
-		log.Printf("Cloned repo to %s", dir)
+		return fmt.Errorf("failed to clone repository: %w", err)
 	}
+	logrus.Infof("Cloned repository to %s", dir)
 
-	err = copyComposeFile(dir, composePath)
-	if err != nil {
-		log.Printf("Failed to copy docker-compose file: %v", err)
-		return err
+	if err := copyComposeFile(dir, composePath); err != nil {
+		return fmt.Errorf("failed to copy docker-compose file: %w", err)
 	}
 
 	return nil
@@ -65,8 +69,7 @@ func copyComposeFile(repoDir, composePath string) error {
 	}
 	defer destinationFile.Close()
 
-	_, err = io.Copy(destinationFile, sourceFile)
-	if err != nil {
+	if _, err := io.Copy(destinationFile, sourceFile); err != nil {
 		return fmt.Errorf("failed to copy file: %w", err)
 	}
 
@@ -77,12 +80,12 @@ func copyComposeFile(repoDir, composePath string) error {
 
 	for _, file := range files {
 		if file.Name() != "docker-compose.yaml" {
-			err = os.RemoveAll(filepath.Join(repoDir, file.Name()))
-			if err != nil {
-				return fmt.Errorf("failed to remove file: %w", err)
+			if err := os.RemoveAll(filepath.Join(repoDir, file.Name())); err != nil {
+				return fmt.Errorf("failed to remove file %s: %w", file.Name(), err)
 			}
 		}
 	}
 
+	logrus.Info("Successfully copied docker-compose file and cleaned up repository directory")
 	return nil
 }
