@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/handler"
+	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/mux"
@@ -72,7 +73,12 @@ func main() {
 
 	// Set up the HTTP server
 	r := mux.NewRouter()
-	r.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
+
+	// Apply the authentication middleware to protected routes
+	apiRouter := r.PathPrefix("/").Subrouter()
+	apiRouter.Use(middleware.APIKeyAuth)
+
+	apiRouter.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
 		handler.Webhook(w, r, taskQueue)
 	}).Methods("POST")
 
