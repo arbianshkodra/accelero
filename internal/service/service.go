@@ -25,8 +25,11 @@ type ComposeService struct {
 	DependsOn   []string          `yaml:"depends_on,omitempty"`
 	Restart     string            `yaml:"restart,omitempty"`
 }
+type DockerClient interface {
+	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
+}
 
-func AreContainersRunning(cli *client.Client, serviceName string) (bool, error) {
+func AreContainersRunning(cli DockerClient, serviceName string) (bool, error) {
 	ctx := context.Background()
 	filter := filters.NewArgs()
 	filter.Add("name", serviceName)
