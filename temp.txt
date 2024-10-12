@@ -39,6 +39,4 @@ Configurable Logging: Log level and format can be configured without changing th
 
 ================================================================================================
 
-6. Testing and Continuous Integration
-
 12. Container Management Enhancements
