@@ -2,10 +2,11 @@ package network
 
 import (
 	"context"
-	"log"
+	"fmt"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
 )
 
 type ComposeNetwork struct {
@@ -19,13 +20,12 @@ func CreateNetwork(cli *client.Client, name string, config ComposeNetwork) error
 	// Check if the network already exists
 	existingNetworks, err := cli.NetworkList(ctx, types.NetworkListOptions{})
 	if err != nil {
-		log.Printf("Failed to list networks: %v", err)
-		return err
+		return fmt.Errorf("failed to list networks: %w", err)
 	}
 
 	for _, net := range existingNetworks {
 		if net.Name == name {
-			log.Printf("Network %s already exists, skipping creation", name)
+			logrus.Warnf("Network %s already exists, skipping creation", name)
 			return nil
 		}
 	}
@@ -35,12 +35,10 @@ func CreateNetwork(cli *client.Client, name string, config ComposeNetwork) error
 		Options: config.DriverOpts,
 	}
 
-	_, err = cli.NetworkCreate(ctx, name, networkCreate)
-	if err != nil {
-		log.Printf("Failed to create network %s: %v", name, err)
-		return err
+	if _, err := cli.NetworkCreate(ctx, name, networkCreate); err != nil {
+		return fmt.Errorf("failed to create network %s: %w", name, err)
 	}
 
-	log.Printf("Successfully created network: %s", name)
+	logrus.Infof("Successfully created network: %s", name)
 	return nil
 }
