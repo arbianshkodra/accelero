@@ -12,23 +12,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type ComposeService struct {
-	Image       string            `yaml:"image"`
-	Environment EnvVars           `yaml:"environment,omitempty"`
-	EnvFile     []string          `yaml:"env_file,omitempty"`
-	Ports       []string          `yaml:"ports,omitempty"`
-	Volumes     []string          `yaml:"volumes,omitempty"`
-	Command     []string          `yaml:"command,omitempty"`
-	Labels      map[string]string `yaml:"labels,omitempty"`
-	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
-	Networks    []string          `yaml:"networks,omitempty"`
-	DependsOn   []string          `yaml:"depends_on,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"`
-}
-type DockerClient interface {
-	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
-}
-
 func AreContainersRunning(cli DockerClient, serviceName string) (bool, error) {
 	ctx := context.Background()
 	filter := filters.NewArgs()
