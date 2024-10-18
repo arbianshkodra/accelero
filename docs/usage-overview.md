@@ -15,6 +15,7 @@ Before running the Accelero container, you need to create an environment file wi
 - `DOCKER_USERNAME` - Your Docker username.
 - `DOCKER_PASSWORD` - Your Docker password.
 - `DOCKER_REGISTRY` - Your Docker registry.
+- `API_KEY` - Your API key.
 
 A sample can be found in the `sample.env` file in the root of the repository.
 
