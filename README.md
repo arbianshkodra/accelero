@@ -21,4 +21,4 @@ Accelero is a container-based tool that automates Docker deployments seamlessly 
 While it seems like a simple tool, it is a powerful one. It is built with the idea of making deployments as easy as possible, by abstracting the complexity of orchestrating a deployment, and making it as simple as pushing a new image to your registry. As of now, it is **not** recommended to use it in production, as it is still in development.
 
 ## Documentation
-The full documentation can be found at https://docs.accelero.sh.
+The full documentation can be found at https://accelero.sh/docs.
