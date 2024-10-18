@@ -1,5 +1,5 @@
 site_name: Accelero
-site_url: htps://accelero.sh/docs/
+site_url: https://accelero.sh/docs/
 repo_url: https://github.com/arbianshkodra/accelero/
 # Path: docs/. Don't forget to update branch name 
 edit_uri: blob/dev/docs/
