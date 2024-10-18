@@ -12,7 +12,8 @@ permissions:
   contents: write
 
 jobs:
-  name: release-docs-dev
+  release-docs-dev:
+  name: Release Docs Dev
   runs-on: ubuntu-latest
   steps:
     - name: Checkout
