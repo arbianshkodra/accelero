@@ -50,7 +50,7 @@ jobs:
       #     ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.7.0
-          with:
-            ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
       - name: Copy Files via SCP
         run: /usr/bin/scp -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
