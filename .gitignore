@@ -38,3 +38,6 @@ samples.env
 
 # Mkdocs
 site/
+
+# configs
+server-config.md
