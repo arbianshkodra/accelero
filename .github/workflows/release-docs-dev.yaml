@@ -49,5 +49,5 @@ jobs:
           # Add server to known_hosts to prevent host key verification prompt
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
-        run: /usr/bin/scp -v -i ${{ secrets.CERT_PATH }} -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
+        run: /usr/bin/scp -v -i ${{ secrets.CERT_PATH }} -r site/ github@${{ secrets.HOST }}:${{ secrets.PATH }}
 
