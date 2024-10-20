@@ -44,7 +44,7 @@ jobs:
         run: |
           export PATH=$PATH:/bin:/usr/bin
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
+          echo '${{ secrets.SSH_PRIVATE_KEY }}' > ${{ secrets.CERT_PATH }}
           chmod 600 ${{ secrets.CERT_PATH }}
           # Add server to known_hosts to prevent host key verification prompt
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
