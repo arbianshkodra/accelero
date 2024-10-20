@@ -42,10 +42,10 @@ jobs:
           mkdocs build
       - name: Install SSH Key
         run: |
-          mkdir -p ~/.ssh
+          mkdir -vm 700 $HOME/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # Add server to known_hosts to prevent host key verification prompt
-          ssh-keyscan -H "${{ secrets.HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
         run: scp -r ./site/* ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
