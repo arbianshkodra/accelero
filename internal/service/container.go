@@ -57,8 +57,9 @@ func CreateAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 
 	// Handle the restart policy
 	if svc.Restart != "" {
+		restartPolicyMode := container.RestartPolicyMode(svc.Restart)
 		hostConfig.RestartPolicy = container.RestartPolicy{
-			Name: svc.Restart,
+			Name: restartPolicyMode,
 		}
 	}
 
