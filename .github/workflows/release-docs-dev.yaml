@@ -31,8 +31,10 @@ jobs:
       - name: Install dependencies
         run: |
           touch requirements.txt
+          echo "mkdocs" >> requirements.txt
+          echo "mkdocs-material" >> requirements.txt
           python -m pip install --upgrade pip
-          pip install mkdocs mkdocs-material
+          pip install -r requirements.txt
       - name: Generate documentation
         run: |
           mkdocs build
