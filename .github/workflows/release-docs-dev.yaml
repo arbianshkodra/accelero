@@ -1,15 +1,13 @@
 name: Release Docs Dev
 
 on:
-  # workflow_run:
-    # workflows: ["Release Dev"]
-    # branch:
-    #   - main
-    # types:
-    #   - completed
-  push:
-    branches:
-      - refactor-logging
+  workflow_run:
+    workflows: ["Release Dev"]
+    branch:
+      # - main
+      - dev
+    types:
+      - completed
 
 permissions:
   contents: write
