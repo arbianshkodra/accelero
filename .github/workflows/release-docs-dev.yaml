@@ -23,6 +23,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - Add requirements.txt
+        run: |
+          touch requirements.txt
+          echo "mkdocs" >> requirements.txt
+          echo "mkdocs-material" >> requirements.txt
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -30,9 +35,6 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: |
-          touch requirements.txt
-          echo "mkdocs" >> requirements.txt
-          echo "mkdocs-material" >> requirements.txt
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Generate documentation
