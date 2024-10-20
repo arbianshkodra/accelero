@@ -42,7 +42,7 @@ jobs:
           mkdocs build
       - name: Install SSH Key
         run: |
-          /bin:/usr/bin/mkdir -p ~/.ssh
+          /usr/bin/mkdir -p ~/.ssh
           echo ${{ secrets.SSH_PRIVATE_KEY }} > ${{ secrets.CERT_PATH }}
           chmod 600 ${{ secrets.CERT_PATH }}
           # Add server to known_hosts to prevent host key verification prompt
