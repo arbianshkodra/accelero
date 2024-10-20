@@ -40,12 +40,12 @@ jobs:
       - name: Generate documentation
         run: |
           mkdocs build
-      - name: copy file via ssh key
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          port: ${{ secrets.PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "site/"
-          target: ${{ secrets.PATH }}
+      - name: Install SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Add server to known_hosts to prevent host key verification prompt
+          ssh-keyscan -H "${{ secrets.HOST }}" >> ~/.ssh/known_hosts
+      - name: Copy Files via SCP
+        run: scp -r ./site/* ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
