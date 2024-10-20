@@ -7,9 +7,10 @@ on:
     #   - main
     # types:
     #   - completed
-  branches:
-    - refactor-logging
-    
+  push:
+    branches:
+      - refactor-logging
+
 permissions:
   contents: write
 
