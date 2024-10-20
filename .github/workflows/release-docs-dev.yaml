@@ -23,12 +23,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.7.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-      - name: Add known hosts
-        run: ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Add requirements.txt
         run: |
           touch requirements.txt
@@ -46,13 +40,13 @@ jobs:
       - name: Generate documentation
         run: |
           mkdocs build
-      # - name: Install SSH Key
-      #   run: |
-      #     export PATH=$PATH:/bin:/usr/bin
-      #     mkdir -p ~/.ssh
-      #     echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
-      #     chmod 400 ${{ secrets.CERT_PATH }}
-      #     # Add server to known_hosts to prevent host key verification prompt
-      #     ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+      - name: Install SSH Key
+        run: |
+          export PATH=$PATH:/bin:/usr/bin
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
+          chmod 600 ${{ secrets.CERT_PATH }}
+          # Add server to known_hosts to prevent host key verification prompt
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
         run: /usr/bin/scp -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
