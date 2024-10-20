@@ -28,7 +28,7 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
       - name: Add known hosts
-        run: ssh-keygen -R ${{ secrets.HOST }}
+        run: ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Add requirements.txt
         run: |
           touch requirements.txt
