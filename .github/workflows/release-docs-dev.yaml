@@ -42,7 +42,8 @@ jobs:
           mkdocs build
       - name: Install SSH Key
         run: |
-          mkdir -vm 700 $HOME/.ssh
+          export PATH=$PATH:/bin:/usr/bin
+          mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # Add server to known_hosts to prevent host key verification prompt
