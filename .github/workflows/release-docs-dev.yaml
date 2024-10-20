@@ -44,10 +44,10 @@ jobs:
         run: |
           export PATH=$PATH:/bin:/usr/bin
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
+          echo ${{ secrets.SSH_PRIVATE_KEY }} | tr -d '\r' > ${{ secrets.CERT_PATH }}
           chmod 600 ${{ secrets.CERT_PATH }}
           # Add server to known_hosts to prevent host key verification prompt
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
-        run: /usr/bin/scp -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
+        run: /usr/bin/scp -v -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
 
