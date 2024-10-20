@@ -50,4 +50,3 @@ jobs:
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
         run: /usr/bin/scp -i ${{ secrets.CERT_PATH }} -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
-
