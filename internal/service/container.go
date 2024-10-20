@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/utils"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -118,7 +117,7 @@ func CreateAndStartContainer(ctx context.Context, cli *client.Client, name, repo
 	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer startCancel()
 
-	if err := cli.ContainerStart(startCtx, resp.ID, types.ContainerStartOptions{}); err != nil {
+	if err := cli.ContainerStart(startCtx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("failed to start container %s: %w", resp.ID, err)
 	}
 

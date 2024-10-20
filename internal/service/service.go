@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/utils"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
@@ -17,7 +17,7 @@ func AreContainersRunning(cli DockerClient, serviceName string) (bool, error) {
 	filter := filters.NewArgs()
 	filter.Add("name", serviceName)
 
-	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{Filters: filter})
+	containers, err := cli.ContainerList(ctx, container.ListOptions{Filters: filter})
 	if err != nil {
 		return false, fmt.Errorf("failed to list containers: %w", err)
 	}
@@ -29,7 +29,7 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 	ctx := context.Background()
 
 	// List existing containers
-	existingContainers, err := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
+	existingContainers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
@@ -99,7 +99,7 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 
 		for _, containerID := range containersToRemove {
 			logrus.Infof("Removing container %s", containerID)
-			if err := cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true}); err != nil {
+			if err := cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
 				return fmt.Errorf("failed to remove container %s: %w", containerID, err)
 			}
 		}
