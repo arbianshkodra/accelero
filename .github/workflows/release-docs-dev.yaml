@@ -42,12 +42,11 @@ jobs:
           mkdocs build
       - name: Install SSH Key
         run: |
-          export PATH=$PATH:/bin:/usr/bin
-          mkdir -p ~/.ssh
+          /bin:/usr/bin/mkdir -p ~/.ssh
           echo ${{ secrets.SSH_PRIVATE_KEY }} > ${{ secrets.CERT_PATH }}
           chmod 600 ${{ secrets.CERT_PATH }}
           # Add server to known_hosts to prevent host key verification prompt
-          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+          # ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
       - name: Copy Files via SCP
         run: /usr/bin/scp -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
 
