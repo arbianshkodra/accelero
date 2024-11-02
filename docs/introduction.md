@@ -11,3 +11,7 @@ a1edf7ab524e   nginx:1.26.1             "/docker-entrypoint.…"   12 minutes ag
 ```
 
 As you can see, Accelero is running and listening on port 8000. You can now push your Docker image to your registry, and Accelero will take care of the rest. To be able to route traffic to your service, you need to configure a reverse proxy like Traefik, but that will be provided by Accelero in the future. On the next section, we will see how to get started with Accelero.
+
+## Sample GitOps Repository
+
+A sample is located within this repo's directory `samples`. Here is a <a href="https://github.com/arbianshkodra/accelero-sample-gitops/">GitOps repository</a> available where you can fork it and use it as a template for your own projects. This repository will contain a `docker-compose.yaml` file and a `sample.env` file with the necessary configuration. You can use this repository to get started with Accelero and automate your deployments with zero downtime.
