@@ -33,4 +33,5 @@ nav:
   - Home: index.md
   - Introduction: introduction.md
   - Usage Overview: usage-overview.md
+  - Configuration: configuration.md
   

@@ -2,7 +2,7 @@ Accelero is itself packaged as a Docker container, so you can run it with a sing
 
 Since Accelero needs to interact with the Docker daemon, you need to mount the Docker socket to the container. This is done by adding the `-v /var/run/docker.sock:/var/run/docker.sock` flag to the `docker run` command. This way, Accelero can listen for webhooks from your CI pipeline and update your service with the new image.
 
-## Configuration & Environment Variables
+## Environment Variables
 Before running the Accelero container, you need to create an environment file with the necessary configuration. The environment file should contain the following variables:
 
 - `REPO_URL` - The URL of your Git repository.
@@ -21,7 +21,7 @@ A sample can be found in the `sample.env` file in the root of the repository.
 
 Also a GitOps repo will be available where you can fork it and use it as a template for your own projects.
 
-## 
+## Running the Accelero Container
 
 Run the Accelero container with the following command:
 
@@ -33,3 +33,5 @@ Run the Accelero container with the following command:
   arbianshkodra/accelero
 ```
 
+## How Accelero Works
+Accelero listens for webhooks from your CI pipeline and updates your service with the new image. To get it started up, fork the <a href="https://github.com/arbianshkodra/accelero-sample-gitops/">GitOps repository</a> and adjust the configuration to your needs. It is designed to be simple to use and easy to integrate with your existing CI/CD pipeline. Using Accelero is as simple as pushing your Docker image to your registry. After that, you'll update your `docker-compose.yaml` file with the new image tag and push it to your repository. Then, when the new image tag is pushed, Accelero will get a webhook trigger and take care of the rest by gracefully updating your service with the new image and shutting down the old one.
