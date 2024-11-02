@@ -2,7 +2,7 @@
   <img src="./docs/images/logo.jpg" width="450" />
   
   # Accelero
-  Rollout Docker deployments without downtime, using GitOps strategy.
+  Rollout Docker deployments with zero downtime, using GitOps strategy.
 </div>
 
 ## Quick Start
