@@ -26,6 +26,7 @@ theme:
   icon:
     previous: fontawesome/solid/angle-left
     next: fontawesome/solid/angle-right
+  favicon: "./images/favicon.ico"
 plugins:
   - search
 
