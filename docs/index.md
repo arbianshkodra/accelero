@@ -23,4 +23,4 @@ $ docker run --rm -d \
 
 Replace `path/to/env/file.env` with the path to your environment variables file. Accelero will start and listen for incoming webhooks on port 8000.
 
-For detailed instructions, see the [Introduction](./docs/introduction.md) and [Usage Overview](./docs/usage-overview.md) sections.
+For detailed instructions, see the [Introduction](./introduction.md) and [Usage Overview](./usage-overview.md) sections.
