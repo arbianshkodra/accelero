@@ -38,6 +38,8 @@ jobs:
           - macos-latest
           - windows-latest
     runs-on: ${{ matrix.platform }}
+    needs:
+      - lint
     steps:
       - name: Checkout
         uses: actions/checkout@v4
