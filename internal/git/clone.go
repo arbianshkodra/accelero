@@ -3,7 +3,6 @@ package git
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -57,21 +56,16 @@ func copyComposeFile(repoDir, composePath string) error {
 	src := filepath.Join(repoDir, composePath)
 	dest := filepath.Join(repoDir, "docker-compose.yaml")
 
-	sourceFile, err := os.Open(src)
+	content, err := os.ReadFile(src)
 	if err != nil {
-		return fmt.Errorf("failed to open source file: %w", err)
+		return fmt.Errorf("failed to read source file: %w", err)
 	}
-	defer sourceFile.Close()
 
-	destinationFile, err := os.Create(dest)
-	if err != nil {
-		return fmt.Errorf("failed to create destination file: %w", err)
+	if err := os.WriteFile(dest, content, 0644); err != nil {
+		return fmt.Errorf("failed to write destination file: %w", err)
 	}
-	defer destinationFile.Close()
 
-	if _, err := io.Copy(destinationFile, sourceFile); err != nil {
-		return fmt.Errorf("failed to copy file: %w", err)
-	}
+	logrus.Debugf("Successfully copied docker-compose content from %s to %s", src, dest)
 
 	files, err := os.ReadDir(repoDir)
 	if err != nil {
@@ -86,6 +80,5 @@ func copyComposeFile(repoDir, composePath string) error {
 		}
 	}
 
-	logrus.Info("Successfully copied docker-compose file and cleaned up repository directory")
 	return nil
 }
