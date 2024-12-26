@@ -41,3 +41,6 @@ site/
 
 # configs
 server-config.md
+
+# vscode
+.vscode/
