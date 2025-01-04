@@ -146,7 +146,7 @@ jobs:
 
       - name: Merge checksums
         run: |
-          cat ./release_artifacts/**/checksums.txt > merged_checksums.txt
+          cat ./release_artifacts/checksums.txt > merged_checksums.txt
           sort -u merged_checksums.txt > checksums.txt
           rm -f merged_checksums.txt
 
