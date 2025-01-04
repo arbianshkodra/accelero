@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   lint:
@@ -18,11 +19,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: 1.22.x
-      - uses: dominikh/staticcheck-action@v1.3.1
+
+      - name: Static check
+        uses: dominikh/staticcheck-action@v1.3.1
         with:
           version: "latest"
           install-go: "false"
@@ -31,89 +35,246 @@ jobs:
     name: Test
     strategy:
       matrix:
-        go-version:
-          - 1.22.x
-        platform:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        go-version: [1.22.x]
+        platform: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
-    needs:
-      - lint
+    needs: [lint]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: 1.22.x
-      - name: Run tests
-        run: |
-          go test ./... -coverprofile coverage.out
 
-  build:
-    name: Build
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Run tests
+        run: go test ./... -coverprofile coverage.out
+
+  build_artifacts:
+    name: Build Archives (like GoReleaser)
     runs-on: ubuntu-latest
-    needs:
-      - lint
-      - test
-    env:
-      CGO_ENABLED: 0
-      TAG: ${{ github.ref_name }}
+    needs: [lint, test]
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, 386, arm, arm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: 1.22.x
+
+      - name: Build binary
+        id: build
+        run: |
+          VERSION="${{ github.ref_name }}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          LDFLAGS="-s -w \
+            -X main.version=$VERSION \
+            -X main.commit=$COMMIT \
+            -X main.date=$DATE"
+
+          BINARY_NAME="accelero"
+
+          # Extension for Windows
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+
+          # Use GOARM=7 for 32-bit ARM, if needed
+          if [ "${{ matrix.goarch }}" = "arm" ]; then
+            export GOARM=7
+          fi
+
+          # Build
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build \
+            -o "${BINARY_NAME}${EXT}" \
+            -ldflags="$LDFLAGS" \
+            ./cmd/main.go
+
+          # Create archive name
+          ARCHIVE_NAME="accelero_${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ARCHIVE_NAME="${ARCHIVE_NAME}.zip"
+            zip -9 -r "$ARCHIVE_NAME" "${BINARY_NAME}.exe" LICENSE.md
+          else
+            ARCHIVE_NAME="${ARCHIVE_NAME}.tar.gz"
+            tar -czvf "$ARCHIVE_NAME" "${BINARY_NAME}" LICENSE.md
+          fi
+
+          # Save the archive name for next step
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Compute sha256 and store
+        run: |
+          sha256sum ${{ steps.build.outputs.archive_name }} >> checksums.txt
+
+      - name: Upload artifact (for collecting in the next step)
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-output
+          path: |
+            ${{ steps.build.outputs.archive_name }}
+            checksums.txt
+
+  release_artifacts:
+    name: Create Release with Artifacts
+    runs-on: ubuntu-latest
+    needs: [build_artifacts]
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-output
+          path: ./release_artifacts
+
+      - name: Merge checksums
+        run: |
+          cat ./release_artifacts/**/checksums.txt > merged_checksums.txt
+          sort -u merged_checksums.txt > checksums.txt
+          rm -f merged_checksums.txt
+
+      - name: Confirm final checksums
+        run: |
+          echo "Final checksums file is:"
+          cat checksums.txt
+
+      - name: Prepare release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:'- %s' $PREV_TAG..HEAD)
+          else
+            CHANGELOG=$(git log --pretty=format:'- %s')
+          fi
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release & Upload Assets
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          allowsUpdates: false
+          body: ${{ steps.notes.outputs.changelog }}
+          assets: |
+            ./release_artifacts/*; ;application/octet-stream
+            checksums.txt;checksums.txt;text/plain
+
+  docker_build:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [release_artifacts]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Docker Login
         uses: docker/login-action@v3.3.0
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      - name: Build
-        uses: goreleaser/goreleaser-action@v6.0.0
-        with:
-          version: '~> v2'
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
 
-      - name: Manifest
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          buildkit-inline-cache: true
+
+      - name: Multi-arch builds
         run: |
-          export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest create arbianshkodra/accelero:$TAG \
-            arbianshkodra/accelero:amd64-${TAG} \
-            arbianshkodra/accelero:i386-${TAG} \
-            arbianshkodra/accelero:arm64-${TAG} \
-            arbianshkodra/accelero:arm-${TAG}
-      - name: Annotation
+          FULL_VERSION=${{ github.ref_name }}
+          STRIPPED_VERSION=$(echo "$FULL_VERSION" | sed 's/^v//') 
+
+          # Build + push each architecture individually
+          docker buildx build \
+            --platform linux/amd64 \
+            -t arbianshkodra/accelero:amd64-${STRIPPED_VERSION} \
+            -t arbianshkodra/accelero:amd64-latest \
+            --push \
+            .
+
+          docker buildx build \
+            --platform linux/386 \
+            -t arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
+            -t arbianshkodra/accelero:i386-latest \
+            --push \
+            .
+
+          docker buildx build \
+            --platform linux/arm64 \
+            -t arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
+            -t arbianshkodra/accelero:arm64-latest \
+            --push \
+            .
+
+          # For 32-bit ARM assume v7
+          docker buildx build \
+            --platform linux/arm/v7 \
+            -t arbianshkodra/accelero:arm-${STRIPPED_VERSION} \
+            -t arbianshkodra/accelero:arm-latest \
+            --push \
+            .
+
+      - name: Create & push multi-arch manifest for version
         run: |
-          export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:i386-${TAG} --os linux --arch 386
-          docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm64-${TAG} --os linux --arch arm64
-          docker manifest annotate arbianshkodra/accelero:$TAG arbianshkodra/accelero:arm-${TAG} --os linux --arch arm
-      - name: Create Latest Manifest
+          FULL_VERSION=${{ github.ref_name }}
+          STRIPPED_VERSION=$(echo "$FULL_VERSION" | sed 's/^v//')
+
+          docker manifest create arbianshkodra/accelero:${STRIPPED_VERSION} \
+            arbianshkodra/accelero:amd64-${STRIPPED_VERSION} \
+            arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
+            arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
+            arbianshkodra/accelero:arm-${STRIPPED_VERSION}
+
+          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
+            arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
+            --os linux --arch 386
+
+          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
+            arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
+            --os linux --arch arm64
+
+          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
+            arbianshkodra/accelero:arm-${STRIPPED_VERSION} \
+            --os linux --arch arm --variant v7
+
+          docker manifest push arbianshkodra/accelero:${STRIPPED_VERSION}
+
+      - name: Create & push multi-arch manifest for latest
         run: |
-          export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
           docker manifest create arbianshkodra/accelero:latest \
             arbianshkodra/accelero:amd64-latest \
             arbianshkodra/accelero:i386-latest \
             arbianshkodra/accelero:arm64-latest \
             arbianshkodra/accelero:arm-latest
-      - name: Annotate Latest
-        run: |
-          export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:i386-latest --os linux --arch 386
-          docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:arm64-latest --os linux --arch arm64
-          docker manifest annotate arbianshkodra/accelero:latest arbianshkodra/accelero:arm-latest --os linux --arch arm
-      - name: Push Manifest
-        run: |
-          export TAG=$(git describe --tags --exact-match HEAD | sed 's/^v*//')
-          docker manifest push arbianshkodra/accelero:$TAG
+
+          docker manifest annotate arbianshkodra/accelero:latest \
+            arbianshkodra/accelero:i386-latest \
+            --os linux --arch 386
+
+          docker manifest annotate arbianshkodra/accelero:latest \
+            arbianshkodra/accelero:arm64-latest \
+            --os linux --arch arm64
+
+          docker manifest annotate arbianshkodra/accelero:latest \
+            arbianshkodra/accelero:arm-latest \
+            --os linux --arch arm --variant v7
+
           docker manifest push arbianshkodra/accelero:latest
