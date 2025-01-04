@@ -197,84 +197,20 @@ jobs:
         with:
           buildkit-inline-cache: true
 
-      - name: Multi-arch builds
-        run: |
-          FULL_VERSION=${{ github.ref_name }}
-          STRIPPED_VERSION=$(echo "$FULL_VERSION" | sed 's/^v//') 
-
-          # Build + push each architecture individually
-          docker buildx build \
-            --platform linux/amd64 \
-            -t arbianshkodra/accelero:amd64-${STRIPPED_VERSION} \
-            -t arbianshkodra/accelero:amd64-latest \
-            --push \
-            .
-
-          docker buildx build \
-            --platform linux/386 \
-            -t arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
-            -t arbianshkodra/accelero:i386-latest \
-            --push \
-            .
-
-          docker buildx build \
-            --platform linux/arm64 \
-            -t arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
-            -t arbianshkodra/accelero:arm64-latest \
-            --push \
-            .
-
-          # For 32-bit ARM assume v7
-          docker buildx build \
-            --platform linux/arm/v7 \
-            -t arbianshkodra/accelero:arm-${STRIPPED_VERSION} \
-            -t arbianshkodra/accelero:arm-latest \
-            --push \
-            .
-
-      - name: Create & push multi-arch manifest for version
+      - name: Multi-arch builds and push
         run: |
           FULL_VERSION=${{ github.ref_name }}
           STRIPPED_VERSION=$(echo "$FULL_VERSION" | sed 's/^v//')
 
+          # Build all architectures in one command
+          docker buildx build \
+            --platform linux/amd64,linux/386,linux/arm64,linux/arm/v7 \
+            -t arbianshkodra/accelero:${STRIPPED_VERSION} \
+            -t arbianshkodra/accelero:latest \
+            --push \
+            .
+
+          # Create and push the manifest
           docker manifest create arbianshkodra/accelero:${STRIPPED_VERSION} \
-            arbianshkodra/accelero:amd64-${STRIPPED_VERSION} \
-            arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
-            arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
-            arbianshkodra/accelero:arm-${STRIPPED_VERSION}
-
-          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
-            arbianshkodra/accelero:i386-${STRIPPED_VERSION} \
-            --os linux --arch 386
-
-          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
-            arbianshkodra/accelero:arm64-${STRIPPED_VERSION} \
-            --os linux --arch arm64
-
-          docker manifest annotate arbianshkodra/accelero:${STRIPPED_VERSION} \
-            arbianshkodra/accelero:arm-${STRIPPED_VERSION} \
-            --os linux --arch arm --variant v7
-
+            arbianshkodra/accelero:${STRIPPED_VERSION}
           docker manifest push arbianshkodra/accelero:${STRIPPED_VERSION}
-
-      - name: Create & push multi-arch manifest for latest
-        run: |
-          docker manifest create arbianshkodra/accelero:latest \
-            arbianshkodra/accelero:amd64-latest \
-            arbianshkodra/accelero:i386-latest \
-            arbianshkodra/accelero:arm64-latest \
-            arbianshkodra/accelero:arm-latest
-
-          docker manifest annotate arbianshkodra/accelero:latest \
-            arbianshkodra/accelero:i386-latest \
-            --os linux --arch 386
-
-          docker manifest annotate arbianshkodra/accelero:latest \
-            arbianshkodra/accelero:arm64-latest \
-            --os linux --arch arm64
-
-          docker manifest annotate arbianshkodra/accelero:latest \
-            arbianshkodra/accelero:arm-latest \
-            --os linux --arch arm --variant v7
-
-          docker manifest push arbianshkodra/accelero:latest
