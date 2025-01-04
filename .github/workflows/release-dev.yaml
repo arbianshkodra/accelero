@@ -61,6 +61,9 @@ jobs:
       matrix:
         goos: [linux, windows, darwin]
         goarch: [amd64, 386, arm, arm64]
+        exclude:
+          - goos: darwin
+            goarch: 386
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,20 +130,6 @@ jobs:
           path: |
             ${{ steps.build.outputs.archive_name }}
             checksums.txt
-
-      - name: Build Release Binaries
-        env:
-          CGO_ENABLED: 0
-        run: |
-          # Linux builds
-          GOOS=linux GOARCH=amd64 go build -o ./release_artifacts/linux_amd64/accelero
-          GOOS=linux GOARCH=386 go build -o ./release_artifacts/linux_386/accelero
-          GOOS=linux GOARCH=arm64 go build -o ./release_artifacts/linux_arm64/accelero
-          GOOS=linux GOARCH=arm GOARM=7 go build -o ./release_artifacts/linux_arm_v7/accelero
-          
-          # Darwin builds (macOS)
-          GOOS=darwin GOARCH=amd64 go build -o ./release_artifacts/darwin_amd64/accelero
-          GOOS=darwin GOARCH=arm64 go build -o ./release_artifacts/darwin_arm64/accelero
 
   release_artifacts:
     name: Create Release with Artifacts
