@@ -78,7 +78,7 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        run: ./scripts/build_docker_image.sh
+        run: ./scripts/build_docker_images.sh
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
