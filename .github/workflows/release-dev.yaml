@@ -53,176 +53,37 @@ jobs:
   #     - name: Run tests
   #       run: go test ./... -coverprofile coverage.out
 
-  build_artifacts:
-    name: Build Archives (like GoReleaser)
+  build-and-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     # needs: [lint, test]
-    strategy:
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, 386, arm, arm64]
-        exclude:
-          - goos: darwin
-            goarch: 386
-          - goos: darwin
-            goarch: arm
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: 1.22.x
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Build binary
-        id: build
-        run: |
-          VERSION="${{ github.ref_name }}"
-          COMMIT="$(git rev-parse --short HEAD)"
-          DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.22.x
 
-          LDFLAGS="-s -w \
-            -X main.version=$VERSION \
-            -X main.commit=$COMMIT \
-            -X main.date=$DATE"
+    - name: Build Binaries
+      run: ./scripts/build_binaries.sh
 
-          BINARY_NAME="accelero"
+    - name: Build Docker Image
+      env:
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      run: ./scripts/build_docker_image.sh
 
-          # Extension for Windows
-          EXT=""
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            EXT=".exe"
-          fi
-
-          # Use GOARM=7 for 32-bit ARM, if needed
-          if [ "${{ matrix.goarch }}" = "arm" ]; then
-            export GOARM=7
-          fi
-
-          # Build
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build \
-            -o "${BINARY_NAME}${EXT}" \
-            -ldflags="$LDFLAGS" \
-            ./cmd/main.go
-
-          # Create archive name
-          ARCHIVE_NAME="accelero_${{ matrix.goos }}_${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            ARCHIVE_NAME="${ARCHIVE_NAME}.zip"
-            zip -9 -r "$ARCHIVE_NAME" "${BINARY_NAME}.exe" LICENSE.md
-          else
-            ARCHIVE_NAME="${ARCHIVE_NAME}.tar.gz"
-            tar -czvf "$ARCHIVE_NAME" "${BINARY_NAME}" LICENSE.md
-          fi
-
-          # Save the archive name for next step
-          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Compute sha256 and store
-        run: |
-          sha256sum ${{ steps.build.outputs.archive_name }} >> checksums.txt
-
-      - name: Upload artifact (for collecting in the next step)
-        uses: actions/upload-artifact@v3
-        with:
-          name: build-output
-          path: |
-            ${{ steps.build.outputs.archive_name }}
-            checksums.txt
-
-  release_artifacts:
-    name: Create Release with Artifacts
-    runs-on: ubuntu-latest
-    needs: [build_artifacts]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          
-      - name: Download all artifacts
-        uses: actions/download-artifact@v3
-        with:
-          name: build-output
-          path: ./release_artifacts
-
-      - name: Merge checksums
-        run: |
-          cat ./release_artifacts/checksums.txt > merged_checksums.txt
-          sort -u merged_checksums.txt > checksums.txt
-          rm -f merged_checksums.txt
-
-      - name: Confirm final checksums
-        run: |
-          echo "Final checksums file is:"
-          cat checksums.txt
-
-      - name: Prepare release notes
-        id: notes
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            CHANGELOG=$(git log --pretty=format:'- %s' $PREV_TAG..HEAD)
-          else
-            CHANGELOG=$(git log --pretty=format:'- %s')
-          fi
-
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create GitHub Release & Upload Assets
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          allowsUpdates: false
-          body: ${{ steps.notes.outputs.changelog }}
-          assets: |
-            ./release_artifacts/*; ;application/octet-stream
-            checksums.txt;checksums.txt;text/plain
-
-  docker_build:
-    name: Docker Build & Push
-    runs-on: ubuntu-latest
-    needs: [release_artifacts]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Docker Login
-        uses: docker/login-action@v3.3.0
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v2
-        with:
-          buildkit-inline-cache: true
-
-      - name: Multi-arch builds and push
-        run: |
-          FULL_VERSION=${{ github.ref_name }}
-          STRIPPED_VERSION=$(echo "$FULL_VERSION" | sed 's/^v//')
-
-          # Build all architectures in one command
-          docker buildx build \
-            --platform linux/amd64,linux/386,linux/arm64,linux/arm/v7 \
-            -t arbianshkodra/accelero:${STRIPPED_VERSION} \
-            -t arbianshkodra/accelero:latest \
-            --push \
-            .
-
-          # Create and push the manifest
-          docker manifest create arbianshkodra/accelero:${STRIPPED_VERSION} \
-            arbianshkodra/accelero:${STRIPPED_VERSION}
-          docker manifest push arbianshkodra/accelero:${STRIPPED_VERSION}
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          dist/*.tar.gz
+          dist/*.zip
+          dist/checksums.txt
+        generate_release_notes: true
