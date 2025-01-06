@@ -1,7 +1,10 @@
 FROM --platform=$BUILDPLATFORM alpine:3.20
 
+ARG TARGETARCH
+ARG TARGETVARIANT
+
 EXPOSE 8000
 
-COPY accelero /
+COPY dist/accelero_linux_${TARGETARCH} /accelero
 
-ENTRYPOINT ["./accelero"]
+ENTRYPOINT ["/accelero"]
