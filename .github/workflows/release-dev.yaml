@@ -54,6 +54,7 @@ jobs:
   #       run: go test ./... -coverprofile coverage.out
 
   build-and-release:
+    name: Build and Release
     runs-on: ubuntu-latest
     permissions:
       contents: write
