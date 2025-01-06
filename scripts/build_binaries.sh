@@ -73,4 +73,3 @@ pushd dist > /dev/null
 popd > /dev/null
 
 echo "All builds done. Binaries are in the dist/ directory."
-
