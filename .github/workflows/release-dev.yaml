@@ -61,30 +61,30 @@ jobs:
       packages: write
     # needs: [lint, test]
 
-  steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: 1.22.x
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.22.x
 
-    - name: Build Binaries
-      run: ./scripts/build_binaries.sh
+      - name: Build Binaries
+        run: ./scripts/build_binaries.sh
 
-    - name: Build Docker Image
-      env:
-        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      run: ./scripts/build_docker_image.sh
+      - name: Build Docker Image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: ./scripts/build_docker_image.sh
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          dist/*.tar.gz
-          dist/*.zip
-          dist/checksums.txt
-        generate_release_notes: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
