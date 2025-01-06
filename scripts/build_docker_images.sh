@@ -40,4 +40,3 @@ docker buildx build \
 echo "Docker images built and published successfully under:"
 echo "  - ${DOCKER_REPO}:${STRIPPED_VERSION}"
 echo "  - ${DOCKER_REPO}:latest"
-
