@@ -88,3 +88,4 @@ jobs:
             dist/*.zip
             dist/checksums.txt
           generate_release_notes: true
+
