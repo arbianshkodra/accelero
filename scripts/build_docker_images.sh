@@ -25,7 +25,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 echo "Setting up Docker BuildX..."
-docker buildx create --use --name multi-arch-builder || true
+docker buildx create --use --name multi-arch-builder
 docker buildx inspect --bootstrap
 
 echo "Building multi-arch images..."
@@ -37,44 +37,44 @@ docker buildx build \
     --push \
     .
 
-# echo "Creating manifest for version ${STRIPPED_VERSION}..."
-# docker manifest create "${DOCKER_REPO}:${STRIPPED_VERSION}" \
-#     "${DOCKER_REPO}:${STRIPPED_VERSION}"
+echo "Creating manifest for version ${STRIPPED_VERSION}..."
+docker manifest create "${DOCKER_REPO}:${STRIPPED_VERSION}" \
+    "${DOCKER_REPO}:${STRIPPED_VERSION}"
 
-# echo "Creating manifest for latest..."
-# docker manifest create "${DOCKER_REPO}:latest" \
-#     "${DOCKER_REPO}:latest"
+echo "Creating manifest for latest..."
+docker manifest create "${DOCKER_REPO}:latest" \
+    "${DOCKER_REPO}:latest"
 
-# for PLATFORM in "${PLATFORMS[@]}"; do
-#     GOOS="${PLATFORM%/*}"
-#     GOARCH="${PLATFORM#*/}"
+for PLATFORM in "${PLATFORMS[@]}"; do
+    GOOS="${PLATFORM%/*}"
+    GOARCH="${PLATFORM#*/}"
     
-#     if [[ "$PLATFORM" == *"arm/v7"* ]]; then
-#         GOARCH="arm"
-#         VARIANT="v7"
-#     else
-#         VARIANT=""
-#     fi
+    if [[ "$PLATFORM" == *"arm/v7"* ]]; then
+        GOARCH="arm"
+        VARIANT="v7"
+    else
+        VARIANT=""
+    fi
 
-#     echo "Adding manifest annotation for ${PLATFORM}..."
-#     if [[ -n "$VARIANT" ]]; then
-#         docker manifest annotate "${DOCKER_REPO}:${STRIPPED_VERSION}" \
-#             "${DOCKER_REPO}:${STRIPPED_VERSION}" \
-#             --os "${GOOS}" --arch "${GOARCH}" --variant "${VARIANT}"
+    echo "Adding manifest annotation for ${PLATFORM}..."
+    if [[ -n "$VARIANT" ]]; then
+        docker manifest annotate "${DOCKER_REPO}:${STRIPPED_VERSION}" \
+            "${DOCKER_REPO}:${STRIPPED_VERSION}" \
+            --os "${GOOS}" --arch "${GOARCH}" --variant "${VARIANT}"
         
-#         docker manifest annotate "${DOCKER_REPO}:latest" \
-#             "${DOCKER_REPO}:latest" \
-#             --os "${GOOS}" --arch "${GOARCH}" --variant "${VARIANT}"
-#     else
-#         docker manifest annotate "${DOCKER_REPO}:${STRIPPED_VERSION}" \
-#             "${DOCKER_REPO}:${STRIPPED_VERSION}" \
-#             --os "${GOOS}" --arch "${GOARCH}"
+        docker manifest annotate "${DOCKER_REPO}:latest" \
+            "${DOCKER_REPO}:latest" \
+            --os "${GOOS}" --arch "${GOARCH}" --variant "${VARIANT}"
+    else
+        docker manifest annotate "${DOCKER_REPO}:${STRIPPED_VERSION}" \
+            "${DOCKER_REPO}:${STRIPPED_VERSION}" \
+            --os "${GOOS}" --arch "${GOARCH}"
         
-#         docker manifest annotate "${DOCKER_REPO}:latest" \
-#             "${DOCKER_REPO}:latest" \
-#             --os "${GOOS}" --arch "${GOARCH}"
-#     fi
-# done
+        docker manifest annotate "${DOCKER_REPO}:latest" \
+            "${DOCKER_REPO}:latest" \
+            --os "${GOOS}" --arch "${GOARCH}"
+    fi
+done
 
 echo "Pushing manifests..."
 docker manifest push "${DOCKER_REPO}:${STRIPPED_VERSION}"
