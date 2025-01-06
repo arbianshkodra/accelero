@@ -12,12 +12,17 @@ PLATFORMS=(
     "linux/arm/v7"
 )
 
-echo "Logging into Docker Hub..."
-if [[ -z "${DOCKER_USERNAME:-}" ]] || [[ -z "${DOCKER_PASSWORD:-}" ]]; then
-    echo "Error: DOCKER_USERNAME and DOCKER_PASSWORD must be set"
-    exit 1
+if ! docker info >/dev/null 2>&1; then
+    if [[ -n "${DOCKER_CONFIG:-}" ]]; then
+        echo "Using Docker config from DOCKER_CONFIG"
+    elif [[ -n "${DOCKER_USERNAME:-}" ]] && [[ -n "${DOCKER_PASSWORD:-}" ]]; then
+        echo "Logging into Docker Hub using credentials..."
+        echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+    else
+        echo "No Docker authentication found. Ensure you're logged in or provide credentials."
+        exit 1
+    fi
 fi
-echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
 
 echo "Setting up Docker BuildX..."
 docker buildx create --use --name multi-arch-builder
