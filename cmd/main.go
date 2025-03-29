@@ -26,11 +26,14 @@ func init() {
 
 	// Set the log format (JSON or text) based on an environment variable
 	if os.Getenv("LOG_FORMAT") == "json" {
-		logrus.SetFormatter(&logrus.JSONFormatter{})
+		logrus.SetFormatter(&logrus.JSONFormatter{
+			TimestampFormat: "2006-01-02T15:04:05",
+		})
 	} else {
 		// Use the text formatter as default
 		logrus.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
+			FullTimestamp:   true,
+			TimestampFormat: "2006-01-02T15:04:05",
 		})
 	}
 }
