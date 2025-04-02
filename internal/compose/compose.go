@@ -64,6 +64,15 @@ func RunDockerCompose(ctx context.Context, repoDir string) error {
 	}
 	logrus.Info("Created Docker client")
 
+	// Track services that need to be rolled back on failure
+	successfulServices := make(map[string]bool)
+	defer func() {
+		if r := recover(); r != nil {
+			logrus.Errorf("Recovered from panic: %v", r)
+			rollbackFailedDeployment(ctx, cli, servicesToDeploy, successfulServices, composeFile.Services, repoDir)
+		}
+	}()
+
 	// Create networks
 	for netName, netConfig := range composeFile.Networks {
 		logrus.Infof("Creating network %s with config %+v", netName, netConfig)
@@ -71,6 +80,9 @@ func RunDockerCompose(ctx context.Context, repoDir string) error {
 			return fmt.Errorf("failed to create network %s: %w", netName, err)
 		}
 	}
+
+	// Track any deployment errors
+	var deploymentError error
 
 	for _, serviceName := range servicesToDeploy {
 		svc, exists := composeFile.Services[serviceName]
@@ -87,26 +99,38 @@ func RunDockerCompose(ctx context.Context, repoDir string) error {
 				continue
 			}
 
-			logrus.Infof("Deploying dependent service: %s", dependency)
-			if err := service.DeployService(cli, dependency, repoDir, dependentService, 1); err != nil {
-				return fmt.Errorf("failed to deploy dependent service %s: %w", dependency, err)
+			if !successfulServices[dependency] {
+				logrus.Infof("Deploying dependent service: %s", dependency)
+				if err := service.DeployService(cli, dependency, repoDir, dependentService, 1); err != nil {
+					deploymentError = fmt.Errorf("failed to deploy dependent service %s: %w", dependency, err)
+					break
+				}
+				successfulServices[dependency] = true
 			}
+		}
+
+		if deploymentError != nil {
+			break
 		}
 
 		logrus.Infof("Pulling image for service: %s", serviceName)
 		if err := service.PullImage(cli, svc.Image); err != nil {
-			return fmt.Errorf("failed to pull image for service %s: %w", serviceName, err)
+			deploymentError = fmt.Errorf("failed to pull image for service %s: %w", serviceName, err)
+			break
 		}
 
 		isFirstDeployment, err := service.AreContainersRunning(cli, serviceName)
 		if err != nil {
-			return fmt.Errorf("failed to check if containers are running for service %s: %w", serviceName, err)
+			deploymentError = fmt.Errorf("failed to check if containers are running for service %s: %w", serviceName, err)
+			break
 		}
 
 		if err := service.DeployService(cli, serviceName, repoDir, svc, 1); err != nil {
-			return fmt.Errorf("failed to deploy service %s: %w", serviceName, err)
+			deploymentError = fmt.Errorf("failed to deploy service %s: %w", serviceName, err)
+			break
 		}
 
+		successfulServices[serviceName] = true
 		if !isFirstDeployment {
 			logrus.Infof("Deployed %s for the first time", serviceName)
 		} else {
@@ -114,5 +138,38 @@ func RunDockerCompose(ctx context.Context, repoDir string) error {
 		}
 	}
 
+	if deploymentError != nil {
+		logrus.Error(deploymentError)
+		rollbackFailedDeployment(ctx, cli, servicesToDeploy, successfulServices, composeFile.Services, repoDir)
+		return deploymentError
+	}
+
 	return nil
+}
+
+// rollbackFailedDeployment attempts to roll back services that were successfully deployed
+// when a later service deployment fails
+func rollbackFailedDeployment(ctx context.Context, cli *client.Client,
+	servicesToDeploy []string, successfulServices map[string]bool,
+	services map[string]service.ComposeService, repoDir string) {
+	logrus.Warn("Deployment failed, attempting to roll back...")
+
+	// Start with the most recently deployed services first
+	for i := len(servicesToDeploy) - 1; i >= 0; i-- {
+		serviceName := servicesToDeploy[i]
+		if successfulServices[serviceName] {
+			logrus.Infof("Attempting to roll back service: %s", serviceName)
+			previousState, err := service.CaptureServiceState(ctx, cli, serviceName)
+			if err != nil {
+				logrus.Errorf("Failed to capture current state for service %s: %v", serviceName, err)
+				continue
+			}
+
+			if err := service.RollbackService(ctx, cli, previousState); err != nil {
+				logrus.Errorf("Failed to roll back service %s: %v", serviceName, err)
+			} else {
+				logrus.Infof("Successfully rolled back service %s", serviceName)
+			}
+		}
+	}
 }

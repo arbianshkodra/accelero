@@ -28,6 +28,13 @@ func AreContainersRunning(cli DockerClient, serviceName string) (bool, error) {
 func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeService, scale int) error {
 	ctx := context.Background()
 
+	// Capture the current state of the service for potential rollback
+	previousState, err := CaptureServiceState(ctx, cli, serviceName)
+	if err != nil {
+		logrus.Warnf("Failed to capture service state for rollback: %v", err)
+		// Continue with deployment even if we can't capture state
+	}
+
 	// List existing containers
 	existingContainers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
@@ -67,12 +74,24 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 		}
 	}
 
+	// Track if deployment is successful
+	deploymentSuccessful := false
+	defer func() {
+		if !deploymentSuccessful && previousState != nil {
+			logrus.Warnf("Deployment failed, attempting to roll back service %s", serviceName)
+			if err := RollbackService(ctx, cli, previousState); err != nil {
+				logrus.Errorf("Rollback failed: %v", err)
+			} else {
+				logrus.Info("Rollback completed successfully")
+			}
+		}
+	}()
+
 	// If no containers were found, it's the first deployment
 	if !containersFound {
 		logrus.Infof("No existing containers found, deploying service %s for the first time", serviceName)
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			// Update the function call here
 			if err := CreateAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
 				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
@@ -84,28 +103,39 @@ func DeployService(cli *client.Client, serviceName, repoDir string, svc ComposeS
 		}
 	} else if len(containersToRemove) > 0 {
 		logrus.Infof("Creating and starting new containers for service: %s", serviceName)
+
+		// Track the new containers we're creating for this deployment
+		newContainers := make([]string, 0, scale)
+
+		// Create and start new containers
 		for i := 0; i < scale; i++ {
 			instanceName := fmt.Sprintf("%s_%d_%d", serviceName, i, time.Now().UnixNano())
-			// Update the function call here
 			if err := CreateAndStartContainer(ctx, cli, instanceName, repoDir, svc, serviceName); err != nil {
 				return fmt.Errorf("failed to create and start container %s: %w", instanceName, err)
 			}
+
 			logrus.Infof("Waiting for health check to complete for new container %s", instanceName)
 			if err := utils.WaitForHealthCheck(ctx, cli, instanceName); err != nil {
 				return fmt.Errorf("health check failed for new container %s: %w", instanceName, err)
 			}
+
+			newContainers = append(newContainers, instanceName)
 			logrus.Infof("New container %s created and started successfully", instanceName)
 		}
 
+		// Only remove old containers if all new containers are healthy
 		for _, containerID := range containersToRemove {
 			logrus.Infof("Removing container %s", containerID)
 			if err := cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
-				return fmt.Errorf("failed to remove container %s: %w", containerID, err)
+				logrus.Warnf("Failed to remove container %s: %v", containerID, err)
+				// Continue with other containers
 			}
 		}
 	} else {
 		logrus.Info("No existing containers with outdated image tags found, no action needed")
 	}
 
+	// Mark deployment as successful
+	deploymentSuccessful = true
 	return nil
 }
