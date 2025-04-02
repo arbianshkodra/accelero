@@ -69,7 +69,14 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to create docker client: %v", err)
 	}
-	logrus.Info("Created Docker client")
+
+	// Check if Docker daemon is actually running and accessible
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx); err != nil {
+		logrus.Fatalf("Cannot connect to the Docker daemon at %s. Is the docker daemon running? Error: %v", dockerSock, err)
+	}
+	logrus.Info("Connected to Docker daemon successfully")
 
 	// Start cleanup routine
 	startCleanupRoutine(cli)
@@ -84,6 +91,9 @@ func main() {
 	apiRouter.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
 		handler.Webhook(w, r, taskQueue)
 	}).Methods("POST")
+
+	// Add the status endpoint
+	apiRouter.HandleFunc("/status", handler.StatusHandler).Methods("GET")
 
 	server := &http.Server{
 		Addr:    ":8000",
