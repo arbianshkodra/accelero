@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -51,9 +53,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize the worker pool
-	numWorkers := 5 // Adjust this number based on your needs
-	taskQueue := make(chan handler.WebhookTask, 100)
+	// Initialize dynamic worker pool based on system resources
+	numWorkers := calculateOptimalWorkers()
+	taskQueueSize := calculateOptimalQueueSize(numWorkers)
+	taskQueue := make(chan handler.WebhookTask, taskQueueSize)
+	
+	logrus.Infof("Starting worker pool with %d workers and queue size %d", numWorkers, taskQueueSize)
 	handler.StartWorkerPool(ctx, numWorkers, taskQueue)
 
 	// Create Docker client
@@ -143,4 +148,61 @@ func startCleanupRoutine(cli *client.Client) {
 			}
 		}
 	}()
+}
+
+// calculateOptimalWorkers determines the optimal number of workers based on system resources
+func calculateOptimalWorkers() int {
+	// Check for environment variable override
+	if workerStr := os.Getenv("WORKER_COUNT"); workerStr != "" {
+		if workers, err := strconv.Atoi(workerStr); err == nil && workers > 0 {
+			logrus.Infof("Using custom worker count from WORKER_COUNT: %d", workers)
+			return workers
+		}
+	}
+
+	// Calculate based on CPU cores
+	cpuCores := runtime.NumCPU()
+	
+	// Base calculation: 2 workers per CPU core for I/O intensive tasks
+	workers := cpuCores * 2
+	
+	// Set reasonable bounds
+	const minWorkers = 2
+	const maxWorkers = 50
+	
+	if workers < minWorkers {
+		workers = minWorkers
+	} else if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	
+	logrus.Infof("Calculated %d workers based on %d CPU cores", workers, cpuCores)
+	return workers
+}
+
+// calculateOptimalQueueSize determines the optimal queue size based on worker count
+func calculateOptimalQueueSize(numWorkers int) int {
+	// Check for environment variable override
+	if queueStr := os.Getenv("QUEUE_SIZE"); queueStr != "" {
+		if queueSize, err := strconv.Atoi(queueStr); err == nil && queueSize > 0 {
+			logrus.Infof("Using custom queue size from QUEUE_SIZE: %d", queueSize)
+			return queueSize
+		}
+	}
+
+	// Calculate queue size: 10-20 tasks per worker
+	queueSize := numWorkers * 15
+	
+	// Set reasonable bounds
+	const minQueueSize = 50
+	const maxQueueSize = 1000
+	
+	if queueSize < minQueueSize {
+		queueSize = minQueueSize
+	} else if queueSize > maxQueueSize {
+		queueSize = maxQueueSize
+	}
+	
+	logrus.Infof("Calculated queue size %d based on %d workers", queueSize, numWorkers)
+	return queueSize
 }
