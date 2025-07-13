@@ -8,6 +8,9 @@ export $(grep -v '^#' dev.env | xargs)
 
 docker run --rm --name accelero -p 8000:8000 --env-file envs/dev/dev.env -v /var/run/docker.sock:/var/run/docker.sock accelero
 
+curl -X GET http://localhost:8000/status -H "X-API-KEY: f98671b7-e205-4020-82f5-61114abf4067"
+curl -X GET "http://localhost:8000/status?id=d2a29c8e8f5f533b9e95ae779a02bfd7" -H "X-API-KEY: f98671b7-e205-4020-82f5-61114abf4067"
+curl -X GET http://localhost:8000/status\?stats\=true -H "X-API-KEY: f98671b7-e205-4020-82f5-61114abf4067"
 
 ================================================================================================
 Usage Instructions
@@ -40,4 +43,57 @@ Configurable Logging: Log level and format can be configured without changing th
 
 ================================================================================================
 
-12. Container Management Enhancements
+Consuming the /status Endpoint in Accelero
+1. Get Status of All Deployments
+curl -X GET http://localhost:8000/status -H "X-API-KEY: your_api_key"
+
+This returns an array of all deployment statuses.
+
+2. Get Status of a Specific Deployment
+curl -X GET "http://localhost:8000/status?id=1680456789012345" -H "X-API-KEY: your_api_key"
+
+Response Format
+The response will be a JSON object (for a specific ID) or array of objects (for all deployments) with this structure:
+{
+  "request_id": "1680456789012345",
+  "service_name": "my-service",
+  "status": "completed", 
+  "created_at": "2025-04-02T19:45:32.123Z",
+  "completed_at": "2025-04-02T19:46:12.456Z", 
+  "error_message": "",
+  "image_tag": "v1.2.3"
+}
+
+Possible status values:
+"pending": Deployment is queued
+"in_progress": Deployment is being processed
+"completed": Deployment completed successfully
+"failed": Deployment failed
+"rolled_back": Deployment failed and was rolled back
+
+Integration Example
+# Submit deployment webhook
+RESPONSE=$(curl -s -X POST http://localhost:8000/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: your_api_key" \
+  -d '{"text": "New Docker image has been pushed"}')
+
+# Extract request_id
+REQUEST_ID=$(echo $RESPONSE | jq -r '.request_id')
+
+# Poll status until deployment completes
+while true; do
+  STATUS=$(curl -s -X GET "http://localhost:8000/status?id=$REQUEST_ID" \
+    -H "X-API-KEY: your_api_key" | jq -r '.status')
+  
+  if [[ "$STATUS" == "completed" ]]; then
+    echo "Deployment completed successfully"
+    break
+  elif [[ "$STATUS" == "failed" || "$STATUS" == "rolled_back" ]]; then
+    echo "Deployment failed"
+    exit 1
+  fi
+  
+  echo "Deployment in progress... ($STATUS)"
+  sleep 5
+done
