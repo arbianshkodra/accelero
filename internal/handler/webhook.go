@@ -2,11 +2,15 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +18,17 @@ import (
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/git"
 	"github.com/sirupsen/logrus"
+)
+
+// Security constants
+const (
+	MaxPayloadSize = 1024 * 1024 // 1MB max payload size
+	MaxRequestIDLength = 64
+)
+
+// Validation patterns
+var (
+	requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 )
 
 // Define a struct for tasks
@@ -40,11 +55,14 @@ var (
 	statusMutex        sync.RWMutex
 )
 
-// StartWorkerPool initializes the worker pool
+// StartWorkerPool initializes the worker pool and status cleanup routine
 func StartWorkerPool(ctx context.Context, numWorkers int, taskQueue <-chan WebhookTask) {
 	for i := 0; i < numWorkers; i++ {
 		go worker(ctx, i, taskQueue)
 	}
+	
+	// Start the status cleanup routine
+	go statusCleanupRoutine(ctx)
 }
 
 // Worker function to process tasks
@@ -85,7 +103,13 @@ func processTask(ctx context.Context, task WebhookTask) {
 	taskCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	repoDir := "./data_" + task.RequestID
+	// Create secure directory path to prevent directory traversal
+	repoDir, err := createSecureRepoDir(task.RequestID)
+	if err != nil {
+		logrus.Errorf("Error creating secure directory for task %s: %v", task.RequestID, err)
+		updateDeploymentStatus(task.RequestID, "failed", fmt.Sprintf("Directory creation error: %v", err), "")
+		return
+	}
 
 	// Create initial deployment status
 	createDeploymentStatus(task.RequestID, "pending", "")
@@ -187,33 +211,58 @@ func GetAllDeploymentStatuses() []*DeploymentStatus {
 // Modified Webhook handler to enqueue tasks
 func Webhook(w http.ResponseWriter, r *http.Request, taskQueue chan<- WebhookTask) {
 	// Generate a unique request ID (e.g., UUID)
-	requestID := generateRequestID()
+	requestID, err := generateSecureRequestID()
+	if err != nil {
+		logrus.Errorf("Failed to generate request ID: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	// Validate HTTP method
 	if r.Method != http.MethodPost {
+		logrus.Warnf("Invalid HTTP method %s from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Validate content type if necessary
-	if r.Header.Get("Content-Type") != "application/json" {
-		http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+	// Validate content type
+	contentType := r.Header.Get("Content-Type")
+	if contentType != "application/json" {
+		logrus.Warnf("Invalid content type %s from %s", contentType, r.RemoteAddr)
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	// Read the request payload if necessary
+	// Limit payload size to prevent DoS attacks
+	r.Body = http.MaxBytesReader(w, r.Body, MaxPayloadSize)
+
+	// Read the request payload with size limit
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
-		logrus.Errorf("Failed to read request body: %v", err)
+		logrus.Errorf("Failed to read request body from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
 
-	// Validate payload structure if expecting JSON
+	// Validate payload is not empty
+	if len(payload) == 0 {
+		logrus.Warnf("Empty payload from %s", r.RemoteAddr)
+		http.Error(w, "Empty payload", http.StatusBadRequest)
+		return
+	}
+
+	// Validate payload structure - must be valid JSON
 	var data map[string]interface{}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		logrus.Errorf("Invalid JSON payload: %v", err)
+		logrus.Errorf("Invalid JSON payload from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Optional: Validate required fields in payload
+	if err := validatePayloadStructure(data); err != nil {
+		logrus.Errorf("Invalid payload structure from %s: %v", r.RemoteAddr, err)
+		http.Error(w, fmt.Sprintf("Invalid payload structure: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -247,19 +296,35 @@ func Webhook(w http.ResponseWriter, r *http.Request, taskQueue chan<- WebhookTas
 	}
 }
 
-// Add a new status endpoint
+// Add a new status endpoint with input validation
 func StatusHandler(w http.ResponseWriter, r *http.Request) {
-	// Extract request ID from query params if provided
+	// Only allow GET requests
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract query parameters
 	requestID := r.URL.Query().Get("id")
+	showStats := r.URL.Query().Get("stats") == "true"
 
 	var response interface{}
 	if requestID != "" {
+		// Validate request ID format and length
+		if err := validateRequestID(requestID); err != nil {
+			logrus.Warnf("Invalid request ID format from %s: %v", r.RemoteAddr, err)
+			http.Error(w, "Invalid request ID format", http.StatusBadRequest)
+			return
+		}
+
 		status := GetDeploymentStatus(requestID)
 		if status == nil {
 			http.Error(w, "Deployment not found", http.StatusNotFound)
 			return
 		}
 		response = status
+	} else if showStats {
+		response = getStatusStatistics()
 	} else {
 		response = GetAllDeploymentStatuses()
 	}
@@ -271,7 +336,211 @@ func StatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Utility function to generate a unique request ID
-func generateRequestID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+// generateSecureRequestID generates a cryptographically secure request ID
+func generateSecureRequestID() (string, error) {
+	bytes := make([]byte, 16) // 128-bit random value
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// validateRequestID validates the format and length of request IDs
+func validateRequestID(requestID string) error {
+	if len(requestID) == 0 {
+		return fmt.Errorf("request ID cannot be empty")
+	}
+	if len(requestID) > MaxRequestIDLength {
+		return fmt.Errorf("request ID too long (max %d characters)", MaxRequestIDLength)
+	}
+	if !requestIDPattern.MatchString(requestID) {
+		return fmt.Errorf("request ID contains invalid characters")
+	}
+	return nil
+}
+
+// createSecureRepoDir creates a secure directory path to prevent directory traversal
+func createSecureRepoDir(requestID string) (string, error) {
+	// Validate request ID first
+	if err := validateRequestID(requestID); err != nil {
+		return "", fmt.Errorf("invalid request ID: %w", err)
+	}
+
+	// Create a secure base directory
+	baseDir := "./data"
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create base directory: %w", err)
+	}
+
+	// Create secure subdirectory using cleaned request ID
+	repoDir := filepath.Join(baseDir, "deployment_"+requestID)
+	
+	// Ensure the path is within our base directory (prevent directory traversal)
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+	
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve base directory: %w", err)
+	}
+	
+	if !strings.HasPrefix(absRepoDir, absBaseDir) {
+		return "", fmt.Errorf("directory traversal attempt detected")
+	}
+
+	return repoDir, nil
+}
+
+// validatePayloadStructure validates the webhook payload structure
+func validatePayloadStructure(data map[string]interface{}) error {
+	// This is a basic validation - extend based on your webhook requirements
+	// For example, if you expect specific fields:
+	
+	// Example validation (uncomment and modify as needed):
+	// if _, ok := data["repository"]; !ok {
+	//     return fmt.Errorf("missing required field: repository")
+	// }
+	
+	// Add more validation as needed for your specific webhook format
+	return nil
+}
+
+// statusCleanupRoutine periodically cleans up old deployment statuses to prevent memory leaks
+func statusCleanupRoutine(ctx context.Context) {
+	// Configurable cleanup interval (default: 1 hour)
+	cleanupInterval := getCleanupInterval()
+	
+	// Configurable max age for deployment statuses (default: 24 hours)
+	maxAge := getStatusMaxAge()
+	
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	
+	logrus.Infof("Starting status cleanup routine (interval: %v, max age: %v)", cleanupInterval, maxAge)
+	
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Info("Status cleanup routine stopping")
+			return
+		case <-ticker.C:
+			cleanupOldStatuses(maxAge)
+		}
+	}
+}
+
+// cleanupOldStatuses removes deployment statuses older than the specified age
+func cleanupOldStatuses(maxAge time.Duration) {
+	statusMutex.Lock()
+	defer statusMutex.Unlock()
+	
+	now := time.Now()
+	initialCount := len(deploymentStatuses)
+	removedCount := 0
+	
+	for requestID, status := range deploymentStatuses {
+		// Calculate age based on completion time if available, otherwise start time
+		statusAge := now.Sub(status.StartTime)
+		if !status.CompletedAt.IsZero() {
+			statusAge = now.Sub(status.CompletedAt)
+		}
+		
+		if statusAge > maxAge {
+			delete(deploymentStatuses, requestID)
+			removedCount++
+		}
+	}
+	
+	if removedCount > 0 {
+		logrus.Infof("Cleaned up %d old deployment statuses (total: %d -> %d)", 
+			removedCount, initialCount, len(deploymentStatuses))
+	} else {
+		logrus.Debugf("No old deployment statuses to clean up (total: %d)", len(deploymentStatuses))
+	}
+}
+
+// GetStatusMapSize returns the current size of the deployment status map (for monitoring)
+func GetStatusMapSize() int {
+	statusMutex.RLock()
+	defer statusMutex.RUnlock()
+	return len(deploymentStatuses)
+}
+
+// getCleanupInterval returns the configurable cleanup interval
+func getCleanupInterval() time.Duration {
+	if intervalStr := os.Getenv("STATUS_CLEANUP_INTERVAL"); intervalStr != "" {
+		if duration, err := time.ParseDuration(intervalStr); err == nil {
+			logrus.Infof("Using custom status cleanup interval: %v", duration)
+			return duration
+		} else {
+			logrus.Warnf("Invalid STATUS_CLEANUP_INTERVAL '%s', using default: 1h", intervalStr)
+		}
+	}
+	return 1 * time.Hour
+}
+
+// getStatusMaxAge returns the configurable max age for status cleanup
+func getStatusMaxAge() time.Duration {
+	if maxAgeStr := os.Getenv("STATUS_MAX_AGE"); maxAgeStr != "" {
+		if duration, err := time.ParseDuration(maxAgeStr); err == nil {
+			logrus.Infof("Using custom status max age: %v", duration)
+			return duration
+		} else {
+			logrus.Warnf("Invalid STATUS_MAX_AGE '%s', using default: 24h", maxAgeStr)
+		}
+	}
+	return 24 * time.Hour
+}
+
+// StatusStatistics represents memory and performance statistics
+type StatusStatistics struct {
+	TotalStatuses     int                    `json:"total_statuses"`
+	StatusBreakdown   map[string]int         `json:"status_breakdown"`
+	OldestStatus      *time.Time             `json:"oldest_status,omitempty"`
+	NewestStatus      *time.Time             `json:"newest_status,omitempty"`
+	CleanupInterval   string                 `json:"cleanup_interval"`
+	StatusMaxAge      string                 `json:"status_max_age"`
+	MemoryUsageBytes  int                    `json:"estimated_memory_bytes"`
+}
+
+// getStatusStatistics returns memory and performance statistics
+func getStatusStatistics() StatusStatistics {
+	statusMutex.RLock()
+	defer statusMutex.RUnlock()
+	
+	stats := StatusStatistics{
+		TotalStatuses:   len(deploymentStatuses),
+		StatusBreakdown: make(map[string]int),
+		CleanupInterval: getCleanupInterval().String(),
+		StatusMaxAge:    getStatusMaxAge().String(),
+	}
+	
+	var oldestTime, newestTime *time.Time
+	memoryUsage := 0
+	
+	for _, status := range deploymentStatuses {
+		// Count by status
+		stats.StatusBreakdown[status.Status]++
+		
+		// Track oldest and newest
+		if oldestTime == nil || status.StartTime.Before(*oldestTime) {
+			oldestTime = &status.StartTime
+		}
+		if newestTime == nil || status.StartTime.After(*newestTime) {
+			newestTime = &status.StartTime
+		}
+		
+		// Estimate memory usage (rough calculation)
+		memoryUsage += len(status.RequestID) + len(status.ServiceName) + 
+					   len(status.Status) + len(status.ErrorMessage) + 
+					   len(status.ImageTag) + 100 // overhead for struct fields
+	}
+	
+	stats.OldestStatus = oldestTime
+	stats.NewestStatus = newestTime
+	stats.MemoryUsageBytes = memoryUsage
+	
+	return stats
 }
