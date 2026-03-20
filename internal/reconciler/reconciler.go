@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -406,7 +407,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 
 	// ---- 5. Check network drift (desired networks that don't exist) ----
 	if len(desiredNetworks) > 0 {
-		existingNetworks, netErr := r.docker.NetworkList(ctx, types.NetworkListOptions{})
+		existingNetworks, netErr := r.docker.NetworkList(ctx, dockernetwork.ListOptions{})
 		if netErr == nil {
 			existingSet := make(map[string]bool, len(existingNetworks))
 			for _, n := range existingNetworks {
