@@ -3,12 +3,6 @@ name: Release Docs Dev
 on:
   pull_request:
     branches: [dev]
-    paths:
-      - '.github/workflows/release-docs-dev.yaml'
-  workflow_run:
-    workflows: ["Release Dev"]
-    types:
-      - completed
 
 permissions:
   contents: write
@@ -17,9 +11,6 @@ jobs:
   release-docs-dev:
     name: Release Docs Dev
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.event.workflow_run.conclusion == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -41,7 +32,6 @@ jobs:
         run: mkdocs build
 
       - name: Install SSH Key
-        if: github.event_name != 'pull_request'
         shell: bash
         env:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -54,7 +44,6 @@ jobs:
           /usr/bin/ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy documentation
-        if: github.event_name != 'pull_request'
         shell: bash
         env:
           KEY_PATH: ${{ secrets.CERT_PATH }}
