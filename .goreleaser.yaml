@@ -15,7 +15,7 @@ before:
 
 builds:
   - 
-    main: ./cmd/main.go
+    main: ./cmd/
     binary: accelero
     env:
       - CGO_ENABLED=0
@@ -28,6 +28,9 @@ builds:
       - '386'
       - arm
       - arm64
+    ignore:
+      - goos: windows
+        goarch: arm
     ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
 
 checksum:
