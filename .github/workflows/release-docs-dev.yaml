@@ -1,6 +1,10 @@
 name: Release Docs Dev
 
 on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - '.github/workflows/release-docs-dev.yaml'
   workflow_run:
     workflows: ["Release Dev"]
     types:
@@ -13,7 +17,9 @@ jobs:
   release-docs-dev:
     name: Release Docs Dev
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -35,20 +41,24 @@ jobs:
         run: mkdocs build
 
       - name: Install SSH Key
+        if: github.event_name != 'pull_request'
+        shell: bash
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          CERT_PATH: ${{ secrets.CERT_PATH }}
-          DEPLOY_HOST: ${{ secrets.HOST }}
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          KEY_PATH: ${{ secrets.CERT_PATH }}
+          HOST: ${{ secrets.HOST }}
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$CERT_PATH"
-          chmod 600 "$CERT_PATH"
-          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          /bin/mkdir -p ~/.ssh
+          /usr/bin/printf '%s\n' "$SSH_KEY" > "$KEY_PATH"
+          /bin/chmod 600 "$KEY_PATH"
+          /usr/bin/ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy documentation
+        if: github.event_name != 'pull_request'
+        shell: bash
         env:
-          CERT_PATH: ${{ secrets.CERT_PATH }}
-          DEPLOY_HOST: ${{ secrets.HOST }}
+          KEY_PATH: ${{ secrets.CERT_PATH }}
+          HOST: ${{ secrets.HOST }}
           DEPLOY_USER: ${{ secrets.USER }}
           DEPLOY_PATH: ${{ secrets.PATH }}
-        run: scp -i "$CERT_PATH" -r site/ "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
+        run: /usr/bin/scp -i "$KEY_PATH" -r site/ "${DEPLOY_USER}@${HOST}:${DEPLOY_PATH}"
