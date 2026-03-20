@@ -16,7 +16,6 @@ PLATFORMS=(
   "windows/amd64"
   "windows/386"
   "windows/arm64"
-  "windows/arm"
   "darwin/amd64"
   "darwin/arm64"
 )
