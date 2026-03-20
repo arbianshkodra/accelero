@@ -22,8 +22,9 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
@@ -595,8 +596,8 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 
 // pullImage pulls a Docker image, optionally authenticating with the supplied
 // per-stack registry credentials (not environment variables).
-func (d *Deployer) pullImage(ctx context.Context, image, username, password, serverAddress string) error {
-	opts := types.ImagePullOptions{}
+func (d *Deployer) pullImage(ctx context.Context, imageRef, username, password, serverAddress string) error {
+	opts := image.PullOptions{}
 
 	if username != "" && password != "" {
 		authConfig := registry.AuthConfig{
@@ -611,18 +612,17 @@ func (d *Deployer) pullImage(ctx context.Context, image, username, password, ser
 		opts.RegistryAuth = base64.URLEncoding.EncodeToString(encoded)
 	}
 
-	reader, err := d.cli.ImagePull(ctx, image, opts)
+	reader, err := d.cli.ImagePull(ctx, imageRef, opts)
 	if err != nil {
-		return fmt.Errorf("failed to pull image %s: %w", image, err)
+		return fmt.Errorf("failed to pull image %s: %w", imageRef, err)
 	}
 	defer reader.Close()
 
-	// Drain the reader to ensure the pull completes.
 	if _, err := io.Copy(io.Discard, reader); err != nil {
-		return fmt.Errorf("error reading image pull response for %s: %w", image, err)
+		return fmt.Errorf("error reading image pull response for %s: %w", imageRef, err)
 	}
 
-	logrus.WithField("image", image).Info("Image pulled successfully")
+	logrus.WithField("image", imageRef).Info("Image pulled successfully")
 	return nil
 }
 
