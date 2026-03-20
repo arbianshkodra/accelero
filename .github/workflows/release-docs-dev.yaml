@@ -3,8 +3,6 @@ name: Release Docs Dev
 on:
   workflow_run:
     workflows: ["Release Dev"]
-    branches:
-      - dev
     types:
       - completed
 
