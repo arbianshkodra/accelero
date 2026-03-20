@@ -1,0 +1,607 @@
+package reconciler
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/arbianshkodra/accelero/internal/network"
+	"github.com/arbianshkodra/accelero/internal/service"
+	"github.com/arbianshkodra/accelero/internal/store"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
+)
+
+// Label constants used to identify containers managed by Accelero.
+const (
+	labelManagedBy = "managed-by"
+	labelManagedByValue = "accelero"
+	labelStackName = "accelero-stack"
+)
+
+// Deployer is the interface that the stack deployer must satisfy.
+type Deployer interface {
+	Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error)
+}
+
+// DriftReport summarises the result of a single reconciliation check.
+type DriftReport struct {
+	StackID   string     `json:"stack_id"`
+	StackName string     `json:"stack_name"`
+	CheckedAt time.Time  `json:"checked_at"`
+	HasDrift  bool       `json:"has_drift"`
+	Drifts    []DriftItem `json:"drifts,omitempty"`
+}
+
+// DriftItem describes one specific piece of drift for a service.
+type DriftItem struct {
+	ServiceName string `json:"service_name"`
+	Type        string `json:"type"` // missing, image_mismatch, stopped, extra, unhealthy
+	Expected    string `json:"expected,omitempty"`
+	Actual      string `json:"actual,omitempty"`
+	Message     string `json:"message"`
+}
+
+// composeFile mirrors the structure used by the compose package.
+type composeFile struct {
+	Version  string                            `yaml:"version"`
+	Services map[string]service.ComposeService `yaml:"services"`
+	Networks map[string]network.ComposeNetwork `yaml:"networks,omitempty"`
+}
+
+// stackLoop holds the cancellation handle for a single per-stack goroutine.
+type stackLoop struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Reconciler periodically compares desired state (git) against actual state
+// (running Docker containers) for every stack that has reconciliation enabled,
+// and optionally triggers deployments to converge.
+type Reconciler struct {
+	store    store.Store
+	docker   *client.Client
+	deployer Deployer
+
+	mu    sync.Mutex          // guards loops
+	loops map[string]*stackLoop // keyed by stack ID
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// New creates a Reconciler. Call Start to begin reconciliation loops.
+func New(s store.Store, dockerClient *client.Client, deployer Deployer) *Reconciler {
+	return &Reconciler{
+		store:    s,
+		docker:   dockerClient,
+		deployer: deployer,
+		loops:    make(map[string]*stackLoop),
+	}
+}
+
+// Start reads all stacks from the store and launches a reconcile loop for each
+// one that has a positive ReconcileInterval. The provided context controls the
+// overall lifetime of all loops.
+func (r *Reconciler) Start(ctx context.Context) {
+	r.ctx, r.cancel = context.WithCancel(ctx)
+
+	stacks, err := r.store.ListStacks()
+	if err != nil {
+		logrus.Errorf("reconciler: failed to list stacks on startup: %v", err)
+		return
+	}
+
+	for _, stack := range stacks {
+		if stack.ReconcileInterval > 0 && stack.Status == store.StackStatusActive {
+			r.startStackLoop(stack)
+		}
+	}
+
+	logrus.Infof("reconciler: started with %d active reconcile loops", len(r.loops))
+}
+
+// Stop signals all running loops to terminate and waits for them to finish.
+func (r *Reconciler) Stop() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+
+	r.mu.Lock()
+	for id, loop := range r.loops {
+		loop.cancel()
+		delete(r.loops, id)
+	}
+	r.mu.Unlock()
+
+	r.wg.Wait()
+	logrus.Info("reconciler: all loops stopped")
+}
+
+// RefreshStack should be called whenever a stack is created, updated, or
+// deleted. It stops any existing loop for the stack and, if the stack still
+// exists and has reconciliation enabled, starts a new one.
+func (r *Reconciler) RefreshStack(stackID string) {
+	r.mu.Lock()
+	if existing, ok := r.loops[stackID]; ok {
+		existing.cancel()
+		<-existing.done
+		delete(r.loops, stackID)
+	}
+	r.mu.Unlock()
+
+	stack, err := r.store.GetStack(stackID)
+	if err != nil {
+		logrus.Errorf("reconciler: failed to get stack %s during refresh: %v", stackID, err)
+		return
+	}
+
+	// Stack may have been deleted.
+	if stack == nil {
+		logrus.Infof("reconciler: stack %s removed, loop stopped", stackID)
+		return
+	}
+
+	if stack.ReconcileInterval > 0 && stack.Status == store.StackStatusActive {
+		r.startStackLoop(stack)
+		logrus.Infof("reconciler: refreshed loop for stack %s (%s) with interval %ds",
+			stack.ID, stack.Name, stack.ReconcileInterval)
+	} else {
+		logrus.Infof("reconciler: stack %s (%s) does not require a reconcile loop",
+			stack.ID, stack.Name)
+	}
+}
+
+// CheckDrift performs a one-off drift check for the given stack. This is
+// exported so that API handlers can trigger an ad-hoc check.
+func (r *Reconciler) CheckDrift(ctx context.Context, stack *store.Stack) (*DriftReport, error) {
+	return r.checkDrift(ctx, stack)
+}
+
+// ---------------------------------------------------------------------------
+// internal helpers
+// ---------------------------------------------------------------------------
+
+// startStackLoop creates a child context, registers it, and launches the
+// per-stack goroutine.
+func (r *Reconciler) startStackLoop(stack *store.Stack) {
+	loopCtx, loopCancel := context.WithCancel(r.ctx)
+	done := make(chan struct{})
+
+	sl := &stackLoop{
+		cancel: loopCancel,
+		done:   done,
+	}
+
+	r.mu.Lock()
+	r.loops[stack.ID] = sl
+	r.mu.Unlock()
+
+	r.wg.Add(1)
+	go r.runLoop(loopCtx, stack.ID, done)
+}
+
+// runLoop is the per-stack reconciliation goroutine.
+func (r *Reconciler) runLoop(ctx context.Context, stackID string, done chan struct{}) {
+	defer r.wg.Done()
+	defer close(done)
+
+	// Re-read the stack so we get the freshest interval.
+	stack, err := r.store.GetStack(stackID)
+	if err != nil || stack == nil {
+		logrus.Errorf("reconciler: loop for stack %s could not load stack: %v", stackID, err)
+		return
+	}
+
+	interval := time.Duration(stack.ReconcileInterval) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	logrus.Infof("reconciler: loop started for stack %s (%s), interval %v",
+		stack.ID, stack.Name, interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Infof("reconciler: loop stopping for stack %s (%s)", stack.ID, stack.Name)
+			return
+
+		case <-ticker.C:
+			r.reconcileOnce(ctx, stackID)
+		}
+	}
+}
+
+// reconcileOnce performs a single reconciliation cycle for the given stack.
+func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
+	// Reload the stack each tick so we pick up config changes.
+	stack, err := r.store.GetStack(stackID)
+	if err != nil || stack == nil {
+		logrus.Errorf("reconciler: could not reload stack %s: %v", stackID, err)
+		return
+	}
+
+	if stack.Status != store.StackStatusActive {
+		logrus.Debugf("reconciler: stack %s (%s) is not active, skipping", stack.ID, stack.Name)
+		return
+	}
+
+	report, err := r.checkDrift(ctx, stack)
+	if err != nil {
+		logrus.Errorf("reconciler: drift check failed for stack %s (%s): %v",
+			stack.ID, stack.Name, err)
+		return
+	}
+
+	if report.HasDrift {
+		logrus.Infof("reconciler: drift detected for stack %s (%s): %d drift(s)",
+			stack.ID, stack.Name, len(report.Drifts))
+		for _, d := range report.Drifts {
+			logrus.Infof("reconciler:   [%s] %s: %s", d.Type, d.ServiceName, d.Message)
+		}
+
+		if stack.AutoDeploy {
+			logrus.Infof("reconciler: auto-deploying stack %s (%s) to resolve drift",
+				stack.ID, stack.Name)
+			if _, deployErr := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); deployErr != nil {
+				logrus.Errorf("reconciler: auto-deploy failed for stack %s (%s): %v",
+					stack.ID, stack.Name, deployErr)
+			}
+		}
+	} else {
+		logrus.Debugf("reconciler: no drift for stack %s (%s)", stack.ID, stack.Name)
+	}
+
+	// Persist the reconciliation timestamp regardless of drift.
+	now := time.Now()
+	stack.LastReconciledAt = &now
+	if updateErr := r.store.UpdateStack(stack); updateErr != nil {
+		logrus.Errorf("reconciler: failed to update LastReconciledAt for stack %s: %v",
+			stack.ID, updateErr)
+	}
+}
+
+// checkDrift compares the desired state (from git) with the actual running
+// containers on the Docker host and returns a DriftReport.
+func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*DriftReport, error) {
+	report := &DriftReport{
+		StackID:   stack.ID,
+		StackName: stack.Name,
+		CheckedAt: time.Now(),
+	}
+
+	// ---- 1. Clone the repository (shallow) and parse the compose file ----
+	desiredServices, desiredNetworks, err := r.fetchDesiredState(ctx, stack)
+	if err != nil {
+		return nil, fmt.Errorf("fetch desired state: %w", err)
+	}
+
+	// ---- 2. List running containers managed by Accelero for this stack ----
+	actualContainers, err := r.listStackContainers(ctx, stack.Name)
+	if err != nil {
+		return nil, fmt.Errorf("list stack containers: %w", err)
+	}
+
+	// Build a lookup of actual containers keyed by service name.
+	type containerInfo struct {
+		id     string
+		image  string
+		state  string // running, exited, etc.
+		health string // healthy, unhealthy, starting, "" (no healthcheck)
+	}
+
+	actualByService := make(map[string][]containerInfo)
+	allActualServiceNames := make(map[string]bool)
+
+	for _, c := range actualContainers {
+		svcName := c.Labels[labelStackName + "-service"]
+		if svcName == "" {
+			// Fall back: try to derive service name from container names.
+			svcName = deriveServiceName(c.Names, stack.Name)
+		}
+		if svcName == "" {
+			continue
+		}
+		allActualServiceNames[svcName] = true
+
+		info := containerInfo{
+			id:    c.ID,
+			image: c.Image,
+			state: c.State,
+		}
+
+		// Inspect for health status.
+		inspect, inspectErr := r.docker.ContainerInspect(ctx, c.ID)
+		if inspectErr == nil && inspect.State != nil && inspect.State.Health != nil {
+			info.health = inspect.State.Health.Status
+		}
+
+		actualByService[svcName] = append(actualByService[svcName], info)
+	}
+
+	// Determine which services to check. If a service filter is set, honour it.
+	filteredServices := filterServices(desiredServices, stack.ServiceFilter)
+
+	// ---- 3. For each desired service, detect drift ----
+	for svcName, svc := range filteredServices {
+		containers, exists := actualByService[svcName]
+
+		if !exists || len(containers) == 0 {
+			report.Drifts = append(report.Drifts, DriftItem{
+				ServiceName: svcName,
+				Type:        "missing",
+				Expected:    svc.Image,
+				Message:     fmt.Sprintf("service %s is defined in compose but has no running container", svcName),
+			})
+			continue
+		}
+
+		for _, c := range containers {
+			// Image mismatch check. Normalise both sides: Docker may store
+			// the fully-qualified image reference while the compose file may
+			// use the short form or vice versa.
+			if !imagesMatch(svc.Image, c.image) {
+				report.Drifts = append(report.Drifts, DriftItem{
+					ServiceName: svcName,
+					Type:        "image_mismatch",
+					Expected:    svc.Image,
+					Actual:      c.image,
+					Message: fmt.Sprintf("container %s has image %s, expected %s",
+						shortID(c.id), c.image, svc.Image),
+				})
+			}
+
+			// Stopped container check.
+			if c.state != "running" {
+				report.Drifts = append(report.Drifts, DriftItem{
+					ServiceName: svcName,
+					Type:        "stopped",
+					Expected:    "running",
+					Actual:      c.state,
+					Message: fmt.Sprintf("container %s for service %s is %s, expected running",
+						shortID(c.id), svcName, c.state),
+				})
+			}
+
+			// Unhealthy container check.
+			if c.health == "unhealthy" {
+				report.Drifts = append(report.Drifts, DriftItem{
+					ServiceName: svcName,
+					Type:        "unhealthy",
+					Expected:    "healthy",
+					Actual:      c.health,
+					Message: fmt.Sprintf("container %s for service %s is unhealthy",
+						shortID(c.id), svcName),
+				})
+			}
+		}
+	}
+
+	// ---- 4. Detect extra containers not in the compose file ----
+	for svcName := range allActualServiceNames {
+		if _, defined := filteredServices[svcName]; !defined {
+			report.Drifts = append(report.Drifts, DriftItem{
+				ServiceName: svcName,
+				Type:        "extra",
+				Message: fmt.Sprintf("container(s) for service %s exist but service is not defined in compose",
+					svcName),
+			})
+		}
+	}
+
+	// ---- 5. Check network drift (desired networks that don't exist) ----
+	if len(desiredNetworks) > 0 {
+		existingNetworks, netErr := r.docker.NetworkList(ctx, types.NetworkListOptions{})
+		if netErr == nil {
+			existingSet := make(map[string]bool, len(existingNetworks))
+			for _, n := range existingNetworks {
+				existingSet[n.Name] = true
+			}
+			for netName := range desiredNetworks {
+				if !existingSet[netName] {
+					report.Drifts = append(report.Drifts, DriftItem{
+						ServiceName: "(network)",
+						Type:        "missing",
+						Expected:    netName,
+						Message:     fmt.Sprintf("network %s is defined in compose but does not exist on host", netName),
+					})
+				}
+			}
+		} else {
+			logrus.Warnf("reconciler: could not list Docker networks for drift check: %v", netErr)
+		}
+	}
+
+	report.HasDrift = len(report.Drifts) > 0
+	return report, nil
+}
+
+// fetchDesiredState clones the stack repository (shallow, depth=1) and parses
+// the compose file. It returns the desired services and networks, and always
+// cleans up the temporary directory.
+func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) (
+	map[string]service.ComposeService, map[string]network.ComposeNetwork, error,
+) {
+	tmpDir, err := secureTempDir(stack.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer func() {
+		if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
+			logrus.Warnf("reconciler: failed to remove temp dir %s: %v", tmpDir, removeErr)
+		}
+	}()
+
+	// Clone (shallow).
+	cloneOpts := &gogit.CloneOptions{
+		URL:   stack.RepoURL,
+		Depth: 1,
+		Auth: &http.BasicAuth{
+			Username: stack.RepoUsername,
+			Password: stack.RepoToken,
+		},
+	}
+
+	if stack.RepoBranch != "" {
+		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(stack.RepoBranch)
+	}
+
+	_, err = gogit.PlainCloneContext(ctx, tmpDir, false, cloneOpts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("git clone: %w", err)
+	}
+
+	// Read and parse compose file.
+	composePath := filepath.Join(tmpDir, stack.ComposePath)
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read compose file %s: %w", stack.ComposePath, err)
+	}
+
+	var cf composeFile
+	if err := yaml.Unmarshal(data, &cf); err != nil {
+		return nil, nil, fmt.Errorf("parse compose file: %w", err)
+	}
+
+	return cf.Services, cf.Networks, nil
+}
+
+// listStackContainers returns all containers on the Docker host that carry the
+// Accelero management labels for the given stack name.
+func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) ([]types.Container, error) {
+	f := filters.NewArgs()
+	f.Add("label", fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByValue))
+	f.Add("label", fmt.Sprintf("%s=%s", labelStackName, stackName))
+
+	containers, err := r.docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: f,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("docker container list: %w", err)
+	}
+
+	return containers, nil
+}
+
+// filterServices applies the stack's ServiceFilter (comma-separated list of
+// service names) to the full set of desired services. If the filter is empty,
+// all services are returned.
+func filterServices(all map[string]service.ComposeService, filter string) map[string]service.ComposeService {
+	if strings.TrimSpace(filter) == "" {
+		return all
+	}
+
+	names := make(map[string]bool)
+	for _, n := range strings.Split(filter, ",") {
+		trimmed := strings.TrimSpace(n)
+		if trimmed != "" {
+			names[trimmed] = true
+		}
+	}
+
+	filtered := make(map[string]service.ComposeService, len(names))
+	for name, svc := range all {
+		if names[name] {
+			filtered[name] = svc
+		}
+	}
+	return filtered
+}
+
+// imagesMatch compares two Docker image references, accounting for the fact
+// that one may include a registry prefix / default tag while the other does not.
+// e.g. "nginx:latest" matches "docker.io/library/nginx:latest" and "nginx".
+func imagesMatch(desired, actual string) bool {
+	if desired == actual {
+		return true
+	}
+
+	// Normalise: append :latest if no tag is present.
+	normalise := func(img string) string {
+		// If there is a digest reference, don't touch it.
+		if strings.Contains(img, "@sha256:") {
+			return img
+		}
+		parts := strings.SplitN(img, ":", 2)
+		if len(parts) == 1 {
+			return img + ":latest"
+		}
+		return img
+	}
+
+	d := normalise(desired)
+	a := normalise(actual)
+
+	if d == a {
+		return true
+	}
+
+	// Strip common registry prefixes for comparison.
+	strip := func(img string) string {
+		img = strings.TrimPrefix(img, "docker.io/library/")
+		img = strings.TrimPrefix(img, "docker.io/")
+		img = strings.TrimPrefix(img, "index.docker.io/")
+		return img
+	}
+
+	return strip(d) == strip(a)
+}
+
+// deriveServiceName attempts to extract a service name from Docker container
+// names and the stack name. Container names created by Accelero follow the
+// pattern "<service>_<instance>_<timestamp>".
+func deriveServiceName(names []string, stackName string) string {
+	for _, name := range names {
+		// Strip leading slash that Docker prepends.
+		n := strings.TrimPrefix(name, "/")
+
+		// If the name contains an underscore, the part before the first
+		// underscore is the service name.
+		if idx := strings.Index(n, "_"); idx > 0 {
+			return n[:idx]
+		}
+	}
+	return ""
+}
+
+// shortID returns the first 12 characters of a container ID for logging.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// secureTempDir creates a temporary directory for the reconciler to clone
+// into. The directory is placed under os.TempDir() and uses a
+// cryptographically random suffix to avoid collisions.
+func secureTempDir(stackID string) (string, error) {
+	randBytes := make([]byte, 8)
+	if _, err := rand.Read(randBytes); err != nil {
+		return "", fmt.Errorf("generate random suffix: %w", err)
+	}
+	suffix := hex.EncodeToString(randBytes)
+
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("accelero-reconcile-%s-%s", stackID, suffix))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	return dir, nil
+}

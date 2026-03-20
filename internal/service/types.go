@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -16,7 +17,7 @@ type ComposeService struct {
 	EnvFile     []string          `yaml:"env_file,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
-	Command     []string          `yaml:"command,omitempty"`
+	Command     Command           `yaml:"command,omitempty"`
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
@@ -47,6 +48,27 @@ func (e *EnvVars) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 
 	return fmt.Errorf("failed to unmarshal environment variables")
+}
+
+// Command supports both string and list forms in docker-compose.
+type Command []string
+
+func (c *Command) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var list []string
+	if err := unmarshal(&list); err == nil {
+		*c = list
+		return nil
+	}
+
+	var str string
+	if err := unmarshal(&str); err == nil {
+		// Split on spaces, matching docker-compose behavior for string commands.
+		// This is a simplified split; shell-style quoting is not handled.
+		*c = strings.Fields(str)
+		return nil
+	}
+
+	return fmt.Errorf("failed to unmarshal command: must be a string or list of strings")
 }
 
 type HealthCheck struct {
