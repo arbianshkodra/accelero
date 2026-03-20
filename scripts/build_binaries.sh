@@ -5,7 +5,7 @@ VERSION="$(git describe --tags --always --dirty || true)"
 COMMIT="$(git rev-parse --short HEAD || true)"
 DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-MAIN_PACKAGE="./cmd/main.go"
+MAIN_PACKAGE="./cmd/"
 BINARY_NAME="accelero"
 
 PLATFORMS=(
@@ -30,18 +30,19 @@ mkdir -p dist
 for PLATFORM in "${PLATFORMS[@]}"; do
   GOOS="${PLATFORM%/*}"
   GOARCH="${PLATFORM#*/}"
-  
-  if [[ "$GOARCH" == "arm" ]]; then
-    GOARM=7
-  fi
 
   OUTPUT_NAME="${BINARY_NAME}_${GOOS}_${GOARCH}"
   if [[ "$GOOS" == "windows" ]]; then
     OUTPUT_NAME+=".exe"
   fi
 
+  EXTRA_ENV=""
+  if [[ "$GOARCH" == "arm" ]]; then
+    EXTRA_ENV="GOARM=7"
+  fi
+
   echo "Building $BINARY_NAME for $GOOS/$GOARCH ..."
-  env CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+  env CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" $EXTRA_ENV \
     go build \
       -ldflags "-s -w \
         -X main.version=$VERSION \
@@ -69,7 +70,12 @@ popd > /dev/null
 rm -f dist/LICENSE.md
 
 pushd dist > /dev/null
-  shasum -a 256 *.tar.gz *.zip > checksums.txt
+  # Use sha256sum on Linux, shasum on macOS
+  if command -v sha256sum &> /dev/null; then
+    sha256sum *.tar.gz *.zip > checksums.txt
+  else
+    shasum -a 256 *.tar.gz *.zip > checksums.txt
+  fi
 popd > /dev/null
 
 echo "All builds done. Binaries are in the dist/ directory."
