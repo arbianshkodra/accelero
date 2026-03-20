@@ -2,8 +2,10 @@ name: Release Docs Dev
 
 on:
   workflow_dispatch:
-  pull_request_target:
-    branches: [dev]
+  workflow_run:
+    workflows: ["Release Dev"]
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -12,11 +14,13 @@ jobs:
   release-docs-dev:
     name: Release Docs Dev
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -34,22 +38,12 @@ jobs:
         run: mkdocs build
 
       - name: Install SSH Key
-        shell: bash
-        env:
-          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          KEY_PATH: ${{ secrets.CERT_PATH }}
-          HOST: ${{ secrets.HOST }}
         run: |
-          /bin/mkdir -p ~/.ssh
-          /usr/bin/printf '%s\n' "$SSH_KEY" > "$KEY_PATH"
-          /bin/chmod 600 "$KEY_PATH"
-          /usr/bin/ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          export PATH=$PATH:/bin:/usr/bin
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
+          chmod 600 ${{ secrets.CERT_PATH }}
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
 
-      - name: Deploy documentation
-        shell: bash
-        env:
-          KEY_PATH: ${{ secrets.CERT_PATH }}
-          HOST: ${{ secrets.HOST }}
-          DEPLOY_USER: ${{ secrets.USER }}
-          DEPLOY_PATH: ${{ secrets.PATH }}
-        run: /usr/bin/scp -i "$KEY_PATH" -r site/ "${DEPLOY_USER}@${HOST}:${DEPLOY_PATH}"
+      - name: Copy Files via SCP
+        run: /usr/bin/scp -i ${{ secrets.CERT_PATH }} -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
