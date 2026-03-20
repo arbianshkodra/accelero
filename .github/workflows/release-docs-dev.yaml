@@ -35,11 +35,20 @@ jobs:
         run: mkdocs build
 
       - name: Install SSH Key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          CERT_PATH: ${{ secrets.CERT_PATH }}
+          DEPLOY_HOST: ${{ secrets.HOST }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
-          chmod 600 ${{ secrets.CERT_PATH }}
-          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$CERT_PATH"
+          chmod 600 "$CERT_PATH"
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy documentation
-        run: /usr/bin/scp -i ${{ secrets.CERT_PATH }} -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
+        env:
+          CERT_PATH: ${{ secrets.CERT_PATH }}
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_USER: ${{ secrets.USER }}
+          DEPLOY_PATH: ${{ secrets.PATH }}
+        run: scp -i "$CERT_PATH" -r site/ "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
