@@ -32,8 +32,11 @@ database
 # Environment variables
 envs/
 test.env
-dist/
 samples.env
+*.bak
+
+# Build artifacts
+dist/
 .venv/
 
 # Mkdocs

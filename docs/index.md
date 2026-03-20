@@ -5,22 +5,45 @@
   Accelero
 </h1>
 
-<p align="center">A container-based tool that automates Docker deployments seamlessly with zero downtime by leveraging the <a href="https://codefresh.io/learn/gitops/">GitOps</a> strategy.</p>
+<p align="center">GitOps-powered Docker deployment automation with zero downtime.</p>
+
+## What is Accelero?
+
+Accelero brings [GitOps](https://codefresh.io/learn/gitops/) to Docker Compose environments. It manages multiple deployment **stacks** — each stack is a git repository containing a `docker-compose.yaml` that defines the desired state of your services. Accelero continuously compares what's in git against what's actually running on your Docker host, and deploys to converge.
+
+**Think of it as ArgoCD for Docker Compose** — git is the source of truth, drift is detected and corrected, and deployments happen automatically with zero downtime.
 
 ## Quick Start
 
-With Accelero, you can automate your deployments with zero downtime by simply pushing your Docker image to your registry. Accelero listens for webhooks and takes care of the rest, gracefully updating your service with the new image and shutting down the old one.
-
-Run the Accelero container with the following command:
+Run Accelero as a Docker container:
 
 ```bash
-$ docker run --rm -d \
-  --name accelero -p 8000:8000 \
-  --env-file path/to/env/file.env \
+docker run -d \
+  --name accelero \
+  -p 8000:8000 \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -v accelero-data:/data \
+  -e API_KEY=your-secure-key \
   arbianshkodra/accelero
 ```
 
-Replace `path/to/env/file.env` with the path to your environment variables file. Accelero will start and listen for incoming webhooks on port 8000.
+Then create your first stack:
 
-For detailed instructions, see the [Introduction](./introduction.md) and [Usage Overview](./usage-overview.md) sections.
+```bash
+curl -X POST http://localhost:8000/api/v1/stacks \
+  -H "Content-Type: application/json" \
+  -H "X-API-KEY: your-secure-key" \
+  -d '{
+    "name": "my-app",
+    "repo_url": "https://github.com/your-org/your-gitops-repo",
+    "repo_username": "your-username",
+    "repo_token": "your-token",
+    "compose_path": "docker-compose.yaml",
+    "auto_deploy": true,
+    "reconcile_interval_seconds": 300
+  }'
+```
+
+Accelero will clone your repo, parse the compose file, and deploy all services. Every 5 minutes it will check for drift and auto-deploy if anything has changed.
+
+For detailed setup instructions, see the [Introduction](./introduction.md) and [Usage Overview](./usage-overview.md) sections.
