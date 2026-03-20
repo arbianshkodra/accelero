@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Accelero is a GitOps-based Docker deployment automation tool that enables zero-downtime deployments. It listens for webhook triggers (typically from Docker registries) and automatically deploys new container versions by gracefully updating services and removing old containers.
+Accelero is a GitOps-based Docker deployment automation tool that enables zero-downtime deployments. It manages multiple "stacks" — each stack is a git repository + docker-compose file that defines the desired state of services on a Docker host. Accelero continuously reconciles the desired state (git) against the actual state (running containers) and deploys to converge.
 
 ## Build and Development Commands
 
@@ -19,11 +19,8 @@ Accelero is a GitOps-based Docker deployment automation tool that enables zero-d
 # Build and publish multi-architecture Docker images
 ./scripts/build_docker_images.sh
 
-# Build security-focused local image
+# Build local image
 docker build -t accelero:latest --build-arg TARGETARCH=amd64 .
-
-# Run with security configuration
-docker-compose -f docker-compose.security.yml up -d
 ```
 
 ### Testing
@@ -35,15 +32,15 @@ go test ./...
 go test -v ./...
 
 # Run tests for a specific package
-go test ./internal/service
 go test ./internal/handler
+go test ./internal/service
 go test ./internal/utils
 ```
 
 ### Running the Application
 ```bash
-# Run locally (requires Docker daemon)
-go run ./cmd/main.go
+# Run locally (requires Docker daemon and API_KEY env var)
+API_KEY=your-key go run ./cmd/main.go
 
 # Build and run binary
 go build -o accelero ./cmd/main.go
@@ -63,71 +60,103 @@ mkdocs build
 
 ### Core Components
 
-- **`cmd/main.go`**: Application entry point with HTTP server setup, signal handling, and Docker client initialization
-- **`internal/handler/`**: Webhook handling with worker pool for processing deployment requests
-- **`internal/service/`**: Core deployment logic including zero-downtime container management and rollback capabilities
-- **`internal/utils/`**: Utility functions for container operations and health checks
-- **`internal/middleware/`**: HTTP middleware (primarily API key authentication)
-- **`internal/git/`**: Git repository operations for fetching compose files
-- **`internal/compose/`**: Docker Compose file parsing and service configuration
-- **`internal/network/`**: Docker network management
+- **`cmd/main.go`**: Entry point — loads config, opens SQLite DB, creates Docker client, wires deployer/reconciler/handlers, runs HTTP server with graceful shutdown
+- **`internal/config/`**: Centralized configuration loaded from environment variables with defaults
+- **`internal/store/`**: Persistence layer (SQLite) — stores stacks, deployments, and managed containers
+- **`internal/stack/`**: Stack deployer — the core deployment orchestrator: git clone, compose parsing, dependency resolution, container lifecycle, rollback
+- **`internal/reconciler/`**: GitOps reconciliation engine — per-stack loops that detect drift and optionally auto-deploy
+- **`internal/handler/`**: HTTP API handlers — stack CRUD, deployment triggers, drift checks, legacy webhook, health/status
+- **`internal/middleware/`**: HTTP middleware (API key authentication with constant-time comparison)
+- **`internal/service/`**: Shared types (ComposeService, HealthCheck) and Docker resource cleanup
+- **`internal/network/`**: Docker network management (idempotent creation)
+- **`internal/utils/`**: Utility functions for port mapping, env file loading, health checks
+
+### Data Model
+
+- **Stack**: A deployable unit — git repo URL + compose file path + branch + credentials + reconciliation settings
+- **Deployment**: A single deployment attempt for a stack — status, trigger, git commit, changes, errors
+- **ManagedContainer**: Tracks which Docker containers Accelero manages (labeled `managed-by=accelero`)
 
 ### Key Features
 
-- **Zero-downtime deployments**: Creates new containers before removing old ones
-- **Health check integration**: Waits for container health checks before proceeding
-- **Rollback capabilities**: Automatic rollback on deployment failures
-- **Dynamic worker pool**: CPU-based worker scaling with configurable overrides
-- **Resource cleanup**: Automated Docker resource cleanup routine
-- **Performance optimization**: Adaptive queue sizing based on system resources
-- **Memory leak prevention**: Automatic cleanup of old deployment statuses
+- **Multi-stack management**: Manage multiple independent stacks via REST API
+- **GitOps reconciliation**: Periodic drift detection comparing git desired state vs actual Docker state
+- **Zero-downtime deployments**: New containers health-checked before old ones removed
+- **Correct rollback**: Pre-deployment state captured BEFORE deploying, restored on failure
+- **Per-service deployment locking**: Prevents concurrent deploys of the same service
+- **Dependency resolution**: Topological sort with transitive dependency expansion and cycle detection
+- **Scoped resource cleanup**: Only prunes Docker resources labeled `managed-by=accelero`
+- **Shallow git clones**: Depth=1 for fast repo fetching
+- **SQLite persistence**: Deployment history, stack config, container tracking survive restarts
+- **Legacy compatibility**: Old env-var config (REPO_URL etc.) auto-migrated to a "default" stack
 
 ### Environment Variables
 
-Required environment variables (checked at startup):
-- `REPO_URL`: Git repository URL containing docker-compose files
-- `REPO_USERNAME`: Git repository username
-- `REPO_TOKEN`: Git repository access token
-- `COMPOSE_PATH`: Path to docker-compose file in repository
-- `API_KEY`: **REQUIRED** - Secure API key for webhook authentication (application will not start without this)
+Required:
+- `API_KEY`: **REQUIRED** — Secure API key for authentication
 
-Optional environment variables:
-- `LOG_LEVEL`: Logging level (default: info)
-- `LOG_FORMAT`: Log format - "json" or text (default: text)
+Optional:
+- `SERVER_PORT`: HTTP server port (default: 8000)
 - `DOCKER_SOCK`: Docker socket path (default: unix:///var/run/docker.sock)
-- `WORKER_COUNT`: Number of worker goroutines (default: 2 * CPU cores, min: 2, max: 50)
-- `QUEUE_SIZE`: Task queue buffer size (default: 15 * workers, min: 50, max: 1000)
-- `STATUS_CLEANUP_INTERVAL`: How often to clean up old deployment statuses (default: 1h)
-- `STATUS_MAX_AGE`: Maximum age before deployment status cleanup (default: 24h)
+- `DATABASE_PATH`: SQLite database path (default: ./data/accelero.db)
+- `LOG_LEVEL`: Logging level (default: info)
+- `LOG_FORMAT`: Log format — "json" or "text" (default: text)
+- `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)
+- `QUEUE_SIZE`: Task queue buffer size override (default: 15 * workers, min: 50, max: 1000)
+- `STATUS_CLEANUP_INTERVAL`: Deployment record cleanup interval (default: 1h)
+- `STATUS_MAX_AGE`: Max deployment record age (default: 24h)
 
-### Security Features
-
-- **Secure Authentication**: Constant-time API key comparison prevents timing attacks
-- **Input Validation**: Comprehensive payload validation with size limits (1MB max)
-- **Directory Traversal Protection**: Secure file path handling prevents directory traversal attacks
-- **Cryptographic Request IDs**: Secure random request ID generation
-- **Request Logging**: Security-focused logging for monitoring and incident response
-
-### Deployment Flow
-
-1. Webhook receives deployment trigger
-2. Repository is cloned to fetch latest compose configuration
-3. Current service state is captured for potential rollback
-4. New containers are created and started with updated image
-5. Health checks are performed on new containers
-6. Old containers are gracefully removed after new ones are healthy
-7. On failure, automatic rollback to previous state occurs
+Legacy (backward-compatible, auto-creates "default" stack):
+- `REPO_URL`, `REPO_USERNAME`, `REPO_TOKEN`, `REPO_BRANCH`, `COMPOSE_PATH`
+- `SERVICE_NAMES`, `DOCKER_USERNAME`, `DOCKER_PASSWORD`, `DOCKER_REGISTRY`
 
 ### API Endpoints
 
-- `POST /webhook`: Receives deployment webhooks (requires API key authentication)
-- `GET /status`: Returns all deployment statuses
-- `GET /status?id=<request_id>`: Returns specific deployment status
-- `GET /status?stats=true`: Returns memory and performance statistics
+**Stack Management:**
+- `POST /api/v1/stacks` — Create a stack
+- `GET /api/v1/stacks` — List all stacks
+- `GET /api/v1/stacks/{id}` — Get a stack (by ID or name)
+- `PUT /api/v1/stacks/{id}` — Update a stack
+- `DELETE /api/v1/stacks/{id}` — Delete a stack
+
+**Deployments:**
+- `POST /api/v1/stacks/{id}/deploy` — Trigger deployment
+- `GET /api/v1/stacks/{id}/deployments` — List deployment history
+- `GET /api/v1/stacks/{id}/drift` — Check drift (desired vs actual state)
+
+**Legacy:**
+- `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
+
+**System:**
+- `GET /health` — Health check (unauthenticated)
+- `GET /status` — Stack summaries
+
+### Deployment Flow
+
+1. API request triggers deployment for a stack
+2. Repository cloned (shallow, depth=1) and compose path validated against directory traversal
+3. Compose file parsed, services filtered, dependency graph resolved via topological sort
+4. Pre-deployment state of ALL services captured before any mutation
+5. Docker networks created
+6. Services deployed in dependency order, each under per-service lock:
+   - Image pulled (with per-stack registry credentials)
+   - New container created with `managed-by=accelero` label
+   - Health check polled (no unconditional sleep)
+   - Old containers removed only after new one is healthy
+7. On failure: rollback restores pre-deployment state using saved snapshots
+8. Deployment record and container tracking updated in SQLite
+
+### Reconciliation Flow
+
+1. Per-stack goroutine runs on configurable interval
+2. Clones repo, parses compose file (desired state)
+3. Lists Docker containers filtered by `managed-by=accelero` + `accelero-stack=<name>` labels (actual state)
+4. Compares: missing services, image mismatches, stopped/unhealthy containers, extra containers, missing networks
+5. If `auto_deploy` is true and drift detected, triggers deployment
+6. Drift reports available via API for manual inspection
 
 ### Testing Strategy
 
-The codebase includes unit tests for core components:
-- `webhook_test.go`: Webhook handler testing
-- `service_test.go`: Service deployment logic testing  
-- `utils_test.go`: Utility function testing
+- `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer
+- `service/service_test.go`: Tests ParseDuration and EnvVars unmarshaling
+- `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName

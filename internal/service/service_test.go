@@ -1,41 +1,40 @@
 package service
 
 import (
-	"context"
 	"testing"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 )
 
-// MockClient is a mock implementation of the Docker client
-type MockClient struct {
-	mock.Mock
-}
-
-func (m *MockClient) ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error) {
-	args := m.Called(ctx, options)
-	return args.Get(0).([]types.Container), args.Error(1)
-}
-
-func TestAreContainersRunning(t *testing.T) {
-	ctx := context.Background()
-	serviceName := "test_service"
-
-	mockCli := new(MockClient)
-	mockContainers := []types.Container{
-		{
-			Names: []string{"/test_service_1"},
-		},
+func TestParseDuration(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected time.Duration
+	}{
+		{"10s", 10 * time.Second},
+		{"5m", 5 * time.Minute},
+		{"1h", 1 * time.Hour},
+		{"", 0},
+		{"invalid", 0},
 	}
 
-	mockCli.On("ContainerList", ctx, mock.Anything).Return(mockContainers, nil)
+	for _, tc := range tests {
+		result := ParseDuration(tc.input)
+		assert.Equal(t, tc.expected, result, "ParseDuration(%q)", tc.input)
+	}
+}
 
-	running, err := AreContainersRunning(mockCli, serviceName)
+func TestEnvVarsUnmarshalYAML_List(t *testing.T) {
+	var envs EnvVars
+	err := envs.UnmarshalYAML(func(v interface{}) error {
+		raw, ok := v.(*[]string)
+		if ok {
+			*raw = []string{"KEY=value", "FOO=bar"}
+			return nil
+		}
+		return assert.AnError
+	})
 	assert.NoError(t, err)
-	assert.True(t, running)
-
-	mockCli.AssertExpectations(t)
+	assert.Equal(t, EnvVars{"KEY=value", "FOO=bar"}, envs)
 }

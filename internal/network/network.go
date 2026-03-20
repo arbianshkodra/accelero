@@ -15,9 +15,10 @@ type ComposeNetwork struct {
 }
 
 func CreateNetwork(cli *client.Client, name string, config ComposeNetwork) error {
-	ctx := context.Background()
+	return CreateNetworkWithContext(context.Background(), cli, name, config)
+}
 
-	// Check if the network already exists
+func CreateNetworkWithContext(ctx context.Context, cli *client.Client, name string, config ComposeNetwork) error {
 	existingNetworks, err := cli.NetworkList(ctx, types.NetworkListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list networks: %w", err)
