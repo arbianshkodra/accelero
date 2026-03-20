@@ -38,12 +38,20 @@ jobs:
         run: mkdocs build
 
       - name: Install SSH Key
+        shell: bash
         run: |
           export PATH=$PATH:/bin:/usr/bin
+          CERT_PATH="${{ secrets.CERT_PATH }}"
+          CERT_PATH="${CERT_PATH/#\~/$HOME}"
+          mkdir -p "$(dirname "$CERT_PATH")"
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ secrets.CERT_PATH }}
-          chmod 600 ${{ secrets.CERT_PATH }}
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > "$CERT_PATH"
+          chmod 600 "$CERT_PATH"
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
 
       - name: Copy Files via SCP
-        run: /usr/bin/scp -i ${{ secrets.CERT_PATH }} -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
+        shell: bash
+        run: |
+          CERT_PATH="${{ secrets.CERT_PATH }}"
+          CERT_PATH="${CERT_PATH/#\~/$HOME}"
+          /usr/bin/scp -i "$CERT_PATH" -r site/ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ secrets.PATH }}
