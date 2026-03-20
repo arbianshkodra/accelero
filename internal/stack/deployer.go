@@ -20,7 +20,6 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/arbianshkodra/accelero/internal/utils"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -909,7 +908,7 @@ func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack
 
 // getServiceContainers lists containers whose name matches the given service,
 // using Docker's name filter rather than fetching all containers.
-func (d *Deployer) getServiceContainers(ctx context.Context, serviceName string) ([]types.Container, error) {
+func (d *Deployer) getServiceContainers(ctx context.Context, serviceName string) ([]container.Summary, error) {
 	f := filters.NewArgs()
 	f.Add("name", serviceName)
 
@@ -923,7 +922,7 @@ func (d *Deployer) getServiceContainers(ctx context.Context, serviceName string)
 
 	// Docker's name filter is a substring match, so we must apply strict
 	// matching to avoid false positives (e.g. "web" matching "webproxy").
-	var matched []types.Container
+	var matched []container.Summary
 	for _, c := range all {
 		for _, name := range c.Names {
 			if matchesServiceName(name, serviceName) {
