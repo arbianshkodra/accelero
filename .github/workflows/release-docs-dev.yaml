@@ -1,7 +1,6 @@
 name: Release Docs Dev
 
 on:
-  workflow_dispatch:
   workflow_run:
     workflows: ["Release Dev"]
     types:
@@ -14,9 +13,7 @@ jobs:
   release-docs-dev:
     name: Release Docs Dev
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
