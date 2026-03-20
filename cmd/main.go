@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"net/http"
-	"os"
 	"crypto/rand"
 	"encoding/hex"
+	"net/http"
+	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -23,6 +23,13 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Build-time variables injected via ldflags.
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
 func main() {
 	// 1. Load config.
 	cfg, err := config.Load()
@@ -30,6 +37,7 @@ func main() {
 		logrus.Fatalf("Configuration error: %v", err)
 	}
 	initLogging(cfg)
+	logrus.Infof("Accelero %s (commit: %s, built: %s)", version, commit, date)
 
 	// 2. Open the database.
 	db, err := store.NewSQLiteStore(cfg.DatabasePath)
