@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/sirupsen/logrus"
 )
@@ -27,7 +26,7 @@ type ComposeService struct {
 	CPULimit    string            `yaml:"cpu_limit,omitempty"`
 }
 type DockerClient interface {
-	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 }
 
 type EnvVars []string

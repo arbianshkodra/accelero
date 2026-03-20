@@ -15,7 +15,6 @@ import (
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockernetwork "github.com/docker/docker/api/types/network"
@@ -484,7 +483,7 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 
 // listStackContainers returns all containers on the Docker host that carry the
 // Accelero management labels for the given stack name.
-func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) ([]types.Container, error) {
+func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) ([]container.Summary, error) {
 	f := filters.NewArgs()
 	f.Add("label", fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByValue))
 	f.Add("label", fmt.Sprintf("%s=%s", labelStackName, stackName))
