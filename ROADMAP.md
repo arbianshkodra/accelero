@@ -28,13 +28,31 @@
 
 ## In Progress
 
-### Phase 2 — Observability & Management
+### Phase 2 — Compose Compatibility, Observability & Management
+
+**Docker Compose compatibility (high impact):**
+- [ ] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`)
+- [ ] `entrypoint`, `working_dir`, `user` fields
+- [ ] `depends_on` map form with conditions (`condition: service_healthy`)
+- [ ] `deploy.replicas` for container scaling
+- [ ] Named volumes (top-level `volumes:` section with `docker volume create`)
+- [ ] `logging` driver and options
+- [ ] `stop_grace_period` (currently hardcoded to 10s)
+- [ ] Long-form `ports` syntax (`{target: 80, published: 8080, protocol: tcp}`)
+
+**Docker Compose compatibility (medium impact):**
+- [ ] `extra_hosts`, `hostname`, `domainname`, `dns`, `dns_search`
+- [ ] `cap_add`, `cap_drop`, `privileged`
+- [ ] `tmpfs`, `shm_size`, `init`
+- [ ] `expose` (expose ports without publishing)
+- [ ] `pull_policy` (always, never, missing)
+
+**Observability & management:**
 - [ ] Container management endpoints (logs, restart, stop)
 - [ ] WebSocket support for real-time log streaming and deployment progress
 - [ ] Prometheus metrics endpoint (`/metrics`)
 - [ ] Structured request ID propagation through deployment chain
 - [ ] Deployment diff preview (show what will change before deploying)
-- [ ] Support for `deploy.replicas` in compose files
 
 ### Phase 3 — Production Hardening
 - [ ] Rate limiting on API endpoints
