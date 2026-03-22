@@ -1,5 +1,5 @@
 <p style="text-align: center;">
-  <img alt="Accelero Logo" src="./images/logo.jpg" width="450" />
+  <img alt="Accelero Logo" src="./images/logo.png" width="450" />
 </p>
 <h1 align="center">
   Accelero
