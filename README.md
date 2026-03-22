@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./docs/images/logo.jpg" width="450" />
+  <img src="./docs/images/logo.png" width="450" />
 
   # Accelero
   GitOps-powered Docker deployment automation with zero downtime.
