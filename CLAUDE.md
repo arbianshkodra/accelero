@@ -64,6 +64,7 @@ mkdocs build
 - **`internal/config/`**: Centralized configuration loaded from environment variables with defaults
 - **`internal/store/`**: Persistence layer (SQLite) — stores stacks, deployments, and managed containers
 - **`internal/stack/`**: Stack deployer — the core deployment orchestrator: git clone, compose parsing, dependency resolution, container lifecycle, rollback
+- **`internal/compose/`**: Compose-file preprocessing — `.env` loading (`LoadDotEnv`) and docker-compose-compatible `${VAR}` interpolation (`Expand`, `ExpandBytes`). Used by both stack/ and reconciler/ before `yaml.Unmarshal`.
 - **`internal/reconciler/`**: GitOps reconciliation engine — per-stack loops that detect drift and optionally auto-deploy
 - **`internal/handler/`**: HTTP API handlers — stack CRUD, deployment triggers, drift checks, legacy webhook, health/status
 - **`internal/middleware/`**: HTTP middleware (API key authentication with constant-time comparison)
@@ -81,6 +82,7 @@ mkdocs build
 
 - **Multi-stack management**: Manage multiple independent stacks via REST API
 - **GitOps reconciliation**: Periodic drift detection comparing git desired state vs actual Docker state
+- **`.env` variable interpolation**: Full docker-compose `${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR+value}`, `$$` syntax. `.env` lookup order: next to compose file → repo root.
 - **Zero-downtime deployments**: New containers health-checked before old ones removed
 - **Correct rollback**: Pre-deployment state captured BEFORE deploying, restored on failure
 - **Per-service deployment locking**: Prevents concurrent deploys of the same service

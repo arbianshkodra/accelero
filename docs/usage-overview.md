@@ -187,17 +187,104 @@ When a deployment is triggered (via API, webhook, or reconciliation), Accelero:
 
 1. **Clones** the git repository (shallow, depth=1)
 2. **Validates** the compose file path (directory traversal protection)
-3. **Parses** the docker-compose.yaml
-4. **Resolves** service dependencies (topological sort with cycle detection)
-5. **Captures** the pre-deployment state of all services
-6. **Creates networks** defined in the compose file
-7. **Deploys** each service in dependency order:
+3. **Interpolates** `${VAR}` references using the repo's `.env` file (see [Variable interpolation](#variable-interpolation-env-file))
+4. **Parses** the docker-compose.yaml
+5. **Resolves** service dependencies (topological sort with cycle detection)
+6. **Captures** the pre-deployment state of all services
+7. **Creates networks** defined in the compose file
+8. **Deploys** each service in dependency order:
     - Pulls the image (with per-stack registry credentials)
     - Creates and starts a new container (labeled `managed-by: accelero`)
     - Waits for the health check to pass
     - Removes the old container
-8. **Rolls back** on failure using the captured pre-deployment state
-9. **Records** the deployment in SQLite
+9. **Rolls back** on failure using the captured pre-deployment state
+10. **Records** the deployment in SQLite
+
+## Variable Interpolation (`.env` file)
+
+Accelero supports the same `${VAR}` interpolation syntax docker-compose uses. Put a `.env` file next to your `docker-compose.yaml` in your git repo, and Accelero substitutes variable references before parsing.
+
+### Example
+
+**`docker-compose.yaml`:**
+```yaml
+services:
+  web:
+    image: ${REGISTRY:-ghcr.io}/${APP}:${TAG}
+    environment:
+      - DB_URL=${DB_URL:?DB_URL is required}
+      - DEBUG=$DEBUG
+```
+
+**`.env`:**
+```
+APP=my-app
+TAG=1.2.3
+DB_URL=postgres://db/app
+DEBUG=on
+# REGISTRY intentionally absent — falls back to ":-default"
+```
+
+Accelero resolves `${REGISTRY:-ghcr.io}/${APP}:${TAG}` to `ghcr.io/my-app:1.2.3` before deploy. If `DB_URL` were missing, the deploy fails fast with the error message — no containers are touched.
+
+### Supported forms
+
+| Form | Behaviour |
+|------|-----------|
+| `$VAR`, `${VAR}` | Value of `VAR`, empty string if unset |
+| `${VAR-default}` | Default if `VAR` is unset |
+| `${VAR:-default}` | Default if `VAR` is unset **or** empty |
+| `${VAR?error}` | Error if `VAR` is unset |
+| `${VAR:?error}` | Error if `VAR` is unset **or** empty |
+| `${VAR+value}` | Replacement if `VAR` is set (even empty) |
+| `${VAR:+value}` | Replacement if `VAR` is set **and** non-empty |
+| `$$` | Literal `$` |
+
+### `.env` file syntax
+
+```
+# Comments start with #
+KEY=value
+QUOTED="value with  spaces  and \n escapes"
+LITERAL='no $escapes and \n stays literal'
+EMPTY=
+TRAILING=value  # inline comment (unquoted values)
+export EXPORTED=works_too
+```
+
+- Double-quoted values support `\n`, `\r`, `\t`, `\\`, `\"` escape sequences
+- Single-quoted values are literal (no escapes)
+- Unquoted values are trimmed; a `#` preceded by whitespace starts an inline comment
+- Leading `export` is allowed (convenient when the `.env` is also shell-sourced)
+
+### Lookup order
+
+Accelero looks for `.env` in this order, using the first one found:
+
+1. Next to the compose file: `<repo>/<compose-dir>/.env`
+2. At the repo root: `<repo>/.env`
+
+A missing `.env` is not an error — compose files without `${...}` references work unchanged.
+
+### Multi-environment pattern
+
+Use one git branch per environment, each with its own `.env`, and one Accelero stack per branch:
+
+```bash
+# Staging stack → staging branch's .env
+curl -X POST /api/v1/stacks \
+  -d '{"name":"app-staging","repo_url":"...","repo_branch":"staging", ...}'
+
+# Production stack → main branch's .env
+curl -X POST /api/v1/stacks \
+  -d '{"name":"app-prod","repo_url":"...","repo_branch":"main", ...}'
+```
+
+Because Accelero treats git as the source of truth, promoting from staging to prod is a PR merge — never a manual config change.
+
+### Security note
+
+`.env` files are committed to git along with your compose. Keep **secrets** out of `.env` — use per-stack `repo_token`/`docker_password` fields in the Accelero API for git and registry credentials, and mount real secrets into containers via `env_file` pointing at a path that Accelero populates at deploy time (future phase 4 work: external secret stores).
 
 ## Upgrading from Legacy Mode
 
