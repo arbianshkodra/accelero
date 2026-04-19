@@ -282,9 +282,24 @@ curl -X POST /api/v1/stacks \
 
 Because Accelero treats git as the source of truth, promoting from staging to prod is a PR merge — never a manual config change.
 
-### Security note
+### ⚠️ Secrets do not belong in this `.env`
 
-`.env` files are committed to git along with your compose. Keep **secrets** out of `.env` — use per-stack `repo_token`/`docker_password` fields in the Accelero API for git and registry credentials, and mount real secrets into containers via `env_file` pointing at a path that Accelero populates at deploy time (future phase 4 work: external secret stores).
+The word ".env" is overloaded, so this point is worth making bluntly:
+
+- The `.env` described on this page is a **compose interpolation** file. Its job is to fill in declarative config — image tags, registry names, replicas, public ports, feature flags — things that describe **what to deploy** and belong in git for the same reason the compose file does.
+- A **runtime** `.env` (the one people mean when they say "don't commit .env") contains passwords, API keys, database URLs. It is **never** the same file and **must not** be committed to git.
+
+**Rule of thumb:** if leaking the value would be a security incident, it does not belong in the `.env` next to your compose.
+
+Today, the supported patterns for actual secrets are:
+
+| Kind of secret | Where it goes |
+|----------------|---------------|
+| Git credentials (to clone the GitOps repo) | `repo_username` / `repo_token` on the Accelero stack (stored in SQLite) |
+| Docker registry credentials | `docker_username` / `docker_password` on the Accelero stack |
+| Application secrets (DB password, API keys) | A separate file referenced via `env_file:` in your compose service, populated by the host at deploy time (mounted volume, external tool, etc.). This file is **not** interpolated and is **not** committed to git |
+
+Accelero does not yet natively integrate with external secret stores. The plan is to land Phase 4's secrets track (encrypted-at-rest per-stack secrets + pluggable Vault/KMS/Secrets Manager backends + `${secret:...}` interpolation syntax) so application secrets get a first-class home that doesn't require a committed file at all. Until then, treat interpolation `.env` as config-only and keep secrets in an adjacent `env_file:` you populate through your host's own provisioning.
 
 ## Upgrading from Legacy Mode
 
