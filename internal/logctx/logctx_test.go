@@ -11,8 +11,10 @@ import (
 )
 
 func TestFromContext_Default(t *testing.T) {
-	// Nil context returns a default entry.
-	entry := FromContext(nil)
+	// Nil context returns a default entry. Use a typed nil so staticcheck
+	// doesn't trip SA1012 on an intentional nil-safety test.
+	var nilCtx context.Context
+	entry := FromContext(nilCtx)
 	assert.NotNil(t, entry)
 
 	// Empty background context also returns default.
@@ -33,7 +35,8 @@ func TestWithFields(t *testing.T) {
 
 func TestWithFields_NilContext(t *testing.T) {
 	// Passing nil must not panic; it should seed a fresh background ctx.
-	ctx := WithFields(nil, logrus.Fields{"k": "v"})
+	var nilCtx context.Context
+	ctx := WithFields(nilCtx, logrus.Fields{"k": "v"})
 	assert.NotNil(t, ctx)
 	assert.Equal(t, "v", FromContext(ctx).Data["k"])
 }
@@ -79,7 +82,8 @@ func TestWithLogger_NilEntry(t *testing.T) {
 
 func TestWithLogger_NilContext(t *testing.T) {
 	entry := logrus.NewEntry(logrus.StandardLogger()).WithField("x", 1)
-	ctx := WithLogger(nil, entry)
+	var nilCtx context.Context
+	ctx := WithLogger(nilCtx, entry)
 
 	got := FromContext(ctx)
 	assert.Equal(t, 1, got.Data["x"])
