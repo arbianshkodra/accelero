@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/logctx"
+	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
@@ -36,7 +38,13 @@ type Handler struct {
 // RegisterRoutes mounts all API endpoints onto the given router.
 // The authMiddleware is applied to all endpoints that require authentication.
 // The /health endpoint is registered without auth.
+//
+// RequestID middleware is applied to the base router so every handler,
+// including /health, receives a request_id on its context and the
+// response carries an X-Request-ID header.
 func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFunc) {
+	r.Use(middleware.RequestID)
+
 	// Unauthenticated
 	r.HandleFunc("/health", h.Health).Methods("GET")
 
@@ -287,12 +295,16 @@ func (h *Handler) DeployStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run deployment asynchronously.
+	// Capture the request's logger so the background goroutine keeps the
+	// request_id on every subsequent log line.
+	reqLogger := logctx.FromContext(r.Context())
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
+		ctx = logctx.WithLogger(ctx, reqLogger)
 		if _, err := h.Deployer.Deploy(ctx, stack, store.TriggerManual); err != nil {
-			logrus.WithError(err).Errorf("Manual deployment failed for stack %s", stack.Name)
+			logctx.FromContext(ctx).WithError(err).Errorf("Manual deployment failed for stack %s", stack.Name)
 		}
 	}()
 
@@ -397,11 +409,14 @@ func (h *Handler) LegacyWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	reqLogger := logctx.FromContext(r.Context())
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
+		ctx = logctx.WithLogger(ctx, reqLogger)
 		if _, err := h.Deployer.Deploy(ctx, stack, store.TriggerWebhook); err != nil {
-			logrus.WithError(err).Errorf("Webhook deployment failed for stack %s", stack.Name)
+			logctx.FromContext(ctx).WithError(err).Errorf("Webhook deployment failed for stack %s", stack.Name)
 		}
 	}()
 
