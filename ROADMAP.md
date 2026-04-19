@@ -1,5 +1,24 @@
 # Accelero Roadmap
 
+## Vision
+
+Accelero is the **ArgoCD/Flux equivalent for Docker Compose environments**.
+
+Git is the single source of truth. Every deployment, every configuration change, flows through a git commit. Accelero continuously reconciles the desired state in git against the actual state of your Docker host(s) and corrects drift automatically.
+
+Unlike Portainer (UI-first, click-to-deploy, imperative), Accelero is **git-first and declarative**. We adopt operational tooling from Portainer (logs, stats, observability, RBAC, audit) where it supports GitOps workflows, and skip features that encourage state drift (in-UI container edits, image building, imperative changes).
+
+## Design Principles
+
+1. **Git is the source of truth.** Nothing modifies desired state except git commits.
+2. **Reconciliation over imperative.** Accelero watches, compares, converges.
+3. **Observability without mutation.** View logs, stats, containers, volumes — but don't edit. To change state, change git.
+4. **Debug operations are exceptional.** `exec` and write access to volumes exist for incident response, but are always audit-logged and flagged as drift.
+5. **Labeled resources only.** Accelero only manages what it created (`managed-by=accelero`). Never touch the user's other Docker resources.
+6. **Single binary, zero ops overhead.** SQLite for state, no external dependencies beyond Docker.
+
+---
+
 ## Completed
 
 ### Phase 0 — Bug Fixes & Foundation
@@ -25,10 +44,15 @@
 - [x] Legacy env-var backward compatibility (auto-migrates to "default" stack)
 - [x] Configurable server port
 - [x] Container labeling (`managed-by=accelero`, `accelero-stack=<name>`)
+- [x] CI/CD pipeline (split lint/test on PRs, build/release on tags, docs deploy)
+
+---
 
 ## In Progress
 
-### Phase 2 — Compose Compatibility, Observability & Management
+### Phase 2 — Compose Compatibility & Core Observability
+
+Goal: accept any reasonable real-world compose file, and surface enough runtime state to diagnose a deployment.
 
 **Docker Compose compatibility (high impact):**
 - [ ] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`)
@@ -47,30 +71,208 @@
 - [ ] `expose` (expose ports without publishing)
 - [ ] `pull_policy` (always, never, missing)
 
-**Observability & management:**
-- [ ] Container management endpoints (logs, restart, stop)
-- [ ] WebSocket support for real-time log streaming and deployment progress
-- [ ] Prometheus metrics endpoint (`/metrics`)
-- [ ] Structured request ID propagation through deployment chain
-- [ ] Deployment diff preview (show what will change before deploying)
+**Observability basics:**
+- [ ] Structured request/deployment ID propagation through all log entries
+- [ ] Prometheus metrics endpoint (`/metrics`) — deployments count, duration, failures, drift events, active reconcile loops
+- [ ] Deployment diff preview (`POST /stacks/{id}/preview` — show what would change without deploying)
+- [ ] `/healthz` and `/readyz` endpoints (distinct from `/health`)
 
-### Phase 3 — Production Hardening
-- [ ] Rate limiting on API endpoints
-- [ ] TLS support (native or documentation for reverse proxy)
-- [ ] Webhook signature verification (Docker Hub, GHCR, Harbor formats)
-- [ ] Retry with exponential backoff for transient failures (image pulls, network)
-- [ ] Notification integrations (Slack, Discord, generic webhook on deploy events)
-- [ ] Approval gates for production stacks
+---
 
-### Phase 4 — Web UI
-- [ ] Dashboard with stack overview, deployment history, container grid
-- [ ] Log viewer with search and filtering
-- [ ] Drift visualization
-- [ ] Stack creation/editing form
-- [ ] Deployment trigger and rollback buttons
+## Planned
 
-### Phase 5 — Multi-Host
-- [ ] Lightweight agent that runs on each Docker host
-- [ ] Central server orchestrates agents
-- [ ] Host grouping by environment
-- [ ] Rolling deployments across hosts
+### Phase 3 — GitOps Operator Experience
+
+Goal: operators can observe, debug, and audit GitOps-managed workloads without needing separate tools like `docker logs`, `docker stats`, or SSH to the host.
+
+**Read-only runtime introspection (no mutation):**
+- [ ] `GET /stacks/{id}/containers` — list containers with status, labels, image
+- [ ] `GET /stacks/{id}/containers/{cid}` — inspect container details
+- [ ] `GET /stacks/{id}/containers/{cid}/logs` — tail/download logs (support `since`, `tail`, `follow`)
+- [ ] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket for live logs
+- [ ] `GET /stacks/{id}/containers/{cid}/stats` — CPU, memory, network, I/O stats (snapshot + stream)
+- [ ] `GET /events` — Docker event stream filtered to accelero-managed containers
+
+**Resource browsers (read-only, filtered to accelero-managed):**
+- [ ] `GET /images` — images used by managed stacks, with size, layers, pull timestamp
+- [ ] `GET /volumes` — accelero-managed volumes with size and mount refs
+- [ ] `GET /volumes/{name}/browse` — read-only file browser for volumes (debugging)
+- [ ] `GET /networks` — accelero-managed networks with connected containers
+
+**Exceptional debug operations (audited, flagged as drift):**
+- [ ] `POST /containers/{cid}/restart` — logged + audit trail (pure GitOps: don't use; prefer git revert)
+- [ ] `POST /containers/{cid}/exec` — interactive shell via WebSocket (audit-logged, treated as drift event)
+- [ ] `POST /volumes/{name}/write` — emergency file write (off by default, requires `--allow-volume-writes` flag)
+
+**Audit log:**
+- [ ] Persistent audit log in SQLite — every API action with timestamp, user, operation, resource
+- [ ] `GET /audit` with filtering by stack, user, time range
+- [ ] Audit entries for: deploys, drifts detected, drifts auto-corrected, exec sessions, restarts
+- [ ] Immutable — append-only table, no update/delete API
+
+---
+
+### Phase 4 — Security & Multi-Tenancy
+
+Goal: run Accelero in team/enterprise environments with multiple users, scoped permissions, and encrypted secrets.
+
+**Identity & access:**
+- [ ] User accounts with password auth (bcrypt)
+- [ ] Multiple API tokens per user (named, revocable, scoped)
+- [ ] OAuth2/OIDC integration (GitHub, Google, generic)
+- [ ] Session-based auth for the UI
+- [ ] LDAP integration (optional, via plugin)
+
+**RBAC:**
+- [ ] Roles: `admin`, `operator`, `viewer`, `none`
+- [ ] Per-stack permissions (team X can deploy stack A but only view stack B)
+- [ ] Team grouping
+- [ ] Environment-based scoping (`prod` stacks require `admin` role)
+
+**Secrets at rest:**
+- [ ] Encrypted fields in SQLite: `repo_token`, `docker_password`, user passwords
+- [ ] Encryption key from env var or KMS (AWS KMS, GCP KMS, Vault)
+- [ ] Migration path from plaintext to encrypted
+
+**Secrets injection:**
+- [ ] External secret backends: HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager
+- [ ] `${secret:vault:path/to/key}` syntax in compose files
+- [ ] Per-stack secret scoping
+
+**Transport & network security:**
+- [ ] Native TLS support (cert files or Let's Encrypt)
+- [ ] Rate limiting on API endpoints (token bucket, per-key)
+- [ ] CSRF protection for session-based UI
+- [ ] Content Security Policy headers
+
+**Registry management:**
+- [ ] Multi-registry support with encrypted credentials at rest
+- [ ] Registry-specific webhook signature verification (Docker Hub, GHCR, Harbor, generic HMAC)
+- [ ] ECR/GCR/ACR IAM-based authentication
+- [ ] Browse registry tags (for UI dropdown / approval workflows)
+
+---
+
+### Phase 5 — Operations & Integrations
+
+Goal: make Accelero production-grade for teams that need notifications, approvals, and disaster recovery.
+
+**Notifications:**
+- [ ] Slack, Discord, Microsoft Teams integrations
+- [ ] Generic webhook (POST JSON to configured URL)
+- [ ] Email (SMTP)
+- [ ] Event types: deploy started/completed/failed/rolled-back, drift detected, auto-deploy triggered, approval requested
+- [ ] Per-stack notification routing (stack A → #prod channel, stack B → email)
+- [ ] Notification templates (customizable content)
+
+**Approval gates:**
+- [ ] Stacks can require approval before deploy (`requires_approval: true`)
+- [ ] Approval via API, Slack interactive message, or UI button
+- [ ] Approval timeouts (auto-reject after N minutes)
+- [ ] Approval audit trail
+
+**Reliability:**
+- [ ] Retry with exponential backoff: image pulls, git clones, network operations
+- [ ] Configurable retry budget per operation type
+- [ ] Circuit breaker for repeatedly-failing stacks
+
+**Backup & disaster recovery:**
+- [ ] `POST /admin/backup` — one-shot backup of SQLite
+- [ ] Scheduled backups (cron-like) to local path, S3, GCS, or arbitrary SCP
+- [ ] Backup encryption (age / gpg)
+- [ ] Restore wizard (load backup, verify, swap)
+
+**Templates (git-first, not in-app):**
+- [ ] Curated list of public GitOps-ready sample repos (fork-to-deploy pattern)
+- [ ] `POST /stacks/from-template` — create a stack from a template URL
+
+---
+
+### Phase 6 — Web UI
+
+Goal: a browser UI that makes GitOps concrete. Not a Portainer clone — a GitOps-native dashboard.
+
+**Core views:**
+- [ ] Dashboard: stack overview with drift status, deployment activity, reconciliation timeline
+- [ ] Stack detail: desired state (from git) vs actual state (from Docker), diff view, deployment history
+- [ ] Drift visualization: tree/graph showing which services are drifted and why
+- [ ] Deployment timeline: waterfall of services coming up, health checks, rollback events
+- [ ] Live log viewer with search, filter, multi-container tail
+- [ ] Container stats dashboard (CPU/mem/network/I/O graphs)
+- [ ] Audit log viewer with filters
+
+**GitOps-specific UX:**
+- [ ] Stack creation wizard: instead of writing compose in-UI, walks user through "fork this template, commit, we'll reconcile from there"
+- [ ] "Edit stack in git" buttons link directly to the compose file in the repo
+- [ ] PR-aware deploys (show open PRs that would change a stack if merged)
+- [ ] Commit-diff view showing what compose changes triggered a deploy
+
+**Implementation:**
+- [ ] Single-page app embedded in the Go binary (no separate server)
+- [ ] Static assets built at release time, served by Go HTTP
+- [ ] WebSocket for live updates (logs, stats, reconciliation events)
+- [ ] Mobile-responsive
+
+---
+
+### Phase 7 — Multi-Host & Agents
+
+Goal: manage multiple Docker hosts from a single Accelero control plane.
+
+- [ ] Lightweight Accelero agent binary per Docker host
+- [ ] Central controller orchestrates agents (mTLS between controller and agents)
+- [ ] Environment grouping: hosts grouped as `prod-us-east`, `staging`, etc.
+- [ ] Rolling deployments across hosts (canary → subset → full)
+- [ ] Edge agents (polling-based, for hosts behind firewalls)
+- [ ] Host health monitoring
+- [ ] Per-environment stack scoping
+- [ ] Disaster failover: if host dies, re-deploy stacks on another host in the same group
+
+---
+
+## Explicitly Out of Scope
+
+These are Portainer/other-tool features that conflict with Accelero's GitOps philosophy or domain:
+
+**State drift-inducing features (git must be the only way to change state):**
+- In-UI container configuration editing — any change must be a git commit
+- In-UI compose file editing — use the git editor
+- Creating containers outside stacks — everything is stack-managed
+- Duplicating/cloning containers via UI — clone the git repo instead
+
+**Outside Docker Compose domain:**
+- Kubernetes support — ArgoCD and Flux already own this
+- Docker Swarm orchestration — Swarm is on maintenance mode
+- Nomad support — different tool, different problem
+- Podman Pods — possible future consideration
+
+**CI responsibilities (not a deployment tool's job):**
+- Image building from Dockerfile
+- Image pushing to registries
+- Test execution before deploy (use CI gates instead)
+- Artifact signing (use CI + cosign)
+
+**Host/OS management:**
+- Firewall configuration
+- OS-level package management
+- SSH key management
+- Host system monitoring (use Prometheus/Grafana)
+
+**Marketplace/ecosystem:**
+- In-app template marketplace — templates should be git-forkable repos
+- Closed paid tier features — Accelero is open source, end to end
+
+---
+
+## Post-Roadmap Ideas (Phase 8+)
+
+Too early to commit, but tracked:
+
+- Progressive delivery (canary, blue-green, shadow traffic)
+- SLO-based automatic rollback (if error rate > X, rollback)
+- Cost tracking per stack
+- Image vulnerability scanning integration (Trivy, Grype) as a gate
+- Git-native approval PR workflow (require PR approval before reconciler deploys)
+- GitHub Actions / GitLab CI integration that queries Accelero drift status
+- OpenTelemetry traces for the full deploy pipeline
+- GraphQL API alongside REST
