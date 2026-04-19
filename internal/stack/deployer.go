@@ -21,12 +21,10 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/arbianshkodra/accelero/internal/utils"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/client"
 	"github.com/docker/go-units"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -489,22 +487,24 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 	var imageTag string
 
 	for _, c := range containers {
-		info, err := d.cli.ContainerInspect(ctx, c.ID)
+		info, err := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to inspect container %s: %w", c.ID[:12], err)
 		}
 
 		var networkIDs []string
-		for netName := range info.NetworkSettings.Networks {
-			networkIDs = append(networkIDs, netName)
+		if info.Container.NetworkSettings != nil {
+			for netName := range info.Container.NetworkSettings.Networks {
+				networkIDs = append(networkIDs, netName)
+			}
 		}
 
 		states = append(states, containerState{
 			ID:         c.ID,
 			Name:       safeName(c.Names),
 			Image:      c.Image,
-			Config:     info.Config,
-			HostConfig: info.HostConfig,
+			Config:     info.Container.Config,
+			HostConfig: info.Container.HostConfig,
 			NetworkIDs: networkIDs,
 		})
 
@@ -545,11 +545,12 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 			toRemove = append(toRemove, c.ID)
 		} else {
 			// Same image -- check health.
-			info, inspectErr := d.cli.ContainerInspect(ctx, c.ID)
+			info, inspectErr := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
 			if inspectErr != nil {
 				return fmt.Errorf("failed to inspect container %s: %w", c.ID[:12], inspectErr)
 			}
-			if info.State.Health != nil && info.State.Health.Status != "healthy" {
+			state := info.Container.State
+			if state != nil && state.Health != nil && state.Health.Status != "healthy" {
 				log.Infof("Existing container %s not healthy, waiting", c.ID[:12])
 				if err := d.waitForHealthy(ctx, c.ID); err != nil {
 					return fmt.Errorf("health check failed for existing container %s: %w", c.ID[:12], err)
@@ -576,8 +577,8 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 	if err := d.waitForHealthy(ctx, containerID); err != nil {
 		// New container is unhealthy -- stop and remove it before returning the error.
 		stopTimeout := 10
-		_ = d.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &stopTimeout})
-		_ = d.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+		_, _ = d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: &stopTimeout})
+		_, _ = d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
 		return fmt.Errorf("health check failed for new container %s: %w", containerID[:12], err)
 	}
 	log.Infof("New container %s healthy", containerID[:12])
@@ -586,10 +587,10 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 	for _, oldID := range toRemove {
 		log.Infof("Removing old container %s", oldID[:12])
 		stopTimeout := 10
-		if err := d.cli.ContainerStop(ctx, oldID, container.StopOptions{Timeout: &stopTimeout}); err != nil {
+		if _, err := d.cli.ContainerStop(ctx, oldID, client.ContainerStopOptions{Timeout: &stopTimeout}); err != nil {
 			log.WithError(err).Warnf("Failed to stop old container %s", oldID[:12])
 		}
-		if err := d.cli.ContainerRemove(ctx, oldID, container.RemoveOptions{Force: true}); err != nil {
+		if _, err := d.cli.ContainerRemove(ctx, oldID, client.ContainerRemoveOptions{Force: true}); err != nil {
 			log.WithError(err).Warnf("Failed to remove old container %s", oldID[:12])
 		}
 	}
@@ -604,7 +605,7 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 // pullImage pulls a Docker image, optionally authenticating with the supplied
 // per-stack registry credentials (not environment variables).
 func (d *Deployer) pullImage(ctx context.Context, imageRef, username, password, serverAddress string) error {
-	opts := image.PullOptions{}
+	opts := client.ImagePullOptions{}
 
 	if username != "" && password != "" {
 		authConfig := registry.AuthConfig{
@@ -619,13 +620,14 @@ func (d *Deployer) pullImage(ctx context.Context, imageRef, username, password, 
 		opts.RegistryAuth = base64.URLEncoding.EncodeToString(encoded)
 	}
 
-	reader, err := d.cli.ImagePull(ctx, imageRef, opts)
+	resp, err := d.cli.ImagePull(ctx, imageRef, opts)
 	if err != nil {
 		return fmt.Errorf("failed to pull image %s: %w", imageRef, err)
 	}
-	defer reader.Close()
+	defer resp.Close()
 
-	if _, err := io.Copy(io.Discard, reader); err != nil {
+	// Drain the stream to guarantee the pull completes before we return.
+	if _, err := io.Copy(io.Discard, resp); err != nil {
 		return fmt.Errorf("error reading image pull response for %s: %w", imageRef, err)
 	}
 
@@ -727,7 +729,12 @@ func (d *Deployer) createAndStartContainer(
 	createCtx, createCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer createCancel()
 
-	resp, err := d.cli.ContainerCreate(createCtx, containerConfig, hostConfig, networkingConfig, nil, name)
+	resp, err := d.cli.ContainerCreate(createCtx, client.ContainerCreateOptions{
+		Config:           containerConfig,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+		Name:             name,
+	})
 	if err != nil {
 		return "", fmt.Errorf("docker create failed for %s: %w", name, err)
 	}
@@ -735,9 +742,9 @@ func (d *Deployer) createAndStartContainer(
 	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer startCancel()
 
-	if err := d.cli.ContainerStart(startCtx, resp.ID, container.StartOptions{}); err != nil {
+	if _, err := d.cli.ContainerStart(startCtx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		// Attempt cleanup of the created-but-not-started container.
-		_ = d.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+		_, _ = d.cli.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
 		return "", fmt.Errorf("docker start failed for %s: %w", name, err)
 	}
 
@@ -760,22 +767,23 @@ func (d *Deployer) waitForHealthy(ctx context.Context, containerID string) error
 
 	// Check immediately on the first iteration, then on each tick.
 	for {
-		info, err := d.cli.ContainerInspect(timeoutCtx, containerID)
+		info, err := d.cli.ContainerInspect(timeoutCtx, containerID, client.ContainerInspectOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to inspect container %s: %w", containerID[:12], err)
 		}
 
-		if info.State == nil {
+		state := info.Container.State
+		if state == nil {
 			return fmt.Errorf("container %s has no state", containerID[:12])
 		}
 
 		// No health check defined -- consider it healthy.
-		if info.State.Health == nil {
+		if state.Health == nil {
 			logctx.FromContext(ctx).Debugf("No healthcheck defined for %s, treating as healthy", containerID[:12])
 			return nil
 		}
 
-		switch info.State.Health.Status {
+		switch state.Health.Status {
 		case "healthy":
 			return nil
 		case "unhealthy":
@@ -833,10 +841,10 @@ func (d *Deployer) rollbackService(ctx context.Context, state *serviceState) err
 	}
 	for _, c := range current {
 		stopTimeout := 10
-		if err := d.cli.ContainerStop(ctx, c.ID, container.StopOptions{Timeout: &stopTimeout}); err != nil {
+		if _, err := d.cli.ContainerStop(ctx, c.ID, client.ContainerStopOptions{Timeout: &stopTimeout}); err != nil {
 			log.WithError(err).Warnf("Failed to stop container %s during rollback", c.ID[:12])
 		}
-		if err := d.cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil {
+		if _, err := d.cli.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true}); err != nil {
 			return fmt.Errorf("failed to remove container %s during rollback: %w", c.ID[:12], err)
 		}
 	}
@@ -846,19 +854,23 @@ func (d *Deployer) rollbackService(ctx context.Context, state *serviceState) err
 		rollbackName := fmt.Sprintf("%s_rollback_%d_%d", state.ServiceName, i, time.Now().UnixNano())
 		log.Infof("Recreating container %s from image %s", rollbackName, cs.Image)
 
-		resp, err := d.cli.ContainerCreate(ctx, cs.Config, cs.HostConfig, nil, nil, rollbackName)
+		resp, err := d.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Config:     cs.Config,
+			HostConfig: cs.HostConfig,
+			Name:       rollbackName,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to create rollback container: %w", err)
 		}
 
 		// Reconnect to networks.
 		for _, netID := range cs.NetworkIDs {
-			if err := d.cli.NetworkConnect(ctx, netID, resp.ID, nil); err != nil {
+			if _, err := d.cli.NetworkConnect(ctx, netID, client.NetworkConnectOptions{Container: resp.ID}); err != nil {
 				log.WithError(err).Warnf("Failed to connect rollback container to network %s", netID)
 			}
 		}
 
-		if err := d.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		if _, err := d.cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 			return fmt.Errorf("failed to start rollback container %s: %w", resp.ID[:12], err)
 		}
 
@@ -902,7 +914,7 @@ func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack
 				ContainerID:   c.ID,
 				ContainerName: safeName(c.Names),
 				Image:         c.Image,
-				Status:        c.State,
+				Status:        string(c.State),
 				CreatedAt:     time.Now(),
 			}
 			if err := d.store.TrackContainer(mc); err != nil {
@@ -921,10 +933,9 @@ func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack
 // getServiceContainers lists containers whose name matches the given service,
 // using Docker's name filter rather than fetching all containers.
 func (d *Deployer) getServiceContainers(ctx context.Context, serviceName string) ([]container.Summary, error) {
-	f := filters.NewArgs()
-	f.Add("name", serviceName)
+	f := make(client.Filters).Add("name", serviceName)
 
-	all, err := d.cli.ContainerList(ctx, container.ListOptions{
+	res, err := d.cli.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: f,
 	})
@@ -935,7 +946,7 @@ func (d *Deployer) getServiceContainers(ctx context.Context, serviceName string)
 	// Docker's name filter is a substring match, so we must apply strict
 	// matching to avoid false positives (e.g. "web" matching "webproxy").
 	var matched []container.Summary
-	for _, c := range all {
+	for _, c := range res.Items {
 		for _, name := range c.Names {
 			if matchesServiceName(name, serviceName) {
 				matched = append(matched, c)

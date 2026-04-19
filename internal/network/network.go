@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,24 +18,24 @@ func CreateNetwork(cli *client.Client, name string, config ComposeNetwork) error
 }
 
 func CreateNetworkWithContext(ctx context.Context, cli *client.Client, name string, config ComposeNetwork) error {
-	existingNetworks, err := cli.NetworkList(ctx, dockernetwork.ListOptions{})
+	existing, err := cli.NetworkList(ctx, client.NetworkListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list networks: %w", err)
 	}
 
-	for _, net := range existingNetworks {
+	for _, net := range existing.Items {
 		if net.Name == name {
 			logrus.Warnf("Network %s already exists, skipping creation", name)
 			return nil
 		}
 	}
 
-	networkCreate := dockernetwork.CreateOptions{
+	opts := client.NetworkCreateOptions{
 		Driver:  config.Driver,
 		Options: config.DriverOpts,
 	}
 
-	if _, err := cli.NetworkCreate(ctx, name, networkCreate); err != nil {
+	if _, err := cli.NetworkCreate(ctx, name, opts); err != nil {
 		return fmt.Errorf("failed to create network %s: %w", name, err)
 	}
 
