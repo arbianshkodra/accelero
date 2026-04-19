@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
@@ -103,6 +104,16 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 		return nil, fmt.Errorf("failed to generate deployment id: %w", err)
 	}
 
+	// Enrich the context so every log line from this deployment carries
+	// the deployment/stack/trigger fields, including in downstream helpers.
+	ctx = logctx.WithFields(ctx, logrus.Fields{
+		"deployment_id": deployID,
+		"stack_id":      stack.ID,
+		"stack_name":    stack.Name,
+		"trigger":       trigger,
+	})
+	log := logctx.FromContext(ctx)
+
 	deployment := &store.Deployment{
 		ID:        deployID,
 		StackID:   stack.ID,
@@ -118,7 +129,7 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	// Mark the stack as deploying.
 	stack.Status = store.StackStatusDeploying
 	if err := d.store.UpdateStack(stack); err != nil {
-		logrus.WithError(err).Error("Failed to set stack status to deploying")
+		log.WithError(err).Error("Failed to set stack status to deploying")
 	}
 
 	deployment.Status = store.DeploymentInProgress
@@ -140,10 +151,10 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	}
 
 	if err := d.store.UpdateDeployment(deployment); err != nil {
-		logrus.WithError(err).Error("Failed to update deployment record")
+		log.WithError(err).Error("Failed to update deployment record")
 	}
 	if err := d.store.UpdateStack(stack); err != nil {
-		logrus.WithError(err).Error("Failed to update stack record")
+		log.WithError(err).Error("Failed to update stack record")
 	}
 
 	return deployment, deployErr
@@ -154,10 +165,7 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 // --------------------------------------------------------------------------
 
 func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deployment *store.Deployment) error {
-	log := logrus.WithFields(logrus.Fields{
-		"stack":      stack.Name,
-		"deployment": deployment.ID,
-	})
+	log := logctx.FromContext(ctx)
 
 	// 1. Clone repository (shallow, depth=1).
 	repoDir, gitCommit, err := d.cloneRepo(ctx, stack)
@@ -298,7 +306,7 @@ func (d *Deployer) cloneRepo(ctx context.Context, stack *store.Stack) (string, s
 	}
 	commit := head.Hash().String()
 
-	logrus.WithField("commit", commit[:12]).Info("Repository cloned successfully")
+	logctx.FromContext(ctx).WithField("commit", commit[:12]).Info("Repository cloned successfully")
 	return dir, commit, nil
 }
 
@@ -517,7 +525,7 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 // --------------------------------------------------------------------------
 
 func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
-	log := logrus.WithField("service", serviceName)
+	log := logctx.FromContext(ctx).WithField("service", serviceName)
 
 	// Pull image.
 	if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
@@ -621,7 +629,7 @@ func (d *Deployer) pullImage(ctx context.Context, imageRef, username, password, 
 		return fmt.Errorf("error reading image pull response for %s: %w", imageRef, err)
 	}
 
-	logrus.WithField("image", imageRef).Info("Image pulled successfully")
+	logctx.FromContext(ctx).WithField("image", imageRef).Info("Image pulled successfully")
 	return nil
 }
 
@@ -637,7 +645,7 @@ func (d *Deployer) createAndStartContainer(
 	svc service.ComposeService,
 	serviceName, stackName string,
 ) (string, error) {
-	log := logrus.WithFields(logrus.Fields{"container": name, "image": svc.Image})
+	log := logctx.FromContext(ctx).WithFields(logrus.Fields{"container": name, "image": svc.Image})
 	log.Info("Creating container")
 
 	// Load environment variables from env_file entries and inline env.
@@ -763,7 +771,7 @@ func (d *Deployer) waitForHealthy(ctx context.Context, containerID string) error
 
 		// No health check defined -- consider it healthy.
 		if info.State.Health == nil {
-			logrus.Debugf("No healthcheck defined for %s, treating as healthy", containerID[:12])
+			logctx.FromContext(ctx).Debugf("No healthcheck defined for %s, treating as healthy", containerID[:12])
 			return nil
 		}
 
@@ -791,29 +799,31 @@ func (d *Deployer) waitForHealthy(ctx context.Context, containerID string) error
 // rollbackServices rolls back previously deployed services using the
 // pre-deployment state snapshots.  Services are rolled back in reverse order.
 func (d *Deployer) rollbackServices(ctx context.Context, deployed []string, states map[string]*serviceState) {
+	log := logctx.FromContext(ctx)
 	for i := len(deployed) - 1; i >= 0; i-- {
 		svcName := deployed[i]
 		state := states[svcName]
 		if state == nil {
-			logrus.Warnf("No pre-deploy state for %s, cannot rollback", svcName)
+			log.Warnf("No pre-deploy state for %s, cannot rollback", svcName)
 			continue
 		}
 		if err := d.rollbackService(ctx, state); err != nil {
-			logrus.WithError(err).Errorf("Rollback failed for service %s", svcName)
+			log.WithError(err).Errorf("Rollback failed for service %s", svcName)
 		} else {
-			logrus.Infof("Rolled back service %s successfully", svcName)
+			log.Infof("Rolled back service %s successfully", svcName)
 		}
 	}
 }
 
 // rollbackService restores a single service to its pre-deployment state.
 func (d *Deployer) rollbackService(ctx context.Context, state *serviceState) error {
+	log := logctx.FromContext(ctx).WithField("service", state.ServiceName)
+
 	if len(state.ContainerStates) == 0 {
-		logrus.Warnf("Service %s had no containers before deployment, nothing to restore", state.ServiceName)
+		log.Warnf("Service %s had no containers before deployment, nothing to restore", state.ServiceName)
 		return nil
 	}
 
-	log := logrus.WithField("service", state.ServiceName)
 	log.Warnf("Rolling back to image %s", state.ImageTag)
 
 	// Stop and remove current (post-failure) containers.
@@ -865,6 +875,8 @@ func (d *Deployer) rollbackService(ctx context.Context, state *serviceState) err
 // syncContainerTracking updates the store's container records to reflect the
 // containers that are currently running for the stack's services.
 func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack, services []string) error {
+	log := logctx.FromContext(ctx)
+
 	// Remove old tracking records for this stack.
 	if err := d.store.RemoveContainersByStack(stack.ID); err != nil {
 		return fmt.Errorf("failed to clear old container records: %w", err)
@@ -873,14 +885,14 @@ func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack
 	for _, svcName := range services {
 		containers, err := d.getServiceContainers(ctx, svcName)
 		if err != nil {
-			logrus.WithError(err).Warnf("Failed to list containers for tracking: %s", svcName)
+			log.WithError(err).Warnf("Failed to list containers for tracking: %s", svcName)
 			continue
 		}
 
 		for _, c := range containers {
 			trackID, err := generateID()
 			if err != nil {
-				logrus.WithError(err).Warn("Failed to generate tracking ID")
+				log.WithError(err).Warn("Failed to generate tracking ID")
 				continue
 			}
 			mc := &store.ManagedContainer{
@@ -894,7 +906,7 @@ func (d *Deployer) syncContainerTracking(ctx context.Context, stack *store.Stack
 				CreatedAt:     time.Now(),
 			}
 			if err := d.store.TrackContainer(mc); err != nil {
-				logrus.WithError(err).Warnf("Failed to track container %s", c.ID[:12])
+				log.WithError(err).Warnf("Failed to track container %s", c.ID[:12])
 			}
 		}
 	}
