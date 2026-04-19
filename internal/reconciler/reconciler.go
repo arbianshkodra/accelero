@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
@@ -208,17 +209,25 @@ func (r *Reconciler) runLoop(ctx context.Context, stackID string, done chan stru
 		return
 	}
 
+	// Bake the stack identity into the loop's context so every log line
+	// from this goroutine carries stack_id / stack_name.
+	ctx = logctx.WithFields(ctx, logrus.Fields{
+		"component":  "reconciler",
+		"stack_id":   stack.ID,
+		"stack_name": stack.Name,
+	})
+	log := logctx.FromContext(ctx)
+
 	interval := time.Duration(stack.ReconcileInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	logrus.Infof("reconciler: loop started for stack %s (%s), interval %v",
-		stack.ID, stack.Name, interval)
+	log.Infof("loop started with interval %v", interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			logrus.Infof("reconciler: loop stopping for stack %s (%s)", stack.ID, stack.Name)
+			log.Info("loop stopping")
 			return
 
 		case <-ticker.C:
@@ -229,51 +238,66 @@ func (r *Reconciler) runLoop(ctx context.Context, stackID string, done chan stru
 
 // reconcileOnce performs a single reconciliation cycle for the given stack.
 func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
+	reconcileID, _ := newReconcileID()
+
+	// Attach a per-tick reconcile_id so every drift/auto-deploy log for
+	// this cycle can be correlated.  This also survives into Deploy() when
+	// auto-deploy is triggered.
+	ctx = logctx.WithField(ctx, "reconcile_id", reconcileID)
+	log := logctx.FromContext(ctx)
+
 	// Reload the stack each tick so we pick up config changes.
 	stack, err := r.store.GetStack(stackID)
 	if err != nil || stack == nil {
-		logrus.Errorf("reconciler: could not reload stack %s: %v", stackID, err)
+		log.WithError(err).Errorf("could not reload stack %s", stackID)
 		return
 	}
 
 	if stack.Status != store.StackStatusActive {
-		logrus.Debugf("reconciler: stack %s (%s) is not active, skipping", stack.ID, stack.Name)
+		log.Debug("stack is not active, skipping reconcile")
 		return
 	}
 
 	report, err := r.checkDrift(ctx, stack)
 	if err != nil {
-		logrus.Errorf("reconciler: drift check failed for stack %s (%s): %v",
-			stack.ID, stack.Name, err)
+		log.WithError(err).Error("drift check failed")
 		return
 	}
 
 	if report.HasDrift {
-		logrus.Infof("reconciler: drift detected for stack %s (%s): %d drift(s)",
-			stack.ID, stack.Name, len(report.Drifts))
+		log.Infof("drift detected: %d drift(s)", len(report.Drifts))
 		for _, d := range report.Drifts {
-			logrus.Infof("reconciler:   [%s] %s: %s", d.Type, d.ServiceName, d.Message)
+			log.WithFields(logrus.Fields{
+				"drift_type":   d.Type,
+				"service_name": d.ServiceName,
+			}).Info(d.Message)
 		}
 
 		if stack.AutoDeploy {
-			logrus.Infof("reconciler: auto-deploying stack %s (%s) to resolve drift",
-				stack.ID, stack.Name)
+			log.Info("auto-deploying to resolve drift")
 			if _, deployErr := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); deployErr != nil {
-				logrus.Errorf("reconciler: auto-deploy failed for stack %s (%s): %v",
-					stack.ID, stack.Name, deployErr)
+				log.WithError(deployErr).Error("auto-deploy failed")
 			}
 		}
 	} else {
-		logrus.Debugf("reconciler: no drift for stack %s (%s)", stack.ID, stack.Name)
+		log.Debug("no drift")
 	}
 
 	// Persist the reconciliation timestamp regardless of drift.
 	now := time.Now()
 	stack.LastReconciledAt = &now
 	if updateErr := r.store.UpdateStack(stack); updateErr != nil {
-		logrus.Errorf("reconciler: failed to update LastReconciledAt for stack %s: %v",
-			stack.ID, updateErr)
+		log.WithError(updateErr).Error("failed to update LastReconciledAt")
 	}
+}
+
+// newReconcileID returns a short hex ID used to tag a single reconcile cycle.
+func newReconcileID() (string, error) {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // checkDrift compares the desired state (from git) with the actual running
@@ -423,7 +447,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 				}
 			}
 		} else {
-			logrus.Warnf("reconciler: could not list Docker networks for drift check: %v", netErr)
+			logctx.FromContext(ctx).WithError(netErr).Warn("could not list Docker networks for drift check")
 		}
 	}
 
@@ -443,7 +467,7 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 	}
 	defer func() {
 		if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
-			logrus.Warnf("reconciler: failed to remove temp dir %s: %v", tmpDir, removeErr)
+			logctx.FromContext(ctx).WithError(removeErr).Warnf("failed to remove temp dir %s", tmpDir)
 		}
 	}()
 
