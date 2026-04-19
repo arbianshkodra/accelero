@@ -3,8 +3,7 @@ package service
 import (
 	"context"
 
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 )
 
@@ -12,46 +11,44 @@ import (
 // It scopes prune operations using the "managed-by=accelero" label so that
 // resources belonging to other tools are never touched.
 func CleanupResources(ctx context.Context, cli *client.Client) error {
-	labelFilter := filters.NewArgs()
-	labelFilter.Add("label", "managed-by=accelero")
+	labelFilter := make(client.Filters).Add("label", "managed-by=accelero")
 
-	// Prune containers
-	containerReport, err := cli.ContainersPrune(ctx, labelFilter)
+	// Prune containers scoped to the accelero label.
+	containerRes, err := cli.ContainerPrune(ctx, client.ContainerPruneOptions{Filters: labelFilter})
 	if err != nil {
 		return err
 	}
-	if len(containerReport.ContainersDeleted) > 0 {
-		logrus.Infof("Pruned %d accelero containers", len(containerReport.ContainersDeleted))
+	if n := len(containerRes.Report.ContainersDeleted); n > 0 {
+		logrus.Infof("Pruned %d accelero containers", n)
 	}
 
-	// Prune images (dangling only — no label filter available for images,
-	// but we only prune dangling ones to stay safe)
-	danglingFilter := filters.NewArgs()
-	danglingFilter.Add("dangling", "true")
-	imageReport, err := cli.ImagesPrune(ctx, danglingFilter)
+	// Prune dangling images (no label filter exists for images — restrict to
+	// dangling-only to stay safe).
+	danglingFilter := make(client.Filters).Add("dangling", "true")
+	imageRes, err := cli.ImagePrune(ctx, client.ImagePruneOptions{Filters: danglingFilter})
 	if err != nil {
 		return err
 	}
-	if len(imageReport.ImagesDeleted) > 0 {
-		logrus.Infof("Pruned %d dangling images", len(imageReport.ImagesDeleted))
+	if n := len(imageRes.Report.ImagesDeleted); n > 0 {
+		logrus.Infof("Pruned %d dangling images", n)
 	}
 
-	// Prune volumes (scoped by label)
-	volumeReport, err := cli.VolumesPrune(ctx, labelFilter)
+	// Prune volumes scoped by label.
+	volumeRes, err := cli.VolumePrune(ctx, client.VolumePruneOptions{Filters: labelFilter})
 	if err != nil {
 		return err
 	}
-	if len(volumeReport.VolumesDeleted) > 0 {
-		logrus.Infof("Pruned %d accelero volumes", len(volumeReport.VolumesDeleted))
+	if n := len(volumeRes.Report.VolumesDeleted); n > 0 {
+		logrus.Infof("Pruned %d accelero volumes", n)
 	}
 
-	// Prune networks (scoped by label)
-	networkReport, err := cli.NetworksPrune(ctx, labelFilter)
+	// Prune networks scoped by label.
+	networkRes, err := cli.NetworkPrune(ctx, client.NetworkPruneOptions{Filters: labelFilter})
 	if err != nil {
 		return err
 	}
-	if len(networkReport.NetworksDeleted) > 0 {
-		logrus.Infof("Pruned %d accelero networks", len(networkReport.NetworksDeleted))
+	if n := len(networkRes.Report.NetworksDeleted); n > 0 {
+		logrus.Infof("Pruned %d accelero networks", n)
 	}
 
 	return nil

@@ -16,10 +16,8 @@ import (
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	dockernetwork "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -346,13 +344,13 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 		info := containerInfo{
 			id:    c.ID,
 			image: c.Image,
-			state: c.State,
+			state: string(c.State),
 		}
 
 		// Inspect for health status.
-		inspect, inspectErr := r.docker.ContainerInspect(ctx, c.ID)
-		if inspectErr == nil && inspect.State != nil && inspect.State.Health != nil {
-			info.health = inspect.State.Health.Status
+		inspect, inspectErr := r.docker.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+		if inspectErr == nil && inspect.Container.State != nil && inspect.Container.State.Health != nil {
+			info.health = string(inspect.Container.State.Health.Status)
 		}
 
 		actualByService[svcName] = append(actualByService[svcName], info)
@@ -430,10 +428,10 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 
 	// ---- 5. Check network drift (desired networks that don't exist) ----
 	if len(desiredNetworks) > 0 {
-		existingNetworks, netErr := r.docker.NetworkList(ctx, dockernetwork.ListOptions{})
+		existingNetworks, netErr := r.docker.NetworkList(ctx, client.NetworkListOptions{})
 		if netErr == nil {
-			existingSet := make(map[string]bool, len(existingNetworks))
-			for _, n := range existingNetworks {
+			existingSet := make(map[string]bool, len(existingNetworks.Items))
+			for _, n := range existingNetworks.Items {
 				existingSet[n.Name] = true
 			}
 			for netName := range desiredNetworks {
@@ -508,11 +506,11 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 // listStackContainers returns all containers on the Docker host that carry the
 // Accelero management labels for the given stack name.
 func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) ([]container.Summary, error) {
-	f := filters.NewArgs()
-	f.Add("label", fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByValue))
-	f.Add("label", fmt.Sprintf("%s=%s", labelStackName, stackName))
+	f := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByValue)).
+		Add("label", fmt.Sprintf("%s=%s", labelStackName, stackName))
 
-	containers, err := r.docker.ContainerList(ctx, container.ListOptions{
+	res, err := r.docker.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: f,
 	})
@@ -520,7 +518,7 @@ func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) 
 		return nil, fmt.Errorf("docker container list: %w", err)
 	}
 
-	return containers, nil
+	return res.Items, nil
 }
 
 // filterServices applies the stack's ServiceFilter (comma-separated list of

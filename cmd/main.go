@@ -18,7 +18,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/stack"
 	"github.com/arbianshkodra/accelero/internal/store"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
@@ -47,10 +47,11 @@ func main() {
 	defer db.Close()
 	logrus.Info("Database initialized")
 
-	// 3. Create Docker client and verify the daemon.
-	cli, err := client.NewClientWithOpts(
+	// 3. Create Docker client and verify the daemon. API version negotiation
+	// is now enabled by default on the Moby client (it used to require an
+	// explicit Opt). We still call Ping below to confirm reachability.
+	cli, err := client.New(
 		client.WithHost(cfg.DockerSock),
-		client.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
 		logrus.Fatalf("Failed to create Docker client: %v", err)
@@ -59,7 +60,7 @@ func main() {
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
-	if _, err := cli.Ping(pingCtx); err != nil {
+	if _, err := cli.Ping(pingCtx, client.PingOptions{}); err != nil {
 		logrus.Fatalf("Cannot connect to Docker daemon at %s: %v", cfg.DockerSock, err)
 	}
 	logrus.Info("Connected to Docker daemon")
