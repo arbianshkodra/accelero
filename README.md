@@ -128,7 +128,7 @@ All endpoints (except `/health`) require the `X-API-KEY` header.
 | `LOG_LEVEL` | No | `info` | Log level (debug, info, warn, error) |
 | `LOG_FORMAT` | No | `text` | Log format (text, json) |
 
-See `sample.env` for the full list including legacy single-stack variables.
+See [`.env.example`](./.env.example) for the full list including legacy single-stack variables.
 
 ## Legacy Mode
 
