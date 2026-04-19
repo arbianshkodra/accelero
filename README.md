@@ -16,6 +16,7 @@ Think of it as **ArgoCD/Flux for Docker Compose** — git is the source of truth
 - **Multi-stack management** — Manage multiple independent stacks via REST API
 - **GitOps reconciliation** — Periodic drift detection: desired state (git) vs actual state (Docker), auto-deploy on drift
 - **Flexible triggers** — Deploy via webhook (push), reconciliation (pull), or manual API call
+- **`.env` interpolation** — Full docker-compose `${VAR}` / `${VAR:-default}` / `${VAR:?required}` support
 - **Zero-downtime deployments** — New containers are health-checked before old ones are removed
 - **Automatic rollback** — Pre-deployment state captured and restored on failure
 - **Dependency resolution** — Services deployed in correct order based on `depends_on`
@@ -75,6 +76,29 @@ curl http://localhost:8000/api/v1/stacks/my-app/drift \
   -H "X-API-KEY: your-secure-key"
 ```
 
+### `.env` Interpolation
+
+Your compose file can reference environment variables using docker-compose's syntax. Accelero resolves them from a `.env` file in the repo before parsing:
+
+**`docker-compose.yaml`:**
+```yaml
+services:
+  web:
+    image: ${REGISTRY:-ghcr.io}/${APP}:${TAG}
+    environment:
+      - DEBUG=${DEBUG-off}
+      - DB_URL=${DB_URL:?DB_URL is required}
+```
+
+**`.env`** (next to the compose file):
+```
+APP=my-app
+TAG=1.2.3
+DB_URL=postgres://db/app
+```
+
+Resolves to `ghcr.io/my-app:1.2.3` before deploy. See [Variable Interpolation](./docs/usage-overview.md#variable-interpolation-env-file) for the full syntax.
+
 ## API Reference
 
 All endpoints (except `/health`) require the `X-API-KEY` header.
@@ -104,7 +128,7 @@ All endpoints (except `/health`) require the `X-API-KEY` header.
 | `LOG_LEVEL` | No | `info` | Log level (debug, info, warn, error) |
 | `LOG_FORMAT` | No | `text` | Log format (text, json) |
 
-See `sample.env` for the full list including legacy single-stack variables.
+See [`.env.example`](./.env.example) for the full list including legacy single-stack variables.
 
 ## Legacy Mode
 

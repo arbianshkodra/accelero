@@ -52,27 +52,15 @@ These variables are supported for backward compatibility. If set, Accelero creat
 
 ## Sample Environment File
 
+A ready-to-fill template lives at [`.env.example`](https://github.com/arbianshkodra/accelero/blob/dev/.env.example) in the repository. Copy it to `.env` and fill in the values:
+
 ```bash
-# Required
-API_KEY=your_secure_api_key_here
-
-# Optional server settings
-# SERVER_PORT=8000
-# DOCKER_SOCK=unix:///var/run/docker.sock
-# DATABASE_PATH=./data/accelero.db
-
-# Optional logging
-# LOG_LEVEL=info
-# LOG_FORMAT=text
-
-# Optional performance tuning
-# WORKER_COUNT=10
-# QUEUE_SIZE=150
-
-# Optional cleanup intervals
-# STATUS_CLEANUP_INTERVAL=1h
-# STATUS_MAX_AGE=24h
+cp .env.example .env
+# edit .env
+docker run --env-file .env ...
 ```
+
+Do **not** confuse `.env.example` (configures the Accelero daemon itself) with a `.env` inside your GitOps repo next to `docker-compose.yaml` — that one feeds `${VAR}` interpolation in your compose. See [Variable Interpolation](./usage-overview.md#variable-interpolation-env-file).
 
 ## Docker Compose Example
 

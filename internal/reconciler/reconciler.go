@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
@@ -495,12 +496,47 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 		return nil, nil, fmt.Errorf("read compose file %s: %w", stack.ComposePath, err)
 	}
 
+	// Apply .env interpolation — same preprocessing the deployer uses so the
+	// drift check compares actual state against the *substituted* desired state.
+	envVars, _, err := loadDotEnv(tmpDir, composePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	expanded, err := compose.ExpandBytes(data, envVars)
+	if err != nil {
+		return nil, nil, fmt.Errorf("interpolate compose file: %w", err)
+	}
+
 	var cf composeFile
-	if err := yaml.Unmarshal(data, &cf); err != nil {
+	if err := yaml.Unmarshal(expanded, &cf); err != nil {
 		return nil, nil, fmt.Errorf("parse compose file: %w", err)
 	}
 
 	return cf.Services, cf.Networks, nil
+}
+
+// loadDotEnv looks for a .env next to the compose file, then at the repo root.
+// Matches the deployer's behaviour.  A missing .env is not an error.
+func loadDotEnv(repoDir, composeFilePath string) (map[string]string, string, error) {
+	candidates := []string{
+		filepath.Join(filepath.Dir(composeFilePath), ".env"),
+		filepath.Join(repoDir, ".env"),
+	}
+	seen := make(map[string]bool)
+	for _, p := range candidates {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		vars, err := compose.LoadDotEnv(p)
+		if err != nil {
+			return nil, "", fmt.Errorf("load .env %s: %w", p, err)
+		}
+		if vars != nil {
+			return vars, p, nil
+		}
+	}
+	return nil, "", nil
 }
 
 // listStackContainers returns all containers on the Docker host that carry the

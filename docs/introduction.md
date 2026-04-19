@@ -36,6 +36,12 @@ Accelero creates new containers and waits for them to pass health checks before 
 
 Before deploying, Accelero captures the complete state of every affected service (container config, host config, network connections). If any service fails to deploy, all previously deployed services in that batch are rolled back using the captured snapshots — not the current (broken) state.
 
+### Variable Interpolation
+
+Compose files commonly use `${VAR}` references for things like image tags, registry names, and inline environment values. Accelero applies full docker-compose-compatible variable substitution before parsing, reading variables from a `.env` file committed next to your compose file. Defaults (`${VAR:-default}`), required vars (`${VAR:?error}`), and conditional replacements (`${VAR:+value}`) are all supported.
+
+See [Variable Interpolation (`.env` file)](./usage-overview.md#variable-interpolation-env-file) for the full syntax and examples.
+
 ## How It Works
 
 ```

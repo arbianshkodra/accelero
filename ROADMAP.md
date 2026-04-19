@@ -55,7 +55,7 @@ Unlike Portainer (UI-first, click-to-deploy, imperative), Accelero is **git-firs
 Goal: accept any reasonable real-world compose file, and surface enough runtime state to diagnose a deployment.
 
 **Docker Compose compatibility (high impact):**
-- [ ] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`)
+- [x] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR:+value}`, `$$`) — next-to-compose and repo-root lookup
 - [ ] `entrypoint`, `working_dir`, `user` fields
 - [ ] `depends_on` map form with conditions (`condition: service_healthy`)
 - [ ] `deploy.replicas` for container scaling
@@ -129,15 +129,36 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 - [ ] Team grouping
 - [ ] Environment-based scoping (`prod` stacks require `admin` role)
 
-**Secrets at rest:**
-- [ ] Encrypted fields in SQLite: `repo_token`, `docker_password`, user passwords
-- [ ] Encryption key from env var or KMS (AWS KMS, GCP KMS, Vault)
-- [ ] Migration path from plaintext to encrypted
+**Secrets — guiding principle:** the interpolation `.env` in a GitOps repo is for declarative config only (tags, registries, ports, flags) and is committed to git. Actual secrets must never land there. The items below give secrets a first-class home that does not require committing anything sensitive.
 
-**Secrets injection:**
-- [ ] External secret backends: HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager
-- [ ] `${secret:vault:path/to/key}` syntax in compose files
-- [ ] Per-stack secret scoping
+**Secrets at rest (inside Accelero):**
+- [ ] Encrypt the sensitive fields already stored in SQLite: `repo_token`, `docker_password`, user passwords. Per-field AEAD (e.g. XChaCha20-Poly1305) keyed by a master key.
+- [ ] Master key sources: env var (simple setups), file path, or KMS (AWS KMS, GCP KMS, HashiCorp Vault Transit).
+- [ ] Automatic key rotation: new writes use the current key; old reads transparently re-encrypt on next write.
+- [ ] Online migration path from existing plaintext rows (one-shot admin endpoint that re-encrypts in place).
+
+**Per-stack secrets API:**
+- [ ] `POST /api/v1/stacks/{id}/secrets` — submit secret key/value pairs encrypted at rest; listed via the API without exposing values (write-only fields).
+- [ ] Secrets injected into containers at deploy time via a host-side `env_file:` that Accelero materialises under `/run/accelero/<stack>/secrets.env` (tmpfs, short-lived, readable only by the managed container).
+- [ ] Audit log entry for every secret create/update/delete, with the actor and the key name (never the value).
+
+**External secret backends:**
+- [ ] HashiCorp Vault (KV v2 + dynamic secrets) — short-lived token or AppRole auth.
+- [ ] AWS Secrets Manager + IAM role or access key.
+- [ ] GCP Secret Manager + service account.
+- [ ] Azure Key Vault (lower priority).
+- [ ] Kubernetes ExternalSecrets-style abstraction so backends are pluggable.
+
+**Secret references in compose:**
+- [ ] `${secret:vault:path/to/key}` / `${secret:aws:arn/...}` / `${secret:stack:MY_KEY}` syntax resolved at deploy time, never substituted back into the compose file on disk.
+- [ ] Resolution happens after `${VAR}` interpolation so plain-text defaults cannot accidentally expose secret names.
+- [ ] A `secrets:` section on the Stack resource maps short references to backend-specific paths, so the compose stays portable.
+- [ ] Cache + TTL per backend so a failing backend doesn't break deploys longer than necessary.
+
+**Secrets UI / CLI ergonomics:**
+- [ ] `accelero secrets set/get/list/rotate` CLI for day-to-day ops.
+- [ ] Web UI "mask on display, reveal on click" for existing values; new values are write-only.
+- [ ] Drift report flags secrets referenced in compose but not resolvable at reconcile time (vs. a noisy deploy failure).
 
 **Transport & network security:**
 - [ ] Native TLS support (cert files or Let's Encrypt)

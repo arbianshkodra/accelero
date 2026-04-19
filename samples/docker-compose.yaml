@@ -1,6 +1,16 @@
+# Sample GitOps repo compose file.
+#
+# This file (together with the .env next to it) represents what a user's
+# GitOps repo looks like — *not* Accelero's own configuration.  Accelero
+# will substitute ${VAR} references from the .env next to this file before
+# parsing, exactly like docker-compose.
+#
+# See docs/usage-overview.md#variable-interpolation-env-file for the full
+# syntax (defaults, required vars, escapes).
+
 services:
   web:
-    image: nginx:1.27.1
+    image: ${NGINX_TAG:-nginx:1.27.1}
     restart: always
     networks:
       - app
@@ -11,10 +21,10 @@ services:
       retries: 3
 
   proxy:
-    image: caddy:2-alpine
-    command: ["caddy", "reverse-proxy", "--from", ":80", "--to", "web:80"]
+    image: caddy:${CADDY_TAG:?CADDY_TAG is required}
+    command: ["caddy", "reverse-proxy", "--from", ":80", "--to", "web:${WEB_PORT:-80}"]
     ports:
-      - "80:80"
+      - "${PUBLIC_PORT:-80}:80"
     depends_on:
       - web
     networks:
