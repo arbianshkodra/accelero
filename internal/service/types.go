@@ -1,12 +1,10 @@
 package service
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/sirupsen/logrus"
 )
 
@@ -24,9 +22,6 @@ type ComposeService struct {
 	Restart     string            `yaml:"restart,omitempty"`
 	MemLimit    string            `yaml:"mem_limit,omitempty"`
 	CPULimit    string            `yaml:"cpu_limit,omitempty"`
-}
-type DockerClient interface {
-	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 }
 
 type EnvVars []string
