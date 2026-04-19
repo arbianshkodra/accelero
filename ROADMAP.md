@@ -55,7 +55,7 @@ Unlike Portainer (UI-first, click-to-deploy, imperative), Accelero is **git-firs
 Goal: accept any reasonable real-world compose file, and surface enough runtime state to diagnose a deployment.
 
 **Docker Compose compatibility (high impact):**
-- [ ] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`)
+- [x] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR:+value}`, `$$`) — next-to-compose and repo-root lookup
 - [ ] `entrypoint`, `working_dir`, `user` fields
 - [ ] `depends_on` map form with conditions (`condition: service_healthy`)
 - [ ] `deploy.replicas` for container scaling
