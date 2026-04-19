@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
@@ -339,8 +340,23 @@ func (d *Deployer) readComposeFile(repoDir, composePath string) (*ComposeFile, e
 		return nil, fmt.Errorf("failed to read compose file at %s: %w", absTarget, err)
 	}
 
+	// Apply .env interpolation (${VAR}, ${VAR:-default}, etc.) before parsing.
+	// We look for a .env next to the compose file first, then fall back to the
+	// repo root — both are common layouts in the wild.
+	vars, envPath, err := loadComposeEnv(absRepo, absTarget)
+	if err != nil {
+		return nil, err
+	}
+	if len(vars) > 0 {
+		logrus.WithField("dotenv", envPath).Debugf("loaded %d variables from .env", len(vars))
+	}
+	expanded, err := compose.ExpandBytes(data, vars)
+	if err != nil {
+		return nil, fmt.Errorf("interpolate compose file: %w", err)
+	}
+
 	var cf ComposeFile
-	if err := yaml.Unmarshal(data, &cf); err != nil {
+	if err := yaml.Unmarshal(expanded, &cf); err != nil {
 		return nil, fmt.Errorf("failed to parse compose YAML: %w", err)
 	}
 
@@ -350,6 +366,32 @@ func (d *Deployer) readComposeFile(repoDir, composePath string) (*ComposeFile, e
 
 	logrus.Infof("Parsed compose file: %d service(s), %d network(s)", len(cf.Services), len(cf.Networks))
 	return &cf, nil
+}
+
+// loadComposeEnv looks for a .env file next to the compose file and then at
+// the repo root, returning whichever it finds first.  The returned path is
+// reported to the caller for log enrichment; both nil vars and empty path
+// mean "no .env was present", which is fine.
+func loadComposeEnv(repoDir, composeFilePath string) (map[string]string, string, error) {
+	candidates := []string{
+		filepath.Join(filepath.Dir(composeFilePath), ".env"),
+		filepath.Join(repoDir, ".env"),
+	}
+	seen := make(map[string]bool)
+	for _, p := range candidates {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		vars, err := compose.LoadDotEnv(p)
+		if err != nil {
+			return nil, "", fmt.Errorf("load .env %s: %w", p, err)
+		}
+		if vars != nil {
+			return vars, p, nil
+		}
+	}
+	return nil, "", nil
 }
 
 // --------------------------------------------------------------------------
