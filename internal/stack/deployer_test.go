@@ -422,3 +422,118 @@ services:
 	assert.NotNil(t, cf)
 	assert.Len(t, cf.Services, 1)
 }
+
+// ---------------------------------------------------------------------------
+// readComposeFile + .env interpolation
+// ---------------------------------------------------------------------------
+
+func TestReadComposeFile_DotEnvInterpolation(t *testing.T) {
+	dir := t.TempDir()
+
+	// Use docker-compose style ${VAR}, ${VAR:-default}, $VAR, and :? required.
+	compose := `version: "3"
+services:
+  web:
+    image: ${REGISTRY:-ghcr.io}/${APP}:${TAG}
+    environment:
+      - DEBUG=$DEBUG_FLAG
+      - DB=${DB_URL:?DB_URL is required}
+`
+	env := `
+# .env sitting next to the compose file
+APP=acme-web
+TAG=1.2.3
+DB_URL=postgres://db/app
+DEBUG_FLAG=on
+# REGISTRY intentionally left unset to exercise the :-default
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.NoError(t, err)
+	assert.NotNil(t, cf)
+
+	web, ok := cf.Services["web"]
+	assert.True(t, ok, "web service should exist after interpolation")
+	assert.Equal(t, "ghcr.io/acme-web:1.2.3", web.Image)
+	// Inline env list uses $DEBUG_FLAG with no braces.
+	assert.Contains(t, []string(web.Environment), "DEBUG=on")
+	assert.Contains(t, []string(web.Environment), "DB=postgres://db/app")
+}
+
+func TestReadComposeFile_DotEnvNextToComposeBeatsRepoRoot(t *testing.T) {
+	// When both exist, the .env next to the compose wins.
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "deploy")
+	assert.NoError(t, os.MkdirAll(subdir, 0755))
+
+	compose := `services:
+  web:
+    image: nginx:${TAG}
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(subdir, "docker-compose.yaml"), []byte(compose), 0644))
+	// Root .env: would resolve to 1.0.0
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("TAG=root-wins\n"), 0644))
+	// Next-to-compose .env: should win.
+	assert.NoError(t, os.WriteFile(filepath.Join(subdir, ".env"), []byte("TAG=1.0.0\n"), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "deploy/docker-compose.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, "nginx:1.0.0", cf.Services["web"].Image)
+}
+
+func TestReadComposeFile_DotEnvRepoRootFallback(t *testing.T) {
+	// No .env next to the compose — should fall back to the repo root.
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "deploy")
+	assert.NoError(t, os.MkdirAll(subdir, 0755))
+
+	compose := `services:
+  web:
+    image: nginx:${TAG}
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(subdir, "docker-compose.yaml"), []byte(compose), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("TAG=from-root\n"), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "deploy/docker-compose.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, "nginx:from-root", cf.Services["web"].Image)
+}
+
+func TestReadComposeFile_NoDotEnvStillWorks(t *testing.T) {
+	// Compose without any ${...} references; no .env present.
+	dir := t.TempDir()
+	compose := `services:
+  web:
+    image: nginx:1.27.0
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, "nginx:1.27.0", cf.Services["web"].Image)
+}
+
+func TestReadComposeFile_RequiredVarMissingFails(t *testing.T) {
+	dir := t.TempDir()
+	compose := `services:
+  web:
+    image: nginx:${TAG:?TAG is required}
+`
+	// No .env file at all — the :? modifier should fail the read.
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	_, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "TAG")
+	assert.Contains(t, err.Error(), "required")
+}
+
+// suppress unused-import warnings when editing happens in bulk
+var _ = service.ComposeService{}
