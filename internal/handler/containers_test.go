@@ -120,6 +120,8 @@ type mockDocker struct {
 	logsByID      map[string]string
 	logsIsFramed  bool // true → wrap body in stdcopy frames
 	logsErr       error
+	statsByID     map[string]container.StatsResponse
+	statsErr      error
 }
 
 func (m *mockDocker) ContainerList(ctx context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -134,6 +136,21 @@ func (m *mockDocker) ContainerInspect(ctx context.Context, id string, _ client.C
 		return res, nil
 	}
 	return client.ContainerInspectResult{}, errNotFound("container")
+}
+
+func (m *mockDocker) ContainerStats(ctx context.Context, id string, _ client.ContainerStatsOptions) (client.ContainerStatsResult, error) {
+	if m.statsErr != nil {
+		return client.ContainerStatsResult{}, m.statsErr
+	}
+	stats, ok := m.statsByID[id]
+	if !ok {
+		return client.ContainerStatsResult{}, errNotFound("container")
+	}
+	buf, err := json.Marshal(stats)
+	if err != nil {
+		return client.ContainerStatsResult{}, err
+	}
+	return client.ContainerStatsResult{Body: io.NopCloser(bytes.NewReader(buf))}, nil
 }
 
 func (m *mockDocker) ContainerLogs(ctx context.Context, id string, _ client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
@@ -483,4 +500,199 @@ func TestGetStackContainerLogs_BadSinceRejected(t *testing.T) {
 	router.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Stats: pure computeStatsSample math
+// ---------------------------------------------------------------------------
+
+func TestComputeCPUPercent_Basic(t *testing.T) {
+	// cpuDelta = 100ns, systemDelta = 1000ns, onlineCPUs = 2
+	// percent = (100/1000) * 2 * 100 = 20%
+	s := container.StatsResponse{
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1100},
+			SystemUsage: 11000,
+			OnlineCPUs:  2,
+		},
+		PreCPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+			SystemUsage: 10000,
+		},
+	}
+	assert.InDelta(t, 20.0, computeCPUPercent(s), 0.001)
+}
+
+func TestComputeCPUPercent_FallsBackToPerCPUUsageCount(t *testing.T) {
+	// OnlineCPUs missing — derive from len(PercpuUsage).
+	s := container.StatsResponse{
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 400, PercpuUsage: []uint64{100, 100, 100, 100}},
+			SystemUsage: 4000,
+		},
+		PreCPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 300},
+			SystemUsage: 3000,
+		},
+	}
+	// delta = (100/1000) * 4 * 100 = 40
+	assert.InDelta(t, 40.0, computeCPUPercent(s), 0.001)
+}
+
+func TestComputeCPUPercent_IdenticalSamplesIsZero(t *testing.T) {
+	// Truly idle: both samples report the same counters, delta is 0.
+	// Guard against emitting NaN or bogus negative percents.
+	s := container.StatsResponse{
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+			SystemUsage: 10000,
+			OnlineCPUs:  4,
+		},
+		PreCPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+			SystemUsage: 10000,
+		},
+	}
+	assert.Equal(t, 0.0, computeCPUPercent(s))
+}
+
+func TestComputeMemoryStats_SubtractsCacheCgroupV1(t *testing.T) {
+	got := computeMemoryStats(container.MemoryStats{
+		Usage: 500,
+		Limit: 1000,
+		Stats: map[string]uint64{"cache": 100},
+	})
+	assert.Equal(t, uint64(400), got.UsageBytes, "cache subtracted")
+	assert.Equal(t, uint64(1000), got.LimitBytes)
+	assert.InDelta(t, 40.0, got.Percent, 0.001)
+}
+
+func TestComputeMemoryStats_SubtractsFileCgroupV2(t *testing.T) {
+	got := computeMemoryStats(container.MemoryStats{
+		Usage: 500,
+		Limit: 1000,
+		Stats: map[string]uint64{"file": 200},
+	})
+	assert.Equal(t, uint64(300), got.UsageBytes)
+	assert.InDelta(t, 30.0, got.Percent, 0.001)
+}
+
+func TestComputeMemoryStats_NoLimitMeansZeroPercent(t *testing.T) {
+	got := computeMemoryStats(container.MemoryStats{Usage: 500})
+	assert.Equal(t, uint64(500), got.UsageBytes)
+	assert.Equal(t, 0.0, got.Percent)
+}
+
+func TestComputeBlockIOStats_SumsAcrossDevices(t *testing.T) {
+	got := computeBlockIOStats(container.BlkioStats{IoServiceBytesRecursive: []container.BlkioStatEntry{
+		{Major: 8, Minor: 0, Op: "Read", Value: 100},
+		{Major: 8, Minor: 0, Op: "Write", Value: 200},
+		{Major: 8, Minor: 16, Op: "Read", Value: 50},
+		{Major: 8, Minor: 0, Op: "Sync", Value: 999}, // ignored
+	}})
+	assert.Equal(t, uint64(150), got.ReadBytes)
+	assert.Equal(t, uint64(200), got.WriteBytes)
+}
+
+// ---------------------------------------------------------------------------
+// Stats: endpoint wiring
+// ---------------------------------------------------------------------------
+
+func TestGetStackContainerStats_HappyPath(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	stats := container.StatsResponse{
+		ID:     "cid",
+		Name:   "/web_0_123",
+		Read:   time.Unix(1_700_000_000, 0),
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1100},
+			SystemUsage: 11000,
+			OnlineCPUs:  2,
+		},
+		PreCPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+			SystemUsage: 10000,
+		},
+		MemoryStats: container.MemoryStats{
+			Usage: 500,
+			Limit: 1000,
+			Stats: map[string]uint64{"cache": 100},
+		},
+		Networks: map[string]container.NetworkStats{
+			"eth0": {RxBytes: 1024, TxBytes: 2048},
+		},
+		BlkioStats: container.BlkioStats{IoServiceBytesRecursive: []container.BlkioStatEntry{
+			{Op: "Read", Value: 512},
+			{Op: "Write", Value: 1024},
+		}},
+		PidsStats: container.PidsStats{Current: 7},
+	}
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID:   "cid",
+				Name: "/web_0_123",
+				Config: &container.Config{Labels: map[string]string{
+					"managed-by":     "accelero",
+					"accelero-stack": "demo",
+				}},
+			}},
+		},
+		statsByID: map[string]container.StatsResponse{"cid": stats},
+	}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/stacks/demo/containers/cid/stats", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var got ContainerStatsSample
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "cid", got.ContainerID)
+	assert.Equal(t, "web_0_123", got.Name)
+	assert.InDelta(t, 20.0, got.CPU.Percent, 0.001)
+	assert.Equal(t, uint32(2), got.CPU.OnlineCPUs)
+	assert.Equal(t, uint64(400), got.Memory.UsageBytes)
+	assert.InDelta(t, 40.0, got.Memory.Percent, 0.001)
+	assert.Equal(t, uint64(1024), got.Networks["eth0"].RxBytes)
+	assert.Equal(t, uint64(2048), got.Networks["eth0"].TxBytes)
+	assert.Equal(t, uint64(512), got.BlockIO.ReadBytes)
+	assert.Equal(t, uint64(1024), got.BlockIO.WriteBytes)
+	assert.Equal(t, uint64(7), got.PIDs)
+}
+
+func TestGetStackContainerStats_ForeignStack404(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "ours", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "theirs",
+			}},
+		}},
+	}}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/stacks/ours/containers/cid/stats", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
 }

@@ -135,6 +135,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/stacks/{id}/containers` — List containers managed for the stack
 - `GET /api/v1/stacks/{id}/containers/{cid}` — Inspect a container (state/config/networks/mounts; env values redacted when the key looks like a secret)
 - `GET /api/v1/stacks/{id}/containers/{cid}/logs` — Tail logs with `tail` (max 10000) / `since` (Go duration) / `timestamps` query params; stdout+stderr demuxed on non-TTY containers
+- `GET /api/v1/stacks/{id}/containers/{cid}/stats` — One-shot resource sample: CPU% (docker-stats formula), memory (page cache subtracted), per-iface network, block I/O, PIDs. ~1s latency (daemon gathers two samples for a valid CPU delta). Streaming is a separate WebSocket endpoint (not yet implemented).
 
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
