@@ -67,7 +67,8 @@ mkdocs build
 - **`internal/compose/`**: Compose-file preprocessing — `.env` loading (`LoadDotEnv`) and docker-compose-compatible `${VAR}` interpolation (`Expand`, `ExpandBytes`). Used by both stack/ and reconciler/ before `yaml.Unmarshal`.
 - **`internal/reconciler/`**: GitOps reconciliation engine — per-stack loops that detect drift and optionally auto-deploy
 - **`internal/handler/`**: HTTP API handlers — stack CRUD, deployment triggers, drift checks, legacy webhook, health/status
-- **`internal/middleware/`**: HTTP middleware (API key authentication with constant-time comparison)
+- **`internal/middleware/`**: HTTP middleware — API key authentication with constant-time comparison, and Prometheus metrics recorder (request count + latency, labelled by mux route template so `/stacks/{id}` doesn't explode cardinality)
+- **`internal/metrics/`**: Prometheus collectors and helpers. Own registry (not the default), exposing deployment counters/duration, drift events, HTTP traffic, and gauges for active reconciler loops + stack counts by status. `Handler()` returns the `/metrics` exposition handler.
 - **`internal/service/`**: Shared types (ComposeService, HealthCheck) and Docker resource cleanup
 - **`internal/network/`**: Docker network management (idempotent creation)
 - **`internal/utils/`**: Utility functions for port mapping, env file loading, health checks
@@ -92,6 +93,8 @@ mkdocs build
 - **Shallow git clones**: Depth=1 for fast repo fetching
 - **SQLite persistence**: Deployment history, stack config, container tracking survive restarts
 - **Legacy compatibility**: Old env-var config (REPO_URL etc.) auto-migrated to a "default" stack
+- **Prometheus metrics**: `/metrics` (unauthenticated, scrape convention) exposes deployment counters/duration, drift events by type, HTTP traffic keyed by route template, and gauges for active reconcile loops + stack counts. Drift counters only increment from reconciler observations, not `/preview` calls.
+- **Deploy preview**: `POST /api/v1/stacks/{id}/preview` is a read-only dry run that reuses the reconciler's drift check and maps each drift item to the action the next deploy would take (`create`, `recreate`, `restart`, `remove`, `error`).
 
 ### Environment Variables
 
@@ -126,6 +129,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `POST /api/v1/stacks/{id}/deploy` — Trigger deployment
 - `GET /api/v1/stacks/{id}/deployments` — List deployment history
 - `GET /api/v1/stacks/{id}/drift` — Check drift (desired vs actual state)
+- `POST /api/v1/stacks/{id}/preview` — Dry-run: show actions the next deploy would take
 
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
@@ -133,6 +137,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 **System:**
 - `GET /health` — Health check (unauthenticated)
 - `GET /status` — Stack summaries
+- `GET /metrics` — Prometheus exposition (unauthenticated)
 
 ### Deployment Flow
 
