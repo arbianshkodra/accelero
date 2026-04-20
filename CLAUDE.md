@@ -135,7 +135,9 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
 
 **System:**
-- `GET /health` — Health check (unauthenticated)
+- `GET /health` — Health check, kept for backward compatibility (unauthenticated)
+- `GET /healthz` — Kubernetes-style liveness probe, alias for `/health` (unauthenticated)
+- `GET /readyz` — Kubernetes-style readiness probe: DB ping + Docker ping + shutdown-in-progress flag; 503 if any check fails (unauthenticated)
 - `GET /status` — Stack summaries
 - `GET /metrics` — Prometheus exposition (unauthenticated)
 

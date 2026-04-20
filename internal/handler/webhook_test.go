@@ -13,6 +13,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // mockStore implements store.Store for testing.
@@ -52,6 +53,7 @@ func (m *mockStore) TrackContainer(c *store.ManagedContainer) error             
 func (m *mockStore) ListContainers(stackID string) ([]*store.ManagedContainer, error) { return nil, nil }
 func (m *mockStore) RemoveContainer(containerID string) error                     { return nil }
 func (m *mockStore) RemoveContainersByStack(stackID string) error                 { return nil }
+func (m *mockStore) Ping(ctx context.Context) error                               { return nil }
 func (m *mockStore) Close() error                                                 { return nil }
 
 // mockDeployer implements Deployer for testing.
@@ -167,6 +169,138 @@ func TestHealth(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rr.Code)
 }
+
+// ---------------------------------------------------------------------------
+// /healthz + /readyz
+// ---------------------------------------------------------------------------
+
+func TestHealthz_AliasesHealth(t *testing.T) {
+	// /healthz is a K8s-style alias — same body, same status, never
+	// touches dependencies (so mock store/pinger state is irrelevant).
+	h := &Handler{Store: &mockStore{}, Deployer: &mockDeployer{}}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "ok", body["status"])
+}
+
+func TestReadyz_AllHealthy(t *testing.T) {
+	h := &Handler{
+		Store:      &mockStore{},
+		Deployer:   &mockDeployer{},
+		DockerPing: func(ctx context.Context) error { return nil },
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "ok", body["status"])
+
+	checks, _ := body["checks"].(map[string]any)
+	assert.Equal(t, "ok", checks["database"])
+	assert.Equal(t, "ok", checks["docker"])
+	assert.Equal(t, "ok", checks["shutdown"])
+}
+
+func TestReadyz_DockerDown(t *testing.T) {
+	h := &Handler{
+		Store:      &mockStore{},
+		Deployer:   &mockDeployer{},
+		DockerPing: func(ctx context.Context) error { return errSimulatedDocker },
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "not_ready", body["status"])
+
+	checks, _ := body["checks"].(map[string]any)
+	dockerStatus, _ := checks["docker"].(string)
+	assert.Contains(t, dockerStatus, "unreachable")
+	assert.Equal(t, "ok", checks["database"])
+}
+
+func TestReadyz_ShuttingDown(t *testing.T) {
+	h := &Handler{
+		Store:      &mockStore{},
+		Deployer:   &mockDeployer{},
+		DockerPing: func(ctx context.Context) error { return nil },
+	}
+	h.SetShuttingDown()
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "not_ready", body["status"])
+
+	checks, _ := body["checks"].(map[string]any)
+	assert.Equal(t, "draining", checks["shutdown"])
+}
+
+func TestReadyz_DockerCheckOptional(t *testing.T) {
+	// DockerPing == nil means "skip the docker check" — useful in tests
+	// or in hypothetical remote-daemon deployments.
+	h := &Handler{
+		Store:    &mockStore{},
+		Deployer: &mockDeployer{},
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	checks, _ := body["checks"].(map[string]any)
+	_, present := checks["docker"]
+	assert.False(t, present, "docker check should be absent when DockerPing is nil")
+}
+
+// errSimulatedDocker stands in for a Docker daemon ping failure in /readyz tests.
+var errSimulatedDocker = errReadyzTest("docker daemon not reachable")
+
+type errReadyzTest string
+
+func (e errReadyzTest) Error() string { return string(e) }
 
 func TestCreateStackValidation(t *testing.T) {
 	ms := &mockStore{}
