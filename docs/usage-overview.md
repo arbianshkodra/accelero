@@ -320,7 +320,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `env_file` | list of paths | Paths relative to the compose file |
 | `ports` | list of strings **or** long-form maps | Short: `"[host_ip:]host_port:container_port[/proto]"`; long-form fields: `target`, `published`, `protocol`, `host_ip` |
 | `expose` | list of strings or ints | Exposed (not published) ports |
-| `volumes` | list (`"host:container[:mode]"`) | Bind mounts (named volumes: TBD Phase 2) |
+| `volumes` | list (`"host:container[:mode]"` or `"volume_name:container[:mode]"`) | Bind mounts and named-volume references both supported. Named volumes must also be declared at the top level (see below). |
 | `networks` | list | Must exist at the top-level `networks:` block |
 | `depends_on` | list of service names **or** map with conditions | Short form → `service_started`; long form accepts `condition: service_healthy` / `service_completed_successfully` and blocks the dependent's deploy until satisfied |
 | `labels` | map | Merged with Accelero's `managed-by` / `accelero-stack` labels |
@@ -347,7 +347,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 |-------|-------|
 | `services` | Required |
 | `networks` | Accelero creates missing networks with the declared driver and `driver_opts` |
-| `volumes` | TBD Phase 2 |
+| `volumes` | Accelero creates missing named volumes idempotently with `driver` / `driver_opts` / `labels`; supports `external: true` and `name:` overrides. See below. |
 | `version` | Parsed but not enforced (docker-compose itself has dropped the schema-version gate) |
 
 ### `depends_on` conditions
@@ -422,6 +422,43 @@ services:
 ```
 
 Any driver supported by your Docker engine works (`json-file`, `local`, `journald`, `syslog`, `fluentd`, `gelf`, `awslogs`, etc.); Accelero passes the options through unchanged.
+
+### Named volumes
+
+Accelero treats the top-level `volumes:` section as **desired state** and creates each declared internal volume idempotently before any service starts. Volumes are **never auto-deleted** — they hold state, so a stack delete today won't destroy them (a future `--remove-volumes` flag will make that explicit).
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data   # named volume reference
+      - /host/bind:/etc/config             # bind mount (pass-through)
+
+volumes:
+  pg_data:                                 # managed by Accelero
+    driver: local
+    driver_opts:
+      type: ext4
+      device: /dev/sda1
+  shared_cache:                            # pre-existing, Accelero doesn't own
+    external: true
+    name: real_volume_name                 # optional explicit name
+```
+
+**Naming rules (in priority order):**
+
+| Config | Docker-side name | Who creates/deletes |
+|--------|------------------|---------------------|
+| `external: true` | `cfg.Name` if set, else the compose key | User — Accelero only verifies existence |
+| `name: explicit` | `cfg.Name` verbatim | Accelero |
+| default | `accelero_<stack>_<logical>` (prevents cross-stack collisions, mirrors docker-compose project prefix) | Accelero |
+
+Managed volumes are labelled `managed-by=accelero` and `accelero-stack=<name>` so scoped cleanup won't touch anything the user owns.
+
+**Drift detection:** a declared named volume missing from the host shows up as a drift item (`type: "missing"` for internal, `type: "missing_external"` for external). Extra volumes on the host that Accelero didn't declare are ignored.
+
+**State survives redeploys.** Changing a service's image tag rebuilds the container but re-attaches the same volume — data persists.
 
 ### Pull policy
 

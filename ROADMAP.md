@@ -61,7 +61,7 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 - [x] `stop_signal`
 - [x] `depends_on` map form with conditions (`service_started`, `service_healthy`, `service_completed_successfully`)
 - [ ] `deploy.replicas` for container scaling
-- [ ] Named volumes (top-level `volumes:` section with `docker volume create`)
+- [x] Named volumes (top-level `volumes:` section with scoped naming, idempotent `docker volume create`, `external: true` verification, drift detection — never auto-delete)
 - [x] `logging` driver and options
 - [x] Long-form `ports` syntax (`{target: 80, published: 8080, protocol: tcp, host_ip: 127.0.0.1}`); also fixes protocol and host-IP handling in short form
 
