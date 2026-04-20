@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 )
@@ -53,6 +54,7 @@ type DockerClient interface {
 	ContainerInspect(ctx context.Context, id string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error)
 	ContainerLogs(ctx context.Context, id string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
 	ContainerStats(ctx context.Context, id string, options client.ContainerStatsOptions) (client.ContainerStatsResult, error)
+	Events(ctx context.Context, options client.EventsListOptions) client.EventsResult
 }
 
 // Handler holds all dependencies for the HTTP API.
@@ -125,6 +127,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers/{cid}", h.GetStackContainer).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
+	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -1131,6 +1134,182 @@ func computeBlockIOStats(b container.BlkioStats) ContainerBlockIOStats {
 		}
 	}
 	return out
+}
+
+// --------------------------------------------------------------------------
+// Events stream
+// --------------------------------------------------------------------------
+
+// eventsKeepalive is the cadence at which the handler writes an SSE
+// comment line during quiet periods. Caddy, nginx, and ELB default
+// idle timeouts are typically 60–120s; 25s keeps us comfortably
+// below the shortest of those without spamming.
+const eventsKeepalive = 25 * time.Second
+
+// StackEvent is the projected view of a Docker event for a stack's
+// managed resources. Narrower than events.Message so our API contract
+// doesn't bake in moby's internal constants.
+type StackEvent struct {
+	Time       time.Time         `json:"time"`
+	Type       string            `json:"type"`   // "container", "network", "volume", "image"
+	Action     string            `json:"action"` // "create", "start", "die", "health_status: healthy", ...
+	ActorID    string            `json:"actor_id"`
+	Name       string            `json:"name,omitempty"`
+	Image      string            `json:"image,omitempty"`
+	Service    string            `json:"service,omitempty"`
+	Replica    *int              `json:"replica,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+}
+
+// StreamStackEvents opens a Server-Sent Events stream of Docker events
+// filtered to this stack's managed resources. Uses SSE rather than
+// WebSocket because this is purely server→client with no control
+// messages — SSE is simpler and works through every HTTP proxy without
+// special configuration.
+//
+// Query parameters:
+//   - since     (Go duration): only emit events newer than N ago
+//   - types     (CSV of Docker event types; default "container"):
+//     narrow to container/network/volume/image as needed.
+func (h *Handler) StreamStackEvents(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, "streaming unsupported by this server", http.StatusInternalServerError)
+		return
+	}
+
+	// Parse optional `since` — Docker accepts a Unix-seconds string.
+	var since string
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, "since must be a Go duration (e.g. 5m, 30s)", http.StatusBadRequest)
+			return
+		}
+		since = strconv.FormatInt(time.Now().Add(-dur).Unix(), 10)
+	}
+
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue)).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stack.Name))
+
+	// Default to container events only; callers who want network/volume
+	// /image events opt in explicitly via ?types=.
+	types := r.URL.Query().Get("types")
+	if types == "" {
+		types = "container"
+	}
+	for _, t := range strings.Split(types, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			filters = filters.Add("type", t)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	res := h.Docker.Events(ctx, client.EventsListOptions{
+		Since:   since,
+		Filters: filters,
+	})
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Tell nginx not to buffer — defaults to buffering proxied upstreams.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	// Initial flush so the client's open-handler fires before we wait for
+	// the first event.
+	flusher.Flush()
+
+	keepalive := time.NewTicker(eventsKeepalive)
+	defer keepalive.Stop()
+
+	log := logctx.FromContext(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-keepalive.C:
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+
+		case err, ok := <-res.Err:
+			if !ok {
+				return
+			}
+			// Docker sends io.EOF when the stream ends cleanly (e.g. daemon
+			// restart during the request). Don't log that as an error.
+			if err != nil && err != io.EOF {
+				log.WithError(err).Warn("docker events stream error")
+			}
+			return
+
+		case msg, ok := <-res.Messages:
+			if !ok {
+				return
+			}
+			payload, marshalErr := json.Marshal(projectEvent(msg))
+			if marshalErr != nil {
+				log.WithError(marshalErr).Warn("marshal event")
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// projectEvent digests a Docker event into our API shape, pulling out
+// the accelero-service/replica labels from the attributes map so
+// clients don't have to dig.
+func projectEvent(m events.Message) StackEvent {
+	t := time.Unix(0, m.TimeNano)
+	if m.TimeNano == 0 {
+		t = time.Unix(m.Time, 0)
+	}
+
+	evt := StackEvent{
+		Time:       t.UTC(),
+		Type:       string(m.Type),
+		Action:     string(m.Action),
+		ActorID:    m.Actor.ID,
+		Attributes: m.Actor.Attributes,
+	}
+	// Docker stashes the human name under attributes["name"] for
+	// container/network events; image events use "image" instead.
+	if n := m.Actor.Attributes["name"]; n != "" {
+		evt.Name = n
+	}
+	if img := m.Actor.Attributes["image"]; img != "" {
+		evt.Image = img
+	}
+	if svc := m.Actor.Attributes[containerLabelServiceName]; svc != "" {
+		evt.Service = svc
+	}
+	if replicaRaw := m.Actor.Attributes[containerLabelReplicaIndex]; replicaRaw != "" {
+		if idx := parseReplicaLabel(replicaRaw); idx != nil {
+			evt.Replica = idx
+		}
+	}
+	return evt
 }
 
 // resolveStack is shared between all the /stacks/{id}/* endpoints. It

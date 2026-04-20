@@ -275,6 +275,43 @@ Same stack-membership verification as `GET /containers/{cid}` — a `cid` from a
 
 ---
 
+### Stream Events
+`GET /api/v1/stacks/{id}/events`
+
+Server-Sent Events stream of Docker events filtered to this stack's managed resources. Useful for live dashboards ("show me what's happening right now") and for wiring up notifications (`die` on a production replica → page on-call).
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `since` | Go duration | unset | Only emit events newer than N ago, e.g. `5m`, `30s`. |
+| `types` | CSV | `container` | Docker event types to include — any of `container`, `network`, `volume`, `image`. Default is container-only; opt in to the rest. |
+
+**Response:** `200 OK` with `Content-Type: text/event-stream`. Each event is one SSE frame:
+
+```
+data: {"time":"2026-04-20T16:10:30.12Z","type":"container","action":"start","actor_id":"abc...","name":"web_0_...","image":"nginx:1.27.2-alpine","service":"web","replica":0,"attributes":{...}}
+
+data: {"time":"2026-04-20T16:10:30.22Z","type":"container","action":"die","actor_id":"def...","name":"web_1_...","image":"nginx:1.27.1-alpine","service":"web","replica":1,"attributes":{...}}
+```
+
+Typical rolling update on a replicated service emits the expected cadence:
+
+```
+create / start  (new replica 0)
+kill / stop / die / destroy  (old replica 1)
+create / start  (new replica 1)
+kill / stop / die / destroy  (old replica 0)
+```
+
+**Keepalive.** A comment line (`: keepalive\n\n`) is written every 25 seconds during quiet periods so idle timeouts on reverse proxies don't kill the stream. Clients using `EventSource` handle this transparently.
+
+**Connection lifetime.** The stream runs until the client disconnects or the Docker daemon closes the underlying event stream. On disconnect, Accelero cancels the upstream events context and cleans up within ~1s.
+
+**Errors:** `400 Bad Request` for malformed `since`; `404 Not Found` if the stack doesn't exist; `503 Service Unavailable` when Docker introspection isn't configured.
+
+---
+
 ### Container Stats
 `GET /api/v1/stacks/{id}/containers/{cid}/stats`
 
