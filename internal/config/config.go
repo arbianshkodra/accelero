@@ -27,6 +27,10 @@ type Config struct {
 	// Status Cleanup
 	StatusCleanupInterval time.Duration
 	StatusMaxAge          time.Duration
+	// AuditMaxAge is how long to keep audit entries before the cleanup
+	// loop drops them. Audit is compliance/investigation data — kept
+	// considerably longer than deploy history by default (90 days vs 24h).
+	AuditMaxAge time.Duration
 
 	// Logging
 	LogLevel  string
@@ -70,6 +74,7 @@ func Load() (*Config, error) {
 		StacksDataDir:         envOrDefault("STACKS_DATA_DIR", "./data/stacks"),
 		StatusCleanupInterval: parseDurationOrDefault("STATUS_CLEANUP_INTERVAL", 1*time.Hour),
 		StatusMaxAge:          parseDurationOrDefault("STATUS_MAX_AGE", 24*time.Hour),
+		AuditMaxAge:           parseDurationOrDefault("AUDIT_MAX_AGE", 90*24*time.Hour),
 
 		// Legacy env vars for backward compatibility
 		LegacyRepoURL:       os.Getenv("REPO_URL"),
