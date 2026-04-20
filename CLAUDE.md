@@ -139,6 +139,12 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/stacks/{id}/containers/{cid}/stats` — One-shot resource sample: CPU% (docker-stats formula), memory (page cache subtracted), per-iface network, block I/O, PIDs. ~1s latency (daemon gathers two samples for a valid CPU delta). Streaming is a separate WebSocket endpoint (not yet implemented).
 - `GET /api/v1/stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources. Each event is projected from Docker's raw format with accelero-service / accelero-replica surfaced as first-class fields. 25s keepalive comment during quiet periods; default type filter is `container` (opt in to `network`/`volume`/`image` via `?types=`).
 
+**Resource browsers (root-level, read-only):**
+- `GET /api/v1/images` — images referenced by accelero-managed containers, with back-references (stack/service/replica/container). Walks containers to derive "managed" since images don't carry labels.
+- `GET /api/v1/volumes` — volumes labelled managed-by=accelero.
+- `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
+- All three accept `?stack=<name>` to narrow to one stack.
+
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
 
