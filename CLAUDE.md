@@ -147,6 +147,11 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
 - All three accept `?stack=<name>` to narrow to one stack.
 
+**Audit log (append-only):**
+- `GET /api/v1/audit` — filters: stack (id or name), actor, operation, since (Go duration), limit (≤1000). Newest first. Immutable at the store layer — no write/update/delete path.
+- Entries emitted today: stack.create/update/delete (actor api-key); deploy.start (api-key, in_progress); deploy.complete/failed/rolled_back (system:deployer, with duration + changes metadata); drift.detected (system:reconciler, one per cycle with drift, per-type counts in metadata); drift.auto_deployed (system:reconciler, when auto-deploy fires).
+- Retention: no automatic cleanup yet — planned as a follow-up alongside the existing deployment-history cleanup.
+
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
 
