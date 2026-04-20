@@ -594,6 +594,19 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
 	log := logctx.FromContext(ctx).WithField("service", serviceName)
 
+	replicas := svc.DesiredReplicas()
+
+	// Reject replicas > 1 alongside static published host ports: N containers
+	// would collide on the same host port, producing a confusing "port already
+	// in use" error deep inside ContainerStart. Docker-compose's non-swarm mode
+	// does the same thing. The GitOps-correct pattern is `expose:` + a proxy,
+	// which is already how zero-downtime deploys route traffic here.
+	if replicas > 1 && svc.HasStaticPublishedPort() {
+		return fmt.Errorf("service %q has replicas=%d with a static published host port; "+
+			"replicas would collide on the host port. Use `expose:` + a reverse proxy, "+
+			"or reduce replicas to 1", serviceName, replicas)
+	}
+
 	// Enforce depends_on conditions before doing anything else.  This waits
 	// for health or exit(0) on the declared dependencies; topological order
 	// already guarantees service_started.
@@ -612,64 +625,110 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	// Determine which existing containers need replacement.
-	var toRemove []string
+	// Partition existing containers: keep = on target image AND healthy, can
+	// stay; replace = wrong image, stopped, or unhealthy, must be torn down.
+	var keep []container.Summary
+	var replace []container.Summary
 	for _, c := range existing {
 		if c.Image != svc.Image {
-			toRemove = append(toRemove, c.ID)
-		} else {
-			// Same image -- check health.
-			info, inspectErr := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
-			if inspectErr != nil {
-				return fmt.Errorf("failed to inspect container %s: %w", c.ID[:12], inspectErr)
-			}
-			state := info.Container.State
-			if state != nil && state.Health != nil && state.Health.Status != "healthy" {
-				log.Infof("Existing container %s not healthy, waiting", c.ID[:12])
-				if err := d.waitForHealthy(ctx, c.ID); err != nil {
-					return fmt.Errorf("health check failed for existing container %s: %w", c.ID[:12], err)
-				}
-			} else {
-				log.Infof("Container %s already running with target image, no action needed", c.ID[:12])
-			}
+			replace = append(replace, c)
+			continue
 		}
-	}
-
-	// If nothing needs updating, we are done.
-	if len(existing) > 0 && len(toRemove) == 0 {
-		return nil
-	}
-
-	// Create new container(s).
-	instanceName := fmt.Sprintf("%s_%d", serviceName, time.Now().UnixNano())
-	containerID, err := d.createAndStartContainer(ctx, instanceName, repoDir, svc, serviceName, stack.Name)
-	if err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		info, inspectErr := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+		if inspectErr != nil {
+			return fmt.Errorf("failed to inspect container %s: %w", c.ID[:12], inspectErr)
+		}
+		state := info.Container.State
+		switch {
+		case state == nil, !state.Running:
+			replace = append(replace, c)
+		case state.Health != nil && state.Health.Status == "unhealthy":
+			replace = append(replace, c)
+		case state.Health != nil && state.Health.Status != "healthy":
+			// Still starting — wait briefly; if it never becomes healthy
+			// we'll replace it as part of the rollout.
+			if err := d.waitForHealthy(ctx, c.ID); err != nil {
+				log.WithError(err).Warnf("existing container %s did not become healthy, replacing", c.ID[:12])
+				replace = append(replace, c)
+			} else {
+				keep = append(keep, c)
+			}
+		default:
+			keep = append(keep, c)
+		}
 	}
 
 	stopTimeout := stopTimeoutSeconds(svc)
 
-	// Wait for health check.
-	if err := d.waitForHealthy(ctx, containerID); err != nil {
-		// New container is unhealthy -- stop and remove it before returning the error.
-		_, _ = d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: &stopTimeout})
-		_, _ = d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
-		return fmt.Errorf("health check failed for new container %s: %w", containerID[:12], err)
+	// Scale-down: too many healthy containers on the target image — trim the
+	// tail into the removal list. (Extra ones are interchangeable; pick any.)
+	if len(keep) > replicas {
+		excess := keep[replicas:]
+		keep = keep[:replicas]
+		replace = append(replace, excess...)
 	}
-	log.Infof("New container %s healthy", containerID[:12])
 
-	// Remove old containers only after the new one is confirmed healthy.
-	for _, oldID := range toRemove {
-		log.Infof("Removing old container %s", oldID[:12])
-		if _, err := d.cli.ContainerStop(ctx, oldID, client.ContainerStopOptions{Timeout: &stopTimeout}); err != nil {
-			log.WithError(err).Warnf("Failed to stop old container %s", oldID[:12])
+	needNew := replicas - len(keep)
+
+	// Fast path: nothing to create, nothing to remove.
+	if needNew == 0 && len(replace) == 0 {
+		log.Infof("Service in sync (%d replica(s) already on target image)", replicas)
+		return nil
+	}
+
+	// Rolling rollout: create one new replica, wait healthy, remove one old.
+	// When `keep` is non-empty this preserves zero-downtime because at least
+	// one healthy replica is always up. When `keep` is empty (fresh deploy,
+	// or full replacement), there is a brief gap — same as the pre-replicas
+	// behaviour with `replicas=1`.
+	for i := 0; i < needNew; i++ {
+		replicaIndex := len(keep) + i
+		instanceName := fmt.Sprintf("%s_%d_%d", serviceName, replicaIndex, time.Now().UnixNano())
+		containerID, err := d.createAndStartContainer(
+			ctx, instanceName, repoDir, svc, serviceName, stack.Name, replicaIndex,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create replica %d for %s: %w", replicaIndex, serviceName, err)
 		}
-		if _, err := d.cli.ContainerRemove(ctx, oldID, client.ContainerRemoveOptions{Force: true}); err != nil {
-			log.WithError(err).Warnf("Failed to remove old container %s", oldID[:12])
+
+		if err := d.waitForHealthy(ctx, containerID); err != nil {
+			_, _ = d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: &stopTimeout})
+			_, _ = d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+			return fmt.Errorf("health check failed for replica %d of %s (%s): %w",
+				replicaIndex, serviceName, containerID[:12], err)
 		}
+		log.Infof("Replica %d (%s) healthy", replicaIndex, containerID[:12])
+
+		// Interleave: remove one old container per new one so the total
+		// container count stays ~constant during the rollout.
+		if len(replace) > 0 {
+			oldID := replace[0].ID
+			replace = replace[1:]
+			d.stopAndRemove(ctx, log, oldID, stopTimeout)
+		}
+	}
+
+	// Any remaining replace entries are leftovers from scale-down or from
+	// cases where needNew < len(replace); tear them down now that the new
+	// replicas are all healthy.
+	for _, c := range replace {
+		d.stopAndRemove(ctx, log, c.ID, stopTimeout)
 	}
 
 	return nil
+}
+
+// stopAndRemove is the best-effort teardown used throughout the rollout.
+// Failures are logged but not fatal — a zombie container will be cleaned up
+// by the next deploy or by scoped resource cleanup.
+func (d *Deployer) stopAndRemove(ctx context.Context, log *logrus.Entry, id string, stopTimeout int) {
+	log.Infof("Removing container %s", id[:12])
+	if _, err := d.cli.ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: &stopTimeout}); err != nil {
+		log.WithError(err).Warnf("Failed to stop container %s", id[:12])
+	}
+	if _, err := d.cli.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true}); err != nil {
+		log.WithError(err).Warnf("Failed to remove container %s", id[:12])
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -784,8 +843,13 @@ func (d *Deployer) createAndStartContainer(
 	name, repoDir string,
 	svc service.ComposeService,
 	serviceName, stackName string,
+	replicaIndex int,
 ) (string, error) {
-	log := logctx.FromContext(ctx).WithFields(logrus.Fields{"container": name, "image": svc.Image})
+	log := logctx.FromContext(ctx).WithFields(logrus.Fields{
+		"container": name,
+		"image":     svc.Image,
+		"replica":   replicaIndex,
+	})
 	log.Info("Creating container")
 
 	// Load environment variables from env_file entries and inline env.
@@ -802,6 +866,8 @@ func (d *Deployer) createAndStartContainer(
 	}
 	labels["managed-by"] = "accelero"
 	labels["accelero-stack"] = stackName
+	labels["accelero-service"] = serviceName
+	labels["accelero-replica"] = strconv.Itoa(replicaIndex)
 
 	containerConfig := &container.Config{
 		Image:      svc.Image,
@@ -1339,9 +1405,13 @@ func (d *Deployer) waitForDependencyConditions(ctx context.Context, serviceName 
 	return nil
 }
 
-// waitForDependencyHealthy polls the dep's container until Docker reports
-// State.Health.Status == "healthy".  An absent healthcheck is treated as
-// an error because "service_healthy" was explicitly requested.
+// waitForDependencyHealthy polls the dep's replicas until *any* of them
+// reports State.Health.Status == "healthy".  "Any" mirrors Swarm's
+// service_healthy semantics — Docker's embedded DNS starts resolving the
+// service name to healthy endpoints as soon as one is up, so dependents
+// can make forward progress without waiting for every replica.
+// An absent healthcheck is treated as an error because "service_healthy"
+// was explicitly requested.
 func (d *Deployer) waitForDependencyHealthy(ctx context.Context, depName string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, dependencyWaitTimeout)
 	defer cancel()
@@ -1357,23 +1427,28 @@ func (d *Deployer) waitForDependencyHealthy(ctx context.Context, depName string)
 			return fmt.Errorf("no containers running for dependency %s", depName)
 		}
 
-		// We only look at the first container (no replicas today).
-		info, err := d.cli.ContainerInspect(timeoutCtx, containers[0].ID, client.ContainerInspectOptions{})
-		if err != nil {
-			return fmt.Errorf("inspect %s: %w", containers[0].ID[:12], err)
+		unhealthy := 0
+		for _, c := range containers {
+			info, err := d.cli.ContainerInspect(timeoutCtx, c.ID, client.ContainerInspectOptions{})
+			if err != nil {
+				continue // transient — try again next tick
+			}
+			state := info.Container.State
+			if state == nil {
+				continue
+			}
+			if state.Health == nil {
+				return fmt.Errorf("dependency %s has no healthcheck but service_healthy was requested", depName)
+			}
+			switch state.Health.Status {
+			case "healthy":
+				return nil
+			case "unhealthy":
+				unhealthy++
+			}
 		}
-		state := info.Container.State
-		if state == nil {
-			return fmt.Errorf("container %s has no state", containers[0].ID[:12])
-		}
-		if state.Health == nil {
-			return fmt.Errorf("dependency %s has no healthcheck but service_healthy was requested", depName)
-		}
-		switch state.Health.Status {
-		case "healthy":
-			return nil
-		case "unhealthy":
-			return fmt.Errorf("dependency %s is unhealthy", depName)
+		if unhealthy == len(containers) {
+			return fmt.Errorf("all %d replica(s) of dependency %s are unhealthy", len(containers), depName)
 		}
 
 		select {
@@ -1384,8 +1459,9 @@ func (d *Deployer) waitForDependencyHealthy(ctx context.Context, depName string)
 	}
 }
 
-// waitForDependencyExit polls the dep's container until it has exited with
-// status code 0 (the contract for "service_completed_successfully").
+// waitForDependencyExit polls until *every* replica of the dep has exited
+// with status code 0.  "All" is the right semantics for one-shot / init /
+// migration services: if any replica failed, the work isn't done.
 func (d *Deployer) waitForDependencyExit(ctx context.Context, depName string) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, dependencyWaitTimeout)
 	defer cancel()
@@ -1401,18 +1477,28 @@ func (d *Deployer) waitForDependencyExit(ctx context.Context, depName string) er
 			return fmt.Errorf("no containers found for dependency %s", depName)
 		}
 
-		info, err := d.cli.ContainerInspect(timeoutCtx, containers[0].ID, client.ContainerInspectOptions{})
-		if err != nil {
-			return fmt.Errorf("inspect %s: %w", containers[0].ID[:12], err)
-		}
-		state := info.Container.State
-		if state == nil {
-			return fmt.Errorf("container %s has no state", containers[0].ID[:12])
-		}
-		if !state.Running {
-			if state.ExitCode != 0 {
-				return fmt.Errorf("dependency %s exited with code %d", depName, state.ExitCode)
+		allExited := true
+		for _, c := range containers {
+			info, err := d.cli.ContainerInspect(timeoutCtx, c.ID, client.ContainerInspectOptions{})
+			if err != nil {
+				allExited = false
+				break
 			}
+			state := info.Container.State
+			if state == nil {
+				allExited = false
+				break
+			}
+			if state.Running {
+				allExited = false
+				break
+			}
+			if state.ExitCode != 0 {
+				return fmt.Errorf("replica %s of dependency %s exited with code %d",
+					c.ID[:12], depName, state.ExitCode)
+			}
+		}
+		if allExited {
 			return nil
 		}
 

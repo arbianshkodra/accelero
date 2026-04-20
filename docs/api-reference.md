@@ -180,11 +180,12 @@ Performs a one-off drift check comparing the desired state (git compose file) ag
 
 | Type | Description |
 |------|-------------|
-| `missing` | Service defined in compose but no container running |
+| `missing` | Service defined in compose but no container running, or fewer containers than the declared `deploy.replicas` |
 | `image_mismatch` | Container running different image than declared |
 | `stopped` | Container exists but is not in `running` state |
 | `unhealthy` | Container is failing its health check |
-| `extra` | Container exists for a service not defined in compose |
+| `extra` | Container exists for a service not defined in compose, or surplus replicas beyond the declared `deploy.replicas` |
+| `missing_external` | `external: true` resource (e.g. volume) is declared but missing on the host |
 
 ---
 
