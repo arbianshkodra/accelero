@@ -256,9 +256,11 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 		}
 	}
 
-	// 6. Create Docker networks.
+	// 6. Create Docker networks (with accelero labels so /networks can
+	// find them). Pre-existing networks from older deploys stay unlabelled
+	// until they're torn down and re-created.
 	for netName, netConfig := range composeFile.Networks {
-		if err := network.CreateNetworkWithContext(ctx, d.cli, netName, netConfig); err != nil {
+		if err := network.CreateNetworkForStack(ctx, d.cli, stack.Name, netName, netConfig); err != nil {
 			return fmt.Errorf("failed to create network %s: %w", netName, err)
 		}
 	}
