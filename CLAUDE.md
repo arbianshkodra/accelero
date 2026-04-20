@@ -83,6 +83,7 @@ mkdocs build
 - **Multi-stack management**: Manage multiple independent stacks via REST API
 - **GitOps reconciliation**: Periodic drift detection comparing git desired state vs actual Docker state
 - **`.env` variable interpolation**: Full docker-compose `${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR+value}`, `$$` syntax. `.env` lookup order: next to compose file → repo root.
+- **Broad compose field support**: `entrypoint`, `working_dir`, `user`, `hostname`, `domainname`, `dns`, `dns_search`, `extra_hosts`, `cap_add`, `cap_drop`, `privileged`, `tmpfs`, `shm_size`, `init`, `expose`, `stop_grace_period`, `stop_signal`, `pull_policy` (always/missing/never; build rejected). See docs/usage-overview.md#supported-compose-fields for the full table.
 - **Zero-downtime deployments**: New containers health-checked before old ones removed
 - **Correct rollback**: Pre-deployment state captured BEFORE deploying, restored on failure
 - **Per-service deployment locking**: Prevents concurrent deploys of the same service
