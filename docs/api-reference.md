@@ -189,6 +189,92 @@ Performs a one-off drift check comparing the desired state (git compose file) ag
 
 ---
 
+### List Containers
+`GET /api/v1/stacks/{id}/containers`
+
+Returns every container Accelero manages for the stack. Filtered by the `managed-by=accelero` + `accelero-stack=<name>` labels — unmanaged containers never appear, even if they share a name.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "id": "0c6bece9f132...",
+    "name": "web_0_1776690394074826000",
+    "image": "nginx:1.27.2",
+    "service": "web",
+    "replica": 0,
+    "state": "running",
+    "status": "Up 2 minutes",
+    "health": "healthy",
+    "created_at": "2026-04-20T13:06:34Z",
+    "ports": [{"container_port": 80, "protocol": "tcp", "host_port": 8080, "host_ip": "127.0.0.1"}],
+    "labels": {"accelero-replica": "0", "accelero-service": "web", "accelero-stack": "my-app", "managed-by": "accelero"}
+  }
+]
+```
+
+Results are sorted by `service` then `replica` so the order is deterministic across scrapes.
+
+**Errors:** `404 Not Found` if the stack doesn't exist; `503 Service Unavailable` if Docker introspection isn't configured on this server.
+
+---
+
+### Inspect Container
+`GET /api/v1/stacks/{id}/containers/{cid}`
+
+Full detail for a single container. `{cid}` accepts the full ID, the short 12-char prefix, or the container name.
+
+**Security:** the container's `managed-by` + `accelero-stack` labels are verified before anything is returned. Guessing a container ID that belongs to a different stack returns `404 Not Found` — the error is intentionally indistinguishable from "doesn't exist" so callers cannot probe for foreign containers.
+
+**Response:** `200 OK`
+```json
+{
+  "id": "0c6bece9f132...",
+  "name": "web_0_1776690394074826000",
+  "image": "sha256:bc5eac5e...",
+  "service": "web",
+  "replica": 0,
+  "state": "running",
+  "created_at": "2026-04-20T13:06:34.112Z",
+  "cmd": ["nginx", "-g", "daemon off;"],
+  "entrypoint": ["/docker-entrypoint.sh"],
+  "env": ["PATH=/usr/bin", "DB_PASSWORD=***", "LOG_LEVEL=info"],
+  "working_dir": "/",
+  "restart_count": 0,
+  "restart_policy": "no",
+  "started_at": "2026-04-20T13:06:34.138Z",
+  "exit_code": 0,
+  "networks": {
+    "bridge": {"network_id": "abcd1234...", "ip_address": "172.17.0.3", "aliases": ["web"]}
+  },
+  "mounts": [],
+  "labels": {"accelero-replica": "0", "accelero-service": "web", "accelero-stack": "my-app", "managed-by": "accelero"}
+}
+```
+
+**Env redaction.** Any env var whose *key* matches `PASSWORD`, `TOKEN`, `SECRET`, `APIKEY` / `API_KEY`, `PRIVATE`, or `CREDENTIAL` (case-insensitive substring) has its value replaced with `***`. This is best-effort hygiene — the assumption remains that real secrets live in an `env_file:` populated by host tooling, not inline `environment:`.
+
+---
+
+### Container Logs
+`GET /api/v1/stacks/{id}/containers/{cid}/logs`
+
+Returns the container's log tail as `text/plain; charset=utf-8`. Stdout and stderr are combined in chronological order. Does not follow — WebSocket streaming is planned as a separate endpoint.
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `tail` | integer | `100` | Number of most-recent lines to return. Capped at 10000. |
+| `since` | Go duration | unset | `5m`, `30s`, `2h`. Only lines emitted within that window are returned. |
+| `timestamps` | bool | `false` | Prefix every line with Docker's RFC3339Nano timestamp. |
+
+Same stack-membership verification as `GET /containers/{cid}` — a `cid` from a different stack returns `404 Not Found`.
+
+**Errors:** `400 Bad Request` for malformed `tail` / `since`; `404 Not Found` for missing / foreign-stack container; `503 Service Unavailable` when Docker introspection isn't configured.
+
+---
+
 ### Preview Deployment
 `POST /api/v1/stacks/{id}/preview`
 
