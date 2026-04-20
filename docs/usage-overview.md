@@ -322,7 +322,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `expose` | list of strings or ints | Exposed (not published) ports |
 | `volumes` | list (`"host:container[:mode]"`) | Bind mounts (named volumes: TBD Phase 2) |
 | `networks` | list | Must exist at the top-level `networks:` block |
-| `depends_on` | list of service names | Ordering only; map form with conditions: TBD Phase 2 |
+| `depends_on` | list of service names **or** map with conditions | Short form → `service_started`; long form accepts `condition: service_healthy` / `service_completed_successfully` and blocks the dependent's deploy until satisfied |
 | `labels` | map | Merged with Accelero's `managed-by` / `accelero-stack` labels |
 | `restart` | `no` / `always` / `on-failure` / `unless-stopped` | |
 | `healthcheck` | object (`test`, `interval`, `timeout`, `retries`, `start_period`) | Overrides image-level healthcheck |
@@ -348,6 +348,40 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `networks` | Accelero creates missing networks with the declared driver and `driver_opts` |
 | `volumes` | TBD Phase 2 |
 | `version` | Parsed but not enforced (docker-compose itself has dropped the schema-version gate) |
+
+### `depends_on` conditions
+
+Accelero supports both the short and long forms, and actually waits on the long-form conditions before deploying the dependent service.
+
+**Short form** — ordering only, no waiting:
+
+```yaml
+services:
+  app:
+    depends_on:
+      - db
+      - redis
+```
+
+**Long form** — per-dependency condition:
+
+```yaml
+services:
+  app:
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+```
+
+| Condition | Accelero behaviour |
+|-----------|-------------------|
+| `service_started` (default) | Topological order is enough — dependencies always deploy first |
+| `service_healthy` | Block the dependent's deploy until Docker reports `State.Health.Status == "healthy"` for the dependency. Errors if the dependency has no `healthcheck`. Timeout: 2 minutes. |
+| `service_completed_successfully` | Block the dependent's deploy until the dependency's container has exited with code 0 (for one-shot init/migration containers). Timeout: 2 minutes. |
+
+Unknown conditions fail the deploy with a clear error rather than silently ignoring. `required: false` and `restart: true` parse but are not yet acted on.
 
 ### Pull policy
 
