@@ -275,6 +275,72 @@ Same stack-membership verification as `GET /containers/{cid}` — a `cid` from a
 
 ---
 
+### Audit Log
+`GET /api/v1/audit`
+
+Returns audit entries newest-first. Every notable write action — stack CRUD, deploy lifecycle, reconciler drift observations, auto-deploys — produces an immutable row. The table is append-only at the store layer; there is no write/delete API.
+
+**Query parameters:**
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `stack` | string | Stack name or ID. Unknown values fall back to name-match so entries from already-deleted stacks still surface. |
+| `actor` | string | Exact match on actor (`api-key`, `system:reconciler`, `system:deployer`). |
+| `operation` | string | Exact match — see the operation table below. |
+| `since` | Go duration | Only entries within the last N. `24h`, `5m`. |
+| `limit` | integer | Default 100, store-capped at 1000. |
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "id": "3f8a9d...",
+    "timestamp": "2026-04-20T21:06:59Z",
+    "actor": "api-key",
+    "remote_addr": "10.0.0.1:55555",
+    "request_id": "cf4f29994be24c04",
+    "operation": "stack.delete",
+    "resource_type": "stack",
+    "resource_id": "s1",
+    "stack_id": "s1",
+    "stack_name": "a",
+    "outcome": "success"
+  },
+  {
+    "id": "9b1e...",
+    "timestamp": "2026-04-20T21:06:54Z",
+    "actor": "system:deployer",
+    "operation": "deploy.complete",
+    "resource_type": "deployment",
+    "resource_id": "d1",
+    "stack_id": "s1",
+    "stack_name": "a",
+    "outcome": "success",
+    "metadata": {
+      "trigger": "manual",
+      "duration_seconds": "1.830",
+      "changes": "web -> nginx:1.27.1-alpine"
+    }
+  }
+]
+```
+
+**Operation catalogue:**
+
+| Operation | Actor | Notes |
+|-----------|-------|-------|
+| `stack.create` / `stack.update` / `stack.delete` | `api-key` | HTTP CRUD on stacks |
+| `deploy.start` | `api-key` | Outcome `in_progress`; emitted at request time. Metadata: `trigger` (manual/webhook/reconcile). |
+| `deploy.complete` / `deploy.failed` / `deploy.rolled_back` | `system:deployer` | Emitted at deployer-finish time. Metadata: `trigger`, `duration_seconds`, `changes` (on success), `git_commit`. |
+| `drift.detected` | `system:reconciler` | One per reconcile cycle with drift (not per drift item — kept compact). Metadata: `drift_count`, per-type counts (`drift_type_missing`, `drift_type_image_mismatch`, etc.). |
+| `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
+
+**Retention.** Entries are not automatically cleaned up in this release. Time-based retention is planned as a follow-up alongside the existing deployment-history cleanup.
+
+**Correlation with logs.** Every entry carries the `request_id` (for HTTP-originated events) or a `system:<component>` actor (for reconciler/deployer events). The same `request_id` appears on every log line from the same request, so `grep cf4f29994be24c04` in logs gives the full context behind an audit row.
+
+---
+
 ### List Managed Images
 `GET /api/v1/images`
 

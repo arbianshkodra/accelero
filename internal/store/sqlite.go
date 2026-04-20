@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -94,6 +96,33 @@ func (s *SQLiteStore) migrate() error {
 
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_stack_id ON managed_containers(stack_id);
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_container_id ON managed_containers(container_id);
+
+	-- audit_entries is append-only; no foreign keys on stack_id because
+	-- entries outlive the stack they describe (that's the whole point of
+	-- an audit trail). Retention is time-based, handled by the app, not
+	-- cascaded from stack deletion.
+	CREATE TABLE IF NOT EXISTS audit_entries (
+		id TEXT PRIMARY KEY,
+		timestamp DATETIME NOT NULL,
+		actor TEXT NOT NULL,
+		remote_addr TEXT NOT NULL DEFAULT '',
+		request_id TEXT NOT NULL DEFAULT '',
+		operation TEXT NOT NULL,
+		resource_type TEXT NOT NULL DEFAULT '',
+		resource_id TEXT NOT NULL DEFAULT '',
+		stack_id TEXT NOT NULL DEFAULT '',
+		stack_name TEXT NOT NULL DEFAULT '',
+		outcome TEXT NOT NULL,
+		error_message TEXT NOT NULL DEFAULT '',
+		metadata TEXT NOT NULL DEFAULT '{}'
+	);
+
+	-- (timestamp desc) is the dominant read pattern for the listing
+	-- endpoint; extra composite indexes cover the common filters.
+	CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_entries(timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_audit_stack_ts ON audit_entries(stack_id, timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit_entries(actor, timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_audit_operation_ts ON audit_entries(operation, timestamp DESC);
 	`
 	_, err := s.db.Exec(schema)
 	return err
@@ -273,6 +302,123 @@ func (s *SQLiteStore) RemoveContainer(containerID string) error {
 func (s *SQLiteStore) RemoveContainersByStack(stackID string) error {
 	_, err := s.db.Exec(`DELETE FROM managed_containers WHERE stack_id = ?`, stackID)
 	return err
+}
+
+// --- Audit log ---
+
+// maxAuditListLimit caps how many rows a single ListAuditEntries call
+// can return. Protects against accidental unbounded loads; the table
+// grows append-only so a bug or an aggressive crawler could otherwise
+// pull millions of rows in one response.
+const maxAuditListLimit = 1000
+
+// CreateAuditEntry inserts a single audit row. Intentionally NOT
+// transactional with the operation it audits — an audit write failure
+// must never block or roll back the user-facing action. Callers log
+// the error and move on.
+func (s *SQLiteStore) CreateAuditEntry(e *AuditEntry) error {
+	meta := "{}"
+	if len(e.Metadata) > 0 {
+		b, err := json.Marshal(e.Metadata)
+		if err != nil {
+			return fmt.Errorf("marshal audit metadata: %w", err)
+		}
+		meta = string(b)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO audit_entries (
+			id, timestamp, actor, remote_addr, request_id,
+			operation, resource_type, resource_id,
+			stack_id, stack_name,
+			outcome, error_message, metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.Timestamp, e.Actor, e.RemoteAddr, e.RequestID,
+		e.Operation, e.ResourceType, e.ResourceID,
+		e.StackID, e.StackName,
+		e.Outcome, e.ErrorMessage, meta,
+	)
+	return err
+}
+
+// ListAuditEntries returns rows newest-first subject to the filter. An
+// empty StackID/Actor/Operation means "any"; a zero Since means "no
+// lower bound." Limit defaults to 100 if unset and is capped at
+// maxAuditListLimit.
+func (s *SQLiteStore) ListAuditEntries(filter AuditFilter) ([]*AuditEntry, error) {
+	var (
+		clauses []string
+		args    []interface{}
+	)
+	if filter.StackID != "" {
+		clauses = append(clauses, "stack_id = ?")
+		args = append(args, filter.StackID)
+	}
+	if filter.StackName != "" {
+		clauses = append(clauses, "stack_name = ?")
+		args = append(args, filter.StackName)
+	}
+	if filter.Actor != "" {
+		clauses = append(clauses, "actor = ?")
+		args = append(args, filter.Actor)
+	}
+	if filter.Operation != "" {
+		clauses = append(clauses, "operation = ?")
+		args = append(args, filter.Operation)
+	}
+	if !filter.Since.IsZero() {
+		clauses = append(clauses, "timestamp >= ?")
+		args = append(args, filter.Since)
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > maxAuditListLimit {
+		limit = maxAuditListLimit
+	}
+
+	query := `SELECT id, timestamp, actor, remote_addr, request_id,
+		operation, resource_type, resource_id,
+		stack_id, stack_name,
+		outcome, error_message, metadata
+		FROM audit_entries`
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += " ORDER BY timestamp DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*AuditEntry
+	for rows.Next() {
+		var (
+			e       AuditEntry
+			metaRaw string
+		)
+		if err := rows.Scan(
+			&e.ID, &e.Timestamp, &e.Actor, &e.RemoteAddr, &e.RequestID,
+			&e.Operation, &e.ResourceType, &e.ResourceID,
+			&e.StackID, &e.StackName,
+			&e.Outcome, &e.ErrorMessage, &metaRaw,
+		); err != nil {
+			return nil, err
+		}
+		if metaRaw != "" && metaRaw != "{}" {
+			if err := json.Unmarshal([]byte(metaRaw), &e.Metadata); err != nil {
+				// Corrupt metadata blob shouldn't block the list —
+				// surface the row without its metadata and move on.
+				e.Metadata = nil
+			}
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
 }
 
 // --- Lifecycle ---

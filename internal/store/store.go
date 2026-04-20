@@ -28,6 +28,11 @@ type Store interface {
 	RemoveContainer(containerID string) error
 	RemoveContainersByStack(stackID string) error
 
+	// Audit log — append-only; no update or delete path. Immutability
+	// is the point, so the interface exposes exactly two methods.
+	CreateAuditEntry(e *AuditEntry) error
+	ListAuditEntries(filter AuditFilter) ([]*AuditEntry, error)
+
 	// Lifecycle
 	Ping(ctx context.Context) error
 	Close() error

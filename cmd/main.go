@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/config"
 	"github.com/arbianshkodra/accelero/internal/handler"
 	"github.com/arbianshkodra/accelero/internal/metrics"
@@ -70,6 +71,11 @@ func main() {
 	deployer := stack.NewDeployer(cli, db, cfg.StacksDataDir)
 	rec := reconciler.New(db, cli, deployer)
 
+	// Shared audit recorder — writes to the same SQLite store.
+	auditRecorder := audit.NewStoreRecorder(db)
+	deployer.SetAudit(auditRecorder)
+	rec.SetAudit(auditRecorder)
+
 	// 5. Migrate legacy env-var config to a "default" stack if needed.
 	migrateLegacyConfig(cfg, db)
 
@@ -109,6 +115,7 @@ func main() {
 		Store:      db,
 		Deployer:   deployer,
 		Reconciler: rec,
+		Audit:      auditRecorder,
 		Docker:     cli,
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
