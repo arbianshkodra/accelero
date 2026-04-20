@@ -68,7 +68,8 @@ func (m *mockStore) Close() error                                               
 
 // mockDeployer implements Deployer for testing.
 type mockDeployer struct {
-	deployCalled bool
+	deployCalled      bool
+	cleanupCalledWith []string
 }
 
 func (d *mockDeployer) Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error) {
@@ -81,6 +82,11 @@ func (d *mockDeployer) Deploy(ctx context.Context, stack *store.Stack, trigger s
 		Trigger:   trigger,
 		StartedAt: time.Now(),
 	}, nil
+}
+
+func (d *mockDeployer) CleanupStackData(stackID string) error {
+	d.cleanupCalledWith = append(d.cleanupCalledWith, stackID)
+	return nil
 }
 
 func TestCreateStack(t *testing.T) {
