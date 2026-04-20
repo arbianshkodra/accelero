@@ -73,10 +73,10 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 - [x] `pull_policy` (`always` / `missing` / `if_not_present` / `never`; `build` rejected)
 
 **Observability basics:**
-- [ ] Structured request/deployment ID propagation through all log entries
+- [x] Structured request/deployment ID propagation through all log entries (request_id attached by middleware; deploy/reconcile/stack enrich via logctx; security events in auth middleware carry request_id)
 - [x] Prometheus metrics endpoint (`/metrics`) — deployments count, duration, failures, drift events, active reconcile loops
 - [x] Deployment diff preview (`POST /stacks/{id}/preview` — show what would change without deploying)
-- [ ] `/healthz` and `/readyz` endpoints (distinct from `/health`)
+- [x] `/healthz` and `/readyz` endpoints (distinct from `/health`)
 
 ---
 

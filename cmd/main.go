@@ -109,6 +109,10 @@ func main() {
 		Store:      db,
 		Deployer:   deployer,
 		Reconciler: rec,
+		DockerPing: func(ctx context.Context) error {
+			_, err := cli.Ping(ctx, client.PingOptions{})
+			return err
+		},
 	}
 
 	// Register all routes — handler applies auth middleware where needed.
@@ -132,6 +136,10 @@ func main() {
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		<-sigs
 		logrus.Info("Shutdown signal received")
+
+		// Flip /readyz to "draining" before tearing anything down so
+		// upstream load balancers stop routing new traffic here first.
+		h.SetShuttingDown()
 
 		// Cancel the root context — stops reconciler, cleanup routines.
 		cancel()

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -275,6 +276,14 @@ func (s *SQLiteStore) RemoveContainersByStack(stackID string) error {
 }
 
 // --- Lifecycle ---
+
+// Ping verifies the database is reachable by running a trivial query under
+// the caller's context/timeout. SQLite doesn't maintain a network connection,
+// so this is really a "database file is open and readable" check — enough
+// for a /readyz probe.
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()

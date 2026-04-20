@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/sirupsen/logrus"
 )
 
@@ -17,23 +18,30 @@ func APIKeyAuth(next http.Handler) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Get API key from the request header
+		// Pull the request-scoped logger so security events carry
+		// request_id (and whatever else is attached upstream). RequestID
+		// middleware runs before APIKeyAuth, so the field is always set.
+		log := logctx.FromContext(r.Context()).WithFields(logrus.Fields{
+			"path":        r.URL.Path,
+			"method":      r.Method,
+			"remote_addr": r.RemoteAddr,
+		})
+
 		requestAPIKey := r.Header.Get("X-API-KEY")
 
 		if requestAPIKey == "" {
-			logrus.Warn("Unauthorized request: missing API key")
+			log.Warn("Unauthorized request: missing API key")
 			http.Error(w, "API key is required", http.StatusUnauthorized)
 			return
 		}
 
-		// Use constant-time comparison to prevent timing attacks
+		// Constant-time comparison prevents timing attacks.
 		if subtle.ConstantTimeCompare([]byte(requestAPIKey), []byte(apiKey)) != 1 {
-			logrus.Warn("Unauthorized request: invalid API key")
+			log.Warn("Unauthorized request: invalid API key")
 			http.Error(w, "Invalid API key", http.StatusForbidden)
 			return
 		}
 
-		// Proceed to the next handler
 		next.ServeHTTP(w, r)
 	})
 }
