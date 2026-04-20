@@ -95,10 +95,10 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources (accelero-service / accelero-replica surfaced). Stack-wide view is the common one; a daemon-wide `/events` variant across all stacks can come later if needed.
 
 **Resource browsers (read-only, filtered to accelero-managed):**
-- [ ] `GET /images` — images used by managed stacks, with size, layers, pull timestamp
-- [ ] `GET /volumes` — accelero-managed volumes with size and mount refs
+- [x] `GET /api/v1/images` — images referenced by managed containers with back-references (stack/service/replica/container). `?stack=<name>` narrows.
+- [x] `GET /api/v1/volumes` — volumes labelled managed-by=accelero with driver/mount/labels. `?stack=<name>` narrows.
 - [ ] `GET /volumes/{name}/browse` — read-only file browser for volumes (debugging)
-- [ ] `GET /networks` — accelero-managed networks with connected containers
+- [x] `GET /api/v1/networks` — networks labelled managed-by=accelero with driver/scope/options. Also fixes a pre-existing bug where networks created by accelero were missing management labels. `?stack=<name>` narrows.
 
 **Exceptional debug operations (audited, flagged as drift):**
 - [ ] `POST /containers/{cid}/restart` — logged + audit trail (pure GitOps: don't use; prefer git revert)

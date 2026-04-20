@@ -275,6 +275,86 @@ Same stack-membership verification as `GET /containers/{cid}` — a `cid` from a
 
 ---
 
+### List Managed Images
+`GET /api/v1/images`
+
+Returns every Docker image currently referenced by at least one accelero-managed container, with back-references to the containers using it. Docker images themselves don't carry management labels, so "managed" here means "used by a managed container" — the endpoint walks containers first, then intersects with the daemon's image list.
+
+**Query parameters:**
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `stack` | string | Narrow usage to one stack name |
+
+**Response:** `200 OK` (sorted by primary repo tag)
+```json
+[
+  {
+    "id": "sha256:a5127daff3d6...",
+    "repo_tags": ["nginx:1.27.1-alpine"],
+    "size_bytes": 71807554,
+    "created_at": "2024-08-14T23:51:24Z",
+    "used_by": [
+      {"stack": "rb", "service": "web", "replica": 0, "container_id": "720e96..."},
+      {"stack": "rb", "service": "web", "replica": 1, "container_id": "a9c4c2..."}
+    ]
+  }
+]
+```
+
+**Errors:** `503 Service Unavailable` when Docker introspection isn't configured.
+
+---
+
+### List Managed Volumes
+`GET /api/v1/volumes`
+
+Volumes tagged `managed-by=accelero`. Narrow with `?stack=<name>`.
+
+**Response:** `200 OK` (sorted by volume name)
+```json
+[
+  {
+    "name": "accelero_rb_pg_data",
+    "driver": "local",
+    "stack": "rb",
+    "mount_point": "/var/lib/docker/volumes/accelero_rb_pg_data/_data",
+    "created_at": "2026-04-20T17:17:53Z",
+    "labels": {"accelero-stack": "rb", "managed-by": "accelero"}
+  }
+]
+```
+
+Daemon warnings from the volume list (rare; usually filesystem-level) are surfaced as log entries, not in the response.
+
+---
+
+### List Managed Networks
+`GET /api/v1/networks`
+
+Networks tagged `managed-by=accelero`. Narrow with `?stack=<name>`.
+
+**Note on upgrades.** Networks created by accelero before the labelling fix landed will NOT appear here — Docker doesn't allow adding labels to a live network without a recreate, which would disrupt every container on it. Those networks remain functional; they just won't show up in this listing until the stack is torn down and re-deployed.
+
+**Response:** `200 OK` (sorted by network name)
+```json
+[
+  {
+    "id": "1f1568dd73e6...",
+    "name": "app",
+    "driver": "bridge",
+    "scope": "local",
+    "stack": "rb",
+    "created_at": "2026-04-20T17:31:00Z",
+    "labels": {"accelero-stack": "rb", "managed-by": "accelero"}
+  }
+]
+```
+
+Connected-container enumeration is deferred — `/api/v1/stacks/{id}/containers` already answers "which containers belong to this stack." Ask in an issue if a per-network "who's on me" view would be useful.
+
+---
+
 ### Stream Events
 `GET /api/v1/stacks/{id}/events`
 

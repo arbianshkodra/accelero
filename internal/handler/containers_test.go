@@ -17,7 +17,9 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,6 +126,12 @@ type mockDocker struct {
 	statsByID     map[string]container.StatsResponse
 	statsErr      error
 	eventsResult  client.EventsResult
+	imageResult   client.ImageListResult
+	imageErr      error
+	volumeResult  client.VolumeListResult
+	volumeErr     error
+	networkResult client.NetworkListResult
+	networkErr    error
 }
 
 func (m *mockDocker) ContainerList(ctx context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -142,6 +150,18 @@ func (m *mockDocker) ContainerInspect(ctx context.Context, id string, _ client.C
 
 func (m *mockDocker) Events(ctx context.Context, _ client.EventsListOptions) client.EventsResult {
 	return m.eventsResult
+}
+
+func (m *mockDocker) ImageList(ctx context.Context, _ client.ImageListOptions) (client.ImageListResult, error) {
+	return m.imageResult, m.imageErr
+}
+
+func (m *mockDocker) VolumeList(ctx context.Context, _ client.VolumeListOptions) (client.VolumeListResult, error) {
+	return m.volumeResult, m.volumeErr
+}
+
+func (m *mockDocker) NetworkList(ctx context.Context, _ client.NetworkListOptions) (client.NetworkListResult, error) {
+	return m.networkResult, m.networkErr
 }
 
 func (m *mockDocker) ContainerStats(ctx context.Context, id string, _ client.ContainerStatsOptions) (client.ContainerStatsResult, error) {
@@ -893,4 +913,249 @@ func TestStreamStackEvents_DockerUnconfigured503(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// ---------------------------------------------------------------------------
+// Resource browsers: images
+// ---------------------------------------------------------------------------
+
+func TestListManagedImages_JoinsContainerUsageWithImageList(t *testing.T) {
+	replica0 := 0
+	replica1 := 1
+
+	docker := &mockDocker{
+		listResult: client.ContainerListResult{Items: []container.Summary{
+			{
+				ID:      "c-a-0",
+				ImageID: "sha256:img-web",
+				Labels: map[string]string{
+					"managed-by":       "accelero",
+					"accelero-stack":   "alpha",
+					"accelero-service": "web",
+					"accelero-replica": "0",
+				},
+			},
+			{
+				ID:      "c-a-1",
+				ImageID: "sha256:img-web",
+				Labels: map[string]string{
+					"managed-by":       "accelero",
+					"accelero-stack":   "alpha",
+					"accelero-service": "web",
+					"accelero-replica": "1",
+				},
+			},
+			{
+				ID:      "c-b-0",
+				ImageID: "sha256:img-api",
+				Labels: map[string]string{
+					"managed-by":       "accelero",
+					"accelero-stack":   "beta",
+					"accelero-service": "api",
+				},
+			},
+		}},
+		imageResult: client.ImageListResult{Items: []image.Summary{
+			{
+				ID:       "sha256:img-web",
+				RepoTags: []string{"nginx:1.27.1-alpine"},
+				Size:     9_000_000,
+				Created:  1_700_000_000,
+			},
+			{
+				ID:       "sha256:img-api",
+				RepoTags: []string{"myapp:v2"},
+				Size:     120_000_000,
+				Created:  1_700_000_500,
+			},
+			{
+				// Unrelated local image — must not appear in the response.
+				ID:       "sha256:img-orphan",
+				RepoTags: []string{"orphan:latest"},
+				Size:     1_000,
+				Created:  1_700_000_900,
+			},
+		}},
+	}
+
+	h := newTestHandler(&mockStore{}, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/images", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var got []ManagedImage
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2, "only referenced images should be returned")
+
+	byTag := map[string]ManagedImage{}
+	for _, m := range got {
+		byTag[m.RepoTags[0]] = m
+	}
+	assert.InDelta(t, 9_000_000, byTag["nginx:1.27.1-alpine"].SizeBytes, 0)
+	require.Len(t, byTag["nginx:1.27.1-alpine"].UsedBy, 2)
+	assert.Equal(t, "alpha", byTag["nginx:1.27.1-alpine"].UsedBy[0].Stack)
+	require.NotNil(t, byTag["nginx:1.27.1-alpine"].UsedBy[0].Replica)
+	assert.Equal(t, replica0, *byTag["nginx:1.27.1-alpine"].UsedBy[0].Replica)
+	assert.Equal(t, replica1, *byTag["nginx:1.27.1-alpine"].UsedBy[1].Replica)
+
+	require.Len(t, byTag["myapp:v2"].UsedBy, 1)
+	assert.Equal(t, "beta", byTag["myapp:v2"].UsedBy[0].Stack)
+}
+
+func TestListManagedImages_NoContainers_EmptyArray(t *testing.T) {
+	// When there are no managed containers, we should return [], not
+	// null — clients iterating the response shouldn't have to care.
+	h := newTestHandler(&mockStore{}, &mockDocker{})
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/images", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "[]\n", rr.Body.String())
+}
+
+func TestListManagedImages_DockerUnconfigured503(t *testing.T) {
+	h := &Handler{Store: &mockStore{}, Deployer: &mockDeployer{}}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/images", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Resource browsers: volumes
+// ---------------------------------------------------------------------------
+
+func TestListManagedVolumes_ProjectsAndSorts(t *testing.T) {
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: []volume.Volume{
+		{
+			Name:       "accelero_beta_pg_data",
+			Driver:     "local",
+			Mountpoint: "/var/lib/docker/volumes/accelero_beta_pg_data/_data",
+			CreatedAt:  "2026-04-20T10:00:00Z",
+			Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "beta",
+			},
+		},
+		{
+			Name:       "accelero_alpha_cache",
+			Driver:     "local",
+			Mountpoint: "/var/lib/docker/volumes/accelero_alpha_cache/_data",
+			CreatedAt:  "2026-04-20T09:00:00Z",
+			Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "alpha",
+			},
+		},
+	}}}
+
+	h := newTestHandler(&mockStore{}, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var got []ManagedVolume
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2)
+	// Sorted by name.
+	assert.Equal(t, "accelero_alpha_cache", got[0].Name)
+	assert.Equal(t, "alpha", got[0].Stack)
+	assert.Equal(t, "accelero_beta_pg_data", got[1].Name)
+	assert.Equal(t, "beta", got[1].Stack)
+}
+
+func TestListManagedVolumes_Empty(t *testing.T) {
+	h := newTestHandler(&mockStore{}, &mockDocker{})
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "[]\n", rr.Body.String())
+}
+
+// ---------------------------------------------------------------------------
+// Resource browsers: networks
+// ---------------------------------------------------------------------------
+
+func TestListManagedNetworks_ProjectsAndSorts(t *testing.T) {
+	created := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
+	docker := &mockDocker{networkResult: client.NetworkListResult{Items: []network.Summary{
+		{Network: network.Network{
+			ID:      "net-beta-id",
+			Name:    "accelero_beta_app",
+			Driver:  "bridge",
+			Scope:   "local",
+			Created: created,
+			Labels:  map[string]string{"managed-by": "accelero", "accelero-stack": "beta"},
+			Options: map[string]string{"com.docker.network.bridge.name": "beta-br"},
+		}},
+		{Network: network.Network{
+			ID:      "net-alpha-id",
+			Name:    "accelero_alpha_app",
+			Driver:  "bridge",
+			Scope:   "local",
+			Created: created,
+			Labels:  map[string]string{"managed-by": "accelero", "accelero-stack": "alpha"},
+		}},
+	}}}
+
+	h := newTestHandler(&mockStore{}, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/networks", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var got []ManagedNetwork
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2)
+	// Sorted by name.
+	assert.Equal(t, "accelero_alpha_app", got[0].Name)
+	assert.Equal(t, "alpha", got[0].Stack)
+	assert.Equal(t, "bridge", got[0].Driver)
+	assert.Equal(t, "accelero_beta_app", got[1].Name)
+	assert.Equal(t, "beta", got[1].Stack)
+	assert.Equal(t, "beta-br", got[1].Options["com.docker.network.bridge.name"])
+}
+
+func TestListManagedNetworks_DockerError_500(t *testing.T) {
+	docker := &mockDocker{networkErr: errReadyzTest("docker is down")}
+	h := newTestHandler(&mockStore{}, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/networks", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 }
