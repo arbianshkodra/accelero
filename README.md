@@ -17,6 +17,7 @@ Think of it as **ArgoCD/Flux for Docker Compose** — git is the source of truth
 - **GitOps reconciliation** — Periodic drift detection: desired state (git) vs actual state (Docker), auto-deploy on drift
 - **Flexible triggers** — Deploy via webhook (push), reconciliation (pull), or manual API call
 - **`.env` interpolation** — Full docker-compose `${VAR}` / `${VAR:-default}` / `${VAR:?required}` support
+- **Broad compose compatibility** — `entrypoint`, `user`, `working_dir`, `hostname`, `dns`, `extra_hosts`, `cap_add`/`cap_drop`, `privileged`, `tmpfs`, `shm_size`, `init`, `expose`, `stop_grace_period`, `pull_policy`, healthchecks, resource limits
 - **Zero-downtime deployments** — New containers are health-checked before old ones are removed
 - **Automatic rollback** — Pre-deployment state captured and restored on failure
 - **Dependency resolution** — Services deployed in correct order based on `depends_on`
