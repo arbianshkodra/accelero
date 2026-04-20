@@ -20,6 +20,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
@@ -129,6 +130,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers", h.ListStackContainers).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}", h.GetStackContainer).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/logs/stream", h.StreamStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
 
@@ -989,6 +991,197 @@ type ContainerNetStats struct {
 type ContainerBlockIOStats struct {
 	ReadBytes  uint64 `json:"read_bytes"`
 	WriteBytes uint64 `json:"write_bytes"`
+}
+
+// wsLogUpgrader upgrades HTTP → WebSocket for the log-follow endpoint.
+// Origin check is permissive — authentication lives at the API-key
+// layer, and CSRF isn't a meaningful concern for a read-only log
+// stream from a server-to-server or curl-to-server caller. If this
+// ever grows a browser UI that stores session cookies, switch to a
+// strict same-origin check.
+var wsLogUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 4096,
+	CheckOrigin:     func(*http.Request) bool { return true },
+}
+
+// wsWriteTimeout is how long a single frame write is allowed to take
+// before we give up on a stuck client. Applied per-message so a slow
+// consumer doesn't pin the goroutine forever.
+const wsWriteTimeout = 10 * time.Second
+
+// wsPingInterval is the cadence of application-level ping frames; they
+// catch half-closed TCP connections that the OS hasn't noticed yet.
+// The reader goroutine enforces a corresponding read deadline of 2x.
+const wsPingInterval = 30 * time.Second
+
+// StreamStackContainerLogs upgrades the connection to WebSocket and
+// streams container logs line-by-line in real time.  Matches the
+// query-param surface of /logs (tail, since, timestamps) so a client
+// can "paginate" into a live tail: open /logs?tail=500 first for
+// history, then /logs/stream for new lines.
+//
+// Each log line arrives as one WebSocket text message. Non-TTY
+// containers have their multiplexed stdout/stderr demuxed on our
+// side so callers see clean text.
+//
+// Authentication is the same X-API-KEY the rest of the API uses; the
+// upgrade request is a regular HTTP GET, so middleware still applies.
+// Browsers that can't set custom headers on new WebSocket() will need
+// a proxy or a short-lived-token flow (not shipped yet).
+func (h *Handler) StreamStackContainerLogs(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Validate the upgrade before we touch the client connection so
+	// callers that fail auth/membership get a regular JSON error,
+	// not a half-completed handshake.
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	// Query-param parsing before upgrade — same as /logs.
+	tailStr := strconv.Itoa(defaultLogTail)
+	if raw := r.URL.Query().Get("tail"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, "tail must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		if n > maxLogTail {
+			n = maxLogTail
+		}
+		tailStr = strconv.Itoa(n)
+	}
+	var since string
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, "since must be a Go duration (e.g. 5m, 30s)", http.StatusBadRequest)
+			return
+		}
+		since = strconv.FormatInt(time.Now().Add(-dur).Unix(), 10)
+	}
+	timestamps := r.URL.Query().Get("timestamps") == "true"
+
+	conn, err := wsLogUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// Upgrade() has already written its own error response to w; just log.
+		logctx.FromContext(r.Context()).WithError(err).Debug("websocket upgrade failed")
+		return
+	}
+	defer conn.Close()
+
+	// Scope the docker stream to the websocket's lifetime. A client
+	// disconnect cancels this, which tears down the docker logs stream
+	// inside the client library — daemon releases within ~1s.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	stream, err := h.Docker.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       tailStr,
+		Since:      since,
+		Timestamps: timestamps,
+		Follow:     true,
+	})
+	if err != nil {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "container logs: "+err.Error()),
+			time.Now().Add(wsWriteTimeout))
+		return
+	}
+	defer stream.Close()
+
+	// Monitor the socket for client-initiated close so we can cancel
+	// the upstream Docker stream.  We don't actually expect messages
+	// from the client (read-only stream), but without a reader, pings
+	// and close frames wouldn't be observed.
+	go func() {
+		conn.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+			return nil
+		})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	// Ticker for pings — catches half-closed TCPs the kernel hasn't
+	// detected yet.
+	pings := time.NewTicker(wsPingInterval)
+	defer pings.Stop()
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pings.C:
+				_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout))
+			}
+		}
+	}()
+
+	// Demux → line-framed → WriteMessage.
+	writer := &wsLogWriter{conn: conn}
+	if insp.Container.Config != nil && insp.Container.Config.Tty {
+		_, _ = io.Copy(writer, stream)
+	} else {
+		_, _ = stdcopy.StdCopy(writer, writer, stream)
+	}
+
+	// stdcopy finished: the container exited or the daemon dropped us.
+	// Send a normal close frame so the client knows the stream ended
+	// cleanly rather than timing out.
+	_ = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(wsWriteTimeout))
+
+	cancel()
+	<-pingDone
+}
+
+// wsLogWriter adapts an io.Writer interface (what stdcopy expects) to
+// gorilla/websocket's frame-based API. Each Write becomes one or more
+// text messages, split on newlines so each log line is its own frame.
+type wsLogWriter struct {
+	conn *websocket.Conn
+	buf  []byte // carries partial trailing lines across Write calls
+}
+
+func (w *wsLogWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := strings.IndexByte(string(w.buf), '\n')
+		if i < 0 {
+			break
+		}
+		line := w.buf[:i]
+		w.buf = w.buf[i+1:]
+		if len(line) == 0 {
+			continue
+		}
+		_ = w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := w.conn.WriteMessage(websocket.TextMessage, line); err != nil {
+			return 0, err
+		}
+	}
+	return len(p), nil
 }
 
 // GetStackContainerStats returns a single computed stats sample. The
