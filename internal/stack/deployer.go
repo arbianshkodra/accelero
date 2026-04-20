@@ -843,6 +843,14 @@ func (d *Deployer) createAndStartContainer(
 		}
 	}
 
+	// logging:driver + options -> HostConfig.LogConfig
+	if svc.Logging != nil && svc.Logging.Driver != "" {
+		hostConfig.LogConfig = container.LogConfig{
+			Type:   svc.Logging.Driver,
+			Config: svc.Logging.Options,
+		}
+	}
+
 	// Resource limits.
 	var resources container.Resources
 	if svc.MemLimit != "" {
