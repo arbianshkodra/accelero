@@ -56,20 +56,21 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 
 **Docker Compose compatibility (high impact):**
 - [x] `.env` variable substitution (`${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR:+value}`, `$$`) — next-to-compose and repo-root lookup
-- [ ] `entrypoint`, `working_dir`, `user` fields
+- [x] `entrypoint`, `working_dir`, `user` fields
+- [x] `stop_grace_period` (replaces the old hardcoded 10s)
+- [x] `stop_signal`
 - [ ] `depends_on` map form with conditions (`condition: service_healthy`)
 - [ ] `deploy.replicas` for container scaling
 - [ ] Named volumes (top-level `volumes:` section with `docker volume create`)
 - [ ] `logging` driver and options
-- [ ] `stop_grace_period` (currently hardcoded to 10s)
 - [ ] Long-form `ports` syntax (`{target: 80, published: 8080, protocol: tcp}`)
 
 **Docker Compose compatibility (medium impact):**
-- [ ] `extra_hosts`, `hostname`, `domainname`, `dns`, `dns_search`
-- [ ] `cap_add`, `cap_drop`, `privileged`
-- [ ] `tmpfs`, `shm_size`, `init`
-- [ ] `expose` (expose ports without publishing)
-- [ ] `pull_policy` (always, never, missing)
+- [x] `extra_hosts`, `hostname`, `domainname`, `dns`, `dns_search`
+- [x] `cap_add`, `cap_drop`, `privileged`
+- [x] `tmpfs`, `shm_size`, `init`
+- [x] `expose` (expose ports without publishing)
+- [x] `pull_policy` (`always` / `missing` / `if_not_present` / `never`; `build` rejected)
 
 **Observability basics:**
 - [ ] Structured request/deployment ID propagation through all log entries
