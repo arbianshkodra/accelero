@@ -124,8 +124,9 @@ type mockDocker struct {
 	logsByID      map[string]string
 	logsIsFramed  bool // true → wrap body in stdcopy frames
 	logsErr       error
-	statsByID     map[string]container.StatsResponse
-	statsErr      error
+	statsByID       map[string]container.StatsResponse
+	statsStreamByID map[string][]container.StatsResponse
+	statsErr        error
 	eventsResult  client.EventsResult
 	imageResult   client.ImageListResult
 	imageErr      error
@@ -168,6 +169,20 @@ func (m *mockDocker) NetworkList(ctx context.Context, _ client.NetworkListOption
 func (m *mockDocker) ContainerStats(ctx context.Context, id string, _ client.ContainerStatsOptions) (client.ContainerStatsResult, error) {
 	if m.statsErr != nil {
 		return client.ContainerStatsResult{}, m.statsErr
+	}
+	// Streaming case first: the stream-stats endpoint decodes multiple
+	// concatenated JSON objects from the body. One-shot /stats only
+	// decodes the first, so a populated stream slice works for both
+	// use cases in tests.
+	if samples, ok := m.statsStreamByID[id]; ok {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for _, s := range samples {
+			if err := enc.Encode(s); err != nil {
+				return client.ContainerStatsResult{}, err
+			}
+		}
+		return client.ContainerStatsResult{Body: io.NopCloser(&buf)}, nil
 	}
 	stats, ok := m.statsByID[id]
 	if !ok {
@@ -1337,3 +1352,152 @@ func TestStreamStackContainerLogs_DockerUnconfigured503(t *testing.T) {
 
 // Keep the stdcopy multi-frame helper compiled in case future tests want it.
 var _ = frameMulti
+
+// ---------------------------------------------------------------------------
+// WebSocket stats stream
+// ---------------------------------------------------------------------------
+
+func TestStreamStackContainerStats_EmitsOneMessagePerSample(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+
+	// Two samples — the second has CPU/memory deltas against PreCPUStats
+	// so the projected percent works out to a non-zero value, and the
+	// client reader can assert on that transition.
+	samples := []container.StatsResponse{
+		{
+			ID:   "cid",
+			Name: "/web_0_1",
+			Read: time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC),
+			CPUStats: container.CPUStats{
+				CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+				SystemUsage: 10000,
+				OnlineCPUs:  2,
+			},
+			// Same values as CPUStats so delta is 0 → "idle" first reading.
+			// Matches real Docker streams: the daemon populates PreCPUStats
+			// with an initial sample before the first message is sent.
+			PreCPUStats: container.CPUStats{
+				CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+				SystemUsage: 10000,
+			},
+			MemoryStats: container.MemoryStats{Usage: 500, Limit: 1000},
+		},
+		{
+			ID:   "cid",
+			Name: "/web_0_1",
+			Read: time.Date(2026, 4, 20, 12, 0, 1, 0, time.UTC),
+			CPUStats: container.CPUStats{
+				CPUUsage:    container.CPUUsage{TotalUsage: 1100},
+				SystemUsage: 11000,
+				OnlineCPUs:  2,
+			},
+			PreCPUStats: container.CPUStats{
+				CPUUsage:    container.CPUUsage{TotalUsage: 1000},
+				SystemUsage: 10000,
+			},
+			MemoryStats: container.MemoryStats{Usage: 600, Limit: 1000},
+		},
+	}
+
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{Labels: map[string]string{
+					"managed-by":     "accelero",
+					"accelero-stack": "demo",
+				}},
+			}},
+		},
+		statsStreamByID: map[string][]container.StatsResponse{"cid": samples},
+	}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	conn, _ := dialWSLogs(t, srv.URL, "/api/v1/stacks/demo/containers/cid/stats/stream")
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	var first ContainerStatsSample
+	_, msg1, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(msg1, &first))
+	assert.Equal(t, "web_0_1", first.Name)
+	// No prior sample on server side yet → 0%.
+	assert.Equal(t, 0.0, first.CPU.Percent)
+	assert.Equal(t, uint64(500), first.Memory.UsageBytes)
+
+	var second ContainerStatsSample
+	_, msg2, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(msg2, &second))
+	assert.InDelta(t, 20.0, second.CPU.Percent, 0.001,
+		"second sample has PreCPUStats filled; formula yields 20%%")
+	assert.Equal(t, uint64(600), second.Memory.UsageBytes)
+
+	// Source ended → normal closure.
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseNormalClosure, closeErr.Code)
+}
+
+func TestStreamStackContainerStats_ForeignStack404(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "ours", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "theirs",
+			}},
+		}},
+	}}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/ours/containers/cid/stats/stream"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestStreamStackContainerStats_DockerUnconfigured503(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}} // no Docker
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/stats/stream"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
