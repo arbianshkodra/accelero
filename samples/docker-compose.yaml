@@ -33,11 +33,13 @@ services:
 
   proxy:
     image: caddy:${CADDY_TAG:?CADDY_TAG is required}
-    # --to web:80 — Docker's embedded DNS resolves `web` to whichever
-    # replicas are currently running.  Caddy re-resolves the upstream
-    # on connection failures, so replicas coming/going during a deploy
-    # don't need any proxy-side config change.
-    command: ["caddy", "reverse-proxy", "--from", ":80", "--to", "web:${WEB_PORT:-80}"]
+    # Caddyfile is committed to this gitops repo alongside the compose
+    # file and bind-mounted into the container.  Accelero resolves
+    # `./Caddyfile` against the stack's cloned repo dir; see
+    # docs/usage-overview.md#bind-mounts-from-the-gitops-repo.
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
       - "${PUBLIC_PORT:-80}:80"
     depends_on:
