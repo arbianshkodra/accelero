@@ -85,6 +85,64 @@ x:
 `))
 }
 
+func TestDependencies_ShortForm(t *testing.T) {
+	deps := decode[Dependencies](t, `
+x:
+  - db
+  - redis
+`)
+	require.Len(t, deps, 2)
+	assert.Equal(t, DependencyConfig{Condition: DependencyConditionStarted}, deps["db"])
+	assert.Equal(t, DependencyConfig{Condition: DependencyConditionStarted}, deps["redis"])
+}
+
+func TestDependencies_LongForm(t *testing.T) {
+	deps := decode[Dependencies](t, `
+x:
+  db:
+    condition: service_healthy
+  redis:
+    condition: service_started
+  migrate:
+    condition: service_completed_successfully
+    required: false
+`)
+	require.Len(t, deps, 3)
+	assert.Equal(t, DependencyConditionHealthy, deps["db"].Condition)
+	assert.Equal(t, DependencyConditionStarted, deps["redis"].Condition)
+	assert.Equal(t, DependencyConditionCompletedOK, deps["migrate"].Condition)
+	require.NotNil(t, deps["migrate"].Required)
+	assert.False(t, *deps["migrate"].Required)
+}
+
+func TestDependencies_LongForm_DefaultCondition(t *testing.T) {
+	// Entries without an explicit condition should fall back to service_started.
+	deps := decode[Dependencies](t, `
+x:
+  db: {}
+  redis:
+    required: true
+`)
+	require.Len(t, deps, 2)
+	assert.Equal(t, DependencyConditionStarted, deps["db"].Condition)
+	assert.Equal(t, DependencyConditionStarted, deps["redis"].Condition)
+}
+
+func TestDependencies_NamesIsSorted(t *testing.T) {
+	deps := Dependencies{
+		"zulu":  {Condition: DependencyConditionStarted},
+		"alpha": {Condition: DependencyConditionStarted},
+		"mike":  {Condition: DependencyConditionStarted},
+	}
+	assert.Equal(t, []string{"alpha", "mike", "zulu"}, deps.Names())
+}
+
+func TestDependencies_InvalidForm(t *testing.T) {
+	var w wrap[Dependencies]
+	err := yaml.Unmarshal([]byte(`x: "just a string"`), &w)
+	require.Error(t, err)
+}
+
 func TestComposeService_FullFieldRoundTrip(t *testing.T) {
 	yamlText := `
 image: nginx:1.27.0
