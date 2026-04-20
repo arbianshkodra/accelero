@@ -62,8 +62,8 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 - [x] `depends_on` map form with conditions (`service_started`, `service_healthy`, `service_completed_successfully`)
 - [ ] `deploy.replicas` for container scaling
 - [ ] Named volumes (top-level `volumes:` section with `docker volume create`)
-- [ ] `logging` driver and options
-- [ ] Long-form `ports` syntax (`{target: 80, published: 8080, protocol: tcp}`)
+- [x] `logging` driver and options
+- [x] Long-form `ports` syntax (`{target: 80, published: 8080, protocol: tcp, host_ip: 127.0.0.1}`); also fixes protocol and host-IP handling in short form
 
 **Docker Compose compatibility (medium impact):**
 - [x] `extra_hosts`, `hostname`, `domainname`, `dns`, `dns_search`

@@ -318,7 +318,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `domainname` | string | |
 | `environment` | list of `KEY=VALUE` or map | Inline env vars |
 | `env_file` | list of paths | Paths relative to the compose file |
-| `ports` | list (`"host:container"` format) | Published ports |
+| `ports` | list of strings **or** long-form maps | Short: `"[host_ip:]host_port:container_port[/proto]"`; long-form fields: `target`, `published`, `protocol`, `host_ip` |
 | `expose` | list of strings or ints | Exposed (not published) ports |
 | `volumes` | list (`"host:container[:mode]"`) | Bind mounts (named volumes: TBD Phase 2) |
 | `networks` | list | Must exist at the top-level `networks:` block |
@@ -339,6 +339,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `mem_limit` | size string | Memory ceiling |
 | `cpu_limit` | float | CPU quota in fractional cores (e.g. `0.5`) |
 | `pull_policy` | `always`, `missing`, `if_not_present`, `never` | See [pull policy](#pull-policy) below; `build` is rejected |
+| `logging` | `{driver, options}` | Maps 1:1 to Docker's `LogConfig` — e.g. `json-file` with `max-size` / `max-file` options |
 
 ### Top-level
 
@@ -382,6 +383,45 @@ services:
 | `service_completed_successfully` | Block the dependent's deploy until the dependency's container has exited with code 0 (for one-shot init/migration containers). Timeout: 2 minutes. |
 
 Unknown conditions fail the deploy with a clear error rather than silently ignoring. `required: false` and `restart: true` parse but are not yet acted on.
+
+### Ports
+
+Both short and long forms are accepted. The short form covers the common cases in a single string; the long form is useful when you need to spell out `host_ip` or mix protocols across several bindings.
+
+```yaml
+services:
+  web:
+    ports:
+      # Short form: [host_ip:]host_port:container_port[/proto]
+      - "8080:80"                   # 0.0.0.0:8080 -> 80/tcp
+      - "127.0.0.1:5353:53/udp"     # loopback only, UDP
+      - "9090"                      # exposed only, not published
+
+      # Long form
+      - target: 80
+        published: 8081
+        protocol: tcp
+        host_ip: 127.0.0.1
+```
+
+A bare container port (no host port) is exposed but not published — same effect as `expose:`.
+
+### Logging
+
+`logging` maps directly onto Docker's `LogConfig`:
+
+```yaml
+services:
+  web:
+    image: nginx:1.27.1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+Any driver supported by your Docker engine works (`json-file`, `local`, `journald`, `syslog`, `fluentd`, `gelf`, `awslogs`, etc.); Accelero passes the options through unchanged.
 
 ### Pull policy
 
