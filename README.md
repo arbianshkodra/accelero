@@ -18,7 +18,7 @@ Think of it as **ArgoCD/Flux for Docker Compose** — git is the source of truth
 - **Flexible triggers** — Deploy via webhook (push), reconciliation (pull), or manual API call
 - **`.env` interpolation** — Full docker-compose `${VAR}` / `${VAR:-default}` / `${VAR:?required}` support
 - **Broad compose compatibility** — `entrypoint`, `user`, `working_dir`, `hostname`, `dns`, `extra_hosts`, `cap_add`/`cap_drop`, `privileged`, `tmpfs`, `shm_size`, `init`, `expose`, `stop_grace_period`, `pull_policy`, healthchecks, resource limits
-- **Zero-downtime deployments** — New containers are health-checked before old ones are removed
+- **Zero-downtime deployments** — Rolling replica updates behind a reverse proxy (Caddy, Traefik, nginx). See [`samples/`](samples/) for a working end-to-end example with a scripted proof, and [`docs/usage-overview.md#zero-downtime-deployments`](docs/usage-overview.md#zero-downtime-deployments) for why a proxy is required.
 - **Automatic rollback** — Pre-deployment state captured and restored on failure
 - **Dependency resolution** — Services deployed in correct order based on `depends_on`
 - **SQLite persistence** — Deployment history and stack config survive restarts

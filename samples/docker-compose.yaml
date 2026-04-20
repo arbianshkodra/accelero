@@ -5,23 +5,38 @@
 # will substitute ${VAR} references from the .env next to this file before
 # parsing, exactly like docker-compose.
 #
-# See docs/usage-overview.md#variable-interpolation-env-file for the full
-# syntax (defaults, required vars, escapes).
+# It intentionally exercises the whole zero-downtime story in one file:
+#   * `web` runs N replicas behind Caddy with only `expose:` (no host port)
+#   * `proxy` is the only thing binding the host port — it never rolls
+#   * on an image bump of `web`, Accelero replaces one replica at a time
+#     while Caddy keeps serving from whichever are healthy
+#
+# See docs/usage-overview.md#replicas for the full pattern, and the
+# README.md next to this file for a scripted zero-downtime proof.
 
 services:
   web:
-    image: ${NGINX_TAG:-nginx:1.27.1}
+    image: ${NGINX_TAG:-nginx:1.27.1-alpine}
     restart: always
     networks:
       - app
+    # wget is present on alpine nginx images; curl is NOT (neither on
+    # the debian-based ones).  --spider makes wget not save output.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost"]
-      interval: 10s
-      timeout: 10s
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 5s
+      timeout: 2s
       retries: 3
+      start_period: 2s
+    deploy:
+      replicas: ${WEB_REPLICAS:-3}
 
   proxy:
     image: caddy:${CADDY_TAG:?CADDY_TAG is required}
+    # --to web:80 — Docker's embedded DNS resolves `web` to whichever
+    # replicas are currently running.  Caddy re-resolves the upstream
+    # on connection failures, so replicas coming/going during a deploy
+    # don't need any proxy-side config change.
     command: ["caddy", "reverse-proxy", "--from", ":80", "--to", "web:${WEB_PORT:-80}"]
     ports:
       - "${PUBLIC_PORT:-80}:80"
