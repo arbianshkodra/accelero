@@ -61,6 +61,7 @@ type composeFile struct {
 	Version  string                            `yaml:"version"`
 	Services map[string]service.ComposeService `yaml:"services"`
 	Networks map[string]network.ComposeNetwork `yaml:"networks,omitempty"`
+	Volumes  map[string]service.ComposeVolume  `yaml:"volumes,omitempty"`
 }
 
 // stackLoop holds the cancellation handle for a single per-stack goroutine.
@@ -309,7 +310,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 	}
 
 	// ---- 1. Clone the repository (shallow) and parse the compose file ----
-	desiredServices, desiredNetworks, err := r.fetchDesiredState(ctx, stack)
+	desiredServices, desiredNetworks, desiredVolumes, err := r.fetchDesiredState(ctx, stack)
 	if err != nil {
 		return nil, fmt.Errorf("fetch desired state: %w", err)
 	}
@@ -450,19 +451,63 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 		}
 	}
 
+	// ---- 6. Check volume drift (declared named volumes that don't exist) ----
+	if len(desiredVolumes) > 0 {
+		volRes, volErr := r.docker.VolumeList(ctx, client.VolumeListOptions{})
+		if volErr == nil {
+			existingSet := make(map[string]bool, len(volRes.Items))
+			for _, v := range volRes.Items {
+				existingSet[v.Name] = true
+			}
+			for logicalName, cfg := range desiredVolumes {
+				actualName := resolveDriftVolumeName(stack.Name, logicalName, cfg)
+				if !existingSet[actualName] {
+					driftType := "missing"
+					msg := fmt.Sprintf("volume %q is defined in compose but does not exist on host", actualName)
+					if cfg.External {
+						driftType = "missing_external"
+						msg = fmt.Sprintf("external volume %q is declared but does not exist on host", actualName)
+					}
+					report.Drifts = append(report.Drifts, DriftItem{
+						ServiceName: "(volume)",
+						Type:        driftType,
+						Expected:    actualName,
+						Message:     msg,
+					})
+				}
+			}
+		} else {
+			logctx.FromContext(ctx).WithError(volErr).Warn("could not list Docker volumes for drift check")
+		}
+	}
+
 	report.HasDrift = len(report.Drifts) > 0
 	return report, nil
 }
 
+// resolveDriftVolumeName mirrors the deployer's scoping rule so the reconciler
+// compares against the same names the deployer would create.  Kept separate
+// from the deployer to avoid an import cycle; the rule is intentionally
+// simple so drift stays synchronous with deploy behaviour.
+func resolveDriftVolumeName(stackName, logicalName string, cfg service.ComposeVolume) string {
+	if cfg.Name != "" {
+		return cfg.Name
+	}
+	if cfg.External {
+		return logicalName
+	}
+	return fmt.Sprintf("accelero_%s_%s", stackName, logicalName)
+}
+
 // fetchDesiredState clones the stack repository (shallow, depth=1) and parses
-// the compose file. It returns the desired services and networks, and always
-// cleans up the temporary directory.
+// the compose file. It returns the desired services, networks, and volumes,
+// and always cleans up the temporary directory.
 func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) (
-	map[string]service.ComposeService, map[string]network.ComposeNetwork, error,
+	map[string]service.ComposeService, map[string]network.ComposeNetwork, map[string]service.ComposeVolume, error,
 ) {
 	tmpDir, err := secureTempDir(stack.ID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create temp dir: %w", err)
+		return nil, nil, nil, fmt.Errorf("create temp dir: %w", err)
 	}
 	defer func() {
 		if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
@@ -486,33 +531,33 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 
 	_, err = gogit.PlainCloneContext(ctx, tmpDir, false, cloneOpts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("git clone: %w", err)
+		return nil, nil, nil, fmt.Errorf("git clone: %w", err)
 	}
 
 	// Read and parse compose file.
 	composePath := filepath.Join(tmpDir, stack.ComposePath)
 	data, err := os.ReadFile(composePath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read compose file %s: %w", stack.ComposePath, err)
+		return nil, nil, nil, fmt.Errorf("read compose file %s: %w", stack.ComposePath, err)
 	}
 
 	// Apply .env interpolation — same preprocessing the deployer uses so the
 	// drift check compares actual state against the *substituted* desired state.
 	envVars, _, err := loadDotEnv(tmpDir, composePath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	expanded, err := compose.ExpandBytes(data, envVars)
 	if err != nil {
-		return nil, nil, fmt.Errorf("interpolate compose file: %w", err)
+		return nil, nil, nil, fmt.Errorf("interpolate compose file: %w", err)
 	}
 
 	var cf composeFile
 	if err := yaml.Unmarshal(expanded, &cf); err != nil {
-		return nil, nil, fmt.Errorf("parse compose file: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse compose file: %w", err)
 	}
 
-	return cf.Services, cf.Networks, nil
+	return cf.Services, cf.Networks, cf.Volumes, nil
 }
 
 // loadDotEnv looks for a .env next to the compose file, then at the repo root.
