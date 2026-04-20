@@ -9,6 +9,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
@@ -122,11 +123,21 @@ func TestTopologicalSort_NoDependencies(t *testing.T) {
 	assert.Equal(t, expectedSorted, sortedCopy)
 }
 
+// deps builds a service.Dependencies out of a short list of service names
+// using the default condition — keeps the topo-sort tests readable.
+func deps(names ...string) service.Dependencies {
+	out := make(service.Dependencies, len(names))
+	for _, n := range names {
+		out[n] = service.DependencyConfig{Condition: service.DependencyConditionStarted}
+	}
+	return out
+}
+
 func TestTopologicalSort_LinearChain(t *testing.T) {
 	// A depends on B, B depends on C  =>  order should be C, B, A.
 	services := map[string]service.ComposeService{
-		"A": {Image: "a", DependsOn: []string{"B"}},
-		"B": {Image: "b", DependsOn: []string{"C"}},
+		"A": {Image: "a", DependsOn: deps("B")},
+		"B": {Image: "b", DependsOn: deps("C")},
 		"C": {Image: "c"},
 	}
 	targets := []string{"A", "B", "C"}
@@ -139,9 +150,9 @@ func TestTopologicalSort_LinearChain(t *testing.T) {
 func TestTopologicalSort_Diamond(t *testing.T) {
 	// A -> B, A -> C, B -> D, C -> D  =>  D first, A last.
 	services := map[string]service.ComposeService{
-		"A": {Image: "a", DependsOn: []string{"B", "C"}},
-		"B": {Image: "b", DependsOn: []string{"D"}},
-		"C": {Image: "c", DependsOn: []string{"D"}},
+		"A": {Image: "a", DependsOn: deps("B", "C")},
+		"B": {Image: "b", DependsOn: deps("D")},
+		"C": {Image: "c", DependsOn: deps("D")},
 		"D": {Image: "d"},
 	}
 	targets := []string{"A", "B", "C", "D"}
@@ -163,8 +174,8 @@ func TestTopologicalSort_Diamond(t *testing.T) {
 
 func TestTopologicalSort_CircularDependency(t *testing.T) {
 	services := map[string]service.ComposeService{
-		"A": {Image: "a", DependsOn: []string{"B"}},
-		"B": {Image: "b", DependsOn: []string{"A"}},
+		"A": {Image: "a", DependsOn: deps("B")},
+		"B": {Image: "b", DependsOn: deps("A")},
 	}
 	targets := []string{"A", "B"}
 
@@ -176,8 +187,8 @@ func TestTopologicalSort_CircularDependency(t *testing.T) {
 func TestTopologicalSort_TransitiveDepsIncluded(t *testing.T) {
 	// Target is only A, but A -> B -> C, so B and C must also be included.
 	services := map[string]service.ComposeService{
-		"A": {Image: "a", DependsOn: []string{"B"}},
-		"B": {Image: "b", DependsOn: []string{"C"}},
+		"A": {Image: "a", DependsOn: deps("B")},
+		"B": {Image: "b", DependsOn: deps("C")},
 		"C": {Image: "c"},
 	}
 	targets := []string{"A"}
@@ -339,7 +350,8 @@ services:
 	assert.Len(t, cf.Services, 2)
 	assert.Equal(t, "nginx:latest", cf.Services["web"].Image)
 	assert.Equal(t, "myapi:v1", cf.Services["api"].Image)
-	assert.Equal(t, []string{"web"}, cf.Services["api"].DependsOn)
+	require.Len(t, cf.Services["api"].DependsOn, 1)
+	assert.Equal(t, service.DependencyConditionStarted, cf.Services["api"].DependsOn["web"].Condition)
 }
 
 func TestReadComposeFile_DefaultPath(t *testing.T) {
@@ -602,6 +614,56 @@ func TestReadComposeFile_SimpleFieldBundle(t *testing.T) {
 	if assert.NotNil(t, svc.Init) {
 		assert.True(t, *svc.Init)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// depends_on: long-form with conditions parses + topo-sorts correctly.
+// ---------------------------------------------------------------------------
+
+func TestReadComposeFile_DependsOnLongForm(t *testing.T) {
+	dir := t.TempDir()
+	compose := `services:
+  app:
+    image: my/app:1.0
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+  db:
+    image: postgres:16
+  migrate:
+    image: my/migrate:1.0
+    depends_on:
+      - db
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.NoError(t, err)
+
+	app := cf.Services["app"]
+	require.Len(t, app.DependsOn, 2)
+	assert.Equal(t, service.DependencyConditionHealthy, app.DependsOn["db"].Condition)
+	assert.Equal(t, service.DependencyConditionCompletedOK, app.DependsOn["migrate"].Condition)
+
+	// migrate uses the short form; condition should default to service_started.
+	migrate := cf.Services["migrate"]
+	require.Len(t, migrate.DependsOn, 1)
+	assert.Equal(t, service.DependencyConditionStarted, migrate.DependsOn["db"].Condition)
+
+	// Topological sort still produces a valid order: db before migrate,
+	// both before app.
+	order, err := topologicalSort([]string{"app", "db", "migrate"}, cf.Services)
+	assert.NoError(t, err)
+	indexOf := map[string]int{}
+	for i, s := range order {
+		indexOf[s] = i
+	}
+	assert.Less(t, indexOf["db"], indexOf["migrate"])
+	assert.Less(t, indexOf["db"], indexOf["app"])
+	assert.Less(t, indexOf["migrate"], indexOf["app"])
 }
 
 // ---------------------------------------------------------------------------

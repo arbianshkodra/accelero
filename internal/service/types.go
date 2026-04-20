@@ -27,7 +27,7 @@ type ComposeService struct {
 	Labels      map[string]string `yaml:"labels,omitempty"`
 	HealthCheck HealthCheck       `yaml:"healthcheck,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
-	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	DependsOn   Dependencies      `yaml:"depends_on,omitempty"`
 	Restart     string            `yaml:"restart,omitempty"`
 	MemLimit    string            `yaml:"mem_limit,omitempty"`
 	CPULimit    string            `yaml:"cpu_limit,omitempty"`
@@ -183,6 +183,82 @@ func (t *Tmpfs) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return nil
 	}
 	return fmt.Errorf("tmpfs must be a string, list, or map")
+}
+
+// Dependency condition constants, matching docker-compose's vocabulary.
+const (
+	DependencyConditionStarted           = "service_started"
+	DependencyConditionHealthy           = "service_healthy"
+	DependencyConditionCompletedOK       = "service_completed_successfully"
+)
+
+// DependencyConfig holds the per-dependency long-form options.
+// Only Condition is acted on today; Required and Restart are parsed for
+// forward-compat but currently do not change deploy behaviour.
+type DependencyConfig struct {
+	Condition string `yaml:"condition,omitempty"`
+	Required  *bool  `yaml:"required,omitempty"`
+	Restart   bool   `yaml:"restart,omitempty"`
+}
+
+// Dependencies accepts both compose forms:
+//
+//	depends_on:
+//	  - db
+//	  - redis
+//
+//	depends_on:
+//	  db:
+//	    condition: service_healthy
+//	  redis:
+//	    condition: service_started
+//
+// The short form is normalised to a map with the default condition
+// (service_started), so downstream consumers only see one shape.
+type Dependencies map[string]DependencyConfig
+
+func (d *Dependencies) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Try the short-form list first.
+	var list []string
+	if err := unmarshal(&list); err == nil {
+		*d = make(Dependencies, len(list))
+		for _, name := range list {
+			(*d)[name] = DependencyConfig{Condition: DependencyConditionStarted}
+		}
+		return nil
+	}
+
+	// Try the long-form map.
+	var raw map[string]DependencyConfig
+	if err := unmarshal(&raw); err == nil {
+		out := make(Dependencies, len(raw))
+		for name, cfg := range raw {
+			if cfg.Condition == "" {
+				cfg.Condition = DependencyConditionStarted
+			}
+			out[name] = cfg
+		}
+		*d = out
+		return nil
+	}
+
+	return fmt.Errorf("depends_on must be a list of service names or a map of name -> config")
+}
+
+// Names returns the dependency names in deterministic (sorted) order so
+// topological-sort output is reproducible across runs.
+func (d Dependencies) Names() []string {
+	names := make([]string, 0, len(d))
+	for name := range d {
+		names = append(names, name)
+	}
+	// Sort for determinism.
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j-1] > names[j]; j-- {
+			names[j-1], names[j] = names[j], names[j-1]
+		}
+	}
+	return names
 }
 
 type HealthCheck struct {
