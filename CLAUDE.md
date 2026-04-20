@@ -110,8 +110,9 @@ Optional:
 - `LOG_FORMAT`: Log format — "json" or "text" (default: text)
 - `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)
 - `QUEUE_SIZE`: Task queue buffer size override (default: 15 * workers, min: 50, max: 1000)
-- `STATUS_CLEANUP_INTERVAL`: Deployment record cleanup interval (default: 1h)
+- `STATUS_CLEANUP_INTERVAL`: Deployment record cleanup interval (default: 1h) — shared with audit cleanup
 - `STATUS_MAX_AGE`: Max deployment record age (default: 24h)
+- `AUDIT_MAX_AGE`: Max audit entry age before cleanup (default: 90 days). Set to `0` to disable retention (useful for compliance contexts that require indefinite retention)
 
 Legacy (backward-compatible, auto-creates "default" stack):
 - `REPO_URL`, `REPO_USERNAME`, `REPO_TOKEN`, `REPO_BRANCH`, `COMPOSE_PATH`
@@ -150,7 +151,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 **Audit log (append-only):**
 - `GET /api/v1/audit` — filters: stack (id or name), actor, operation, since (Go duration), limit (≤1000). Newest first. Immutable at the store layer — no write/update/delete path.
 - Entries emitted today: stack.create/update/delete (actor api-key); deploy.start (api-key, in_progress); deploy.complete/failed/rolled_back (system:deployer, with duration + changes metadata); drift.detected (system:reconciler, one per cycle with drift, per-type counts in metadata); drift.auto_deployed (system:reconciler, when auto-deploy fires).
-- Retention: no automatic cleanup yet — planned as a follow-up alongside the existing deployment-history cleanup.
+- Retention: time-based cleanup on the existing deployment-cleanup cadence. Keep 90 days by default (`AUDIT_MAX_AGE`); set to 0 to disable.
 
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
