@@ -120,6 +120,15 @@ curl http://localhost:8000/api/v1/stacks/{id-or-name}/drift \
 
 Returns a drift report showing any differences between the desired state (git) and actual state (Docker).
 
+### Preview a Deployment
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stacks/{id-or-name}/preview \
+  -H "X-API-KEY: your-secure-key"
+```
+
+Dry-run the next deploy: Accelero runs the same drift check as `/drift` and translates each difference into the action a real deploy would take (`create`, `recreate`, `restart`, `remove`, `error`). No containers are touched — handy for PR review, CI gates, and "what's about to happen" checks before hitting `/deploy`. See the [API reference](api-reference.md#preview-deployment) for the full response shape and action taxonomy.
+
 ## Deployment Strategies
 
 Accelero supports three ways to trigger deployments. You can use any combination.
@@ -199,6 +208,32 @@ When a deployment is triggered (via API, webhook, or reconciliation), Accelero:
     - Removes the old container
 9. **Rolls back** on failure using the captured pre-deployment state
 10. **Records** the deployment in SQLite
+
+## Observability
+
+### Prometheus metrics
+
+Accelero exposes a Prometheus-format metrics endpoint at `GET /metrics` (no authentication — Prometheus scrape convention; metrics never contain payloads or secrets). Scrape it the usual way:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: accelero
+    static_configs:
+      - targets: ['accelero.internal:8000']
+```
+
+Useful metrics out of the box:
+
+- `accelero_deployments_total{stack,trigger,status}` — how many deploys, broken out by outcome
+- `accelero_deployment_duration_seconds` — histogram of deploy latency
+- `accelero_drift_detected_total{stack,type}` — drift items observed by the reconciler (preview calls intentionally do not count here)
+- `accelero_reconcile_cycles_total{stack}` — reconciler activity per stack
+- `accelero_http_requests_total{method,path,status}` — HTTP traffic; `path` uses route templates (`/api/v1/stacks/{id}`) to keep cardinality bounded
+- `accelero_stacks{status}` — gauge of stacks in each lifecycle state
+- `accelero_reconciler_loops` — gauge of active reconciler goroutines
+
+Standard `go_*` / `process_*` collectors are included for runtime health. The full list, including label cardinality notes, lives in the [API reference](api-reference.md#metrics).
 
 ## Variable Interpolation (`.env` file)
 

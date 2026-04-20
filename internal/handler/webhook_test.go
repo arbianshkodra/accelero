@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
@@ -183,4 +184,100 @@ func TestCreateStackValidation(t *testing.T) {
 	router.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Preview endpoint
+// ---------------------------------------------------------------------------
+
+func TestDriftToAction(t *testing.T) {
+	cases := []struct {
+		name       string
+		drift      reconciler.DriftItem
+		wantAction string
+	}{
+		{
+			name:       "missing service -> create",
+			drift:      reconciler.DriftItem{Type: "missing", ServiceName: "web", Expected: "nginx:1.27"},
+			wantAction: "create",
+		},
+		{
+			name:       "image mismatch -> recreate",
+			drift:      reconciler.DriftItem{Type: "image_mismatch", ServiceName: "api", Expected: "api:v2", Actual: "api:v1"},
+			wantAction: "recreate",
+		},
+		{
+			name:       "stopped -> restart",
+			drift:      reconciler.DriftItem{Type: "stopped", ServiceName: "db"},
+			wantAction: "restart",
+		},
+		{
+			name:       "unhealthy -> restart",
+			drift:      reconciler.DriftItem{Type: "unhealthy", ServiceName: "worker"},
+			wantAction: "restart",
+		},
+		{
+			name:       "extra -> remove",
+			drift:      reconciler.DriftItem{Type: "extra", ServiceName: "orphan"},
+			wantAction: "remove",
+		},
+		{
+			name:       "missing_external -> error",
+			drift:      reconciler.DriftItem{Type: "missing_external", ServiceName: "(volume)"},
+			wantAction: "error",
+		},
+		{
+			name:       "unknown drift type -> inspect",
+			drift:      reconciler.DriftItem{Type: "something_new", ServiceName: "web"},
+			wantAction: "inspect",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := driftToAction(tc.drift)
+			assert.Equal(t, tc.wantAction, got.Action)
+			assert.Equal(t, tc.drift.ServiceName, got.ServiceName)
+			assert.Equal(t, tc.drift.Expected, got.Expected)
+			assert.Equal(t, tc.drift.Actual, got.Actual)
+		})
+	}
+}
+
+func TestPreviewDeploy_ReconcilerUnavailable(t *testing.T) {
+	// Handler returns 503 when no reconciler is wired — exercises the route
+	// registration and verifies the happy-path branches haven't been
+	// accidentally demoted.
+	now := time.Now()
+	ms := &mockStore{
+		stacks: []*store.Stack{
+			{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+		},
+	}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}} // no Reconciler
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/demo/preview", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+}
+
+func TestPreviewDeploy_StackNotFound(t *testing.T) {
+	ms := &mockStore{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/nope/preview", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
 }

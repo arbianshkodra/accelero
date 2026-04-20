@@ -13,6 +13,7 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/config"
 	"github.com/arbianshkodra/accelero/internal/handler"
+	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/service"
@@ -97,6 +98,12 @@ func main() {
 
 	// 10. Set up HTTP server.
 	r := mux.NewRouter()
+	r.Use(middleware.Metrics)
+
+	// /metrics is exposed unauthenticated — this is the convention Prometheus
+	// scrapers rely on.  No secrets leak; Accelero metrics describe rates and
+	// durations, never payload contents.
+	r.Handle("/metrics", metrics.Handler()).Methods("GET")
 
 	h := &handler.Handler{
 		Store:      db,
@@ -106,6 +113,13 @@ func main() {
 
 	// Register all routes — handler applies auth middleware where needed.
 	h.RegisterRoutes(r, middleware.APIKeyAuth)
+
+	// Start the stack-gauge refresher; inexpensive enough to run every 15s.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		refreshStackGauges(ctx, db)
+	}()
 
 	server := &http.Server{
 		Addr:    ":" + cfg.ServerPort,
@@ -251,4 +265,35 @@ func generateBootstrapID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// refreshStackGauges refreshes the accelero_stacks gauge on a 15-second
+// cadence.  Cheap to compute (one store query), and it means the /metrics
+// endpoint always returns a fresh snapshot without cramming a DB query into
+// the scrape handler.
+func refreshStackGauges(ctx context.Context, db store.Store) {
+	tick := func() {
+		stacks, err := db.ListStacks()
+		if err != nil {
+			return
+		}
+		counts := map[string]int{}
+		for _, s := range stacks {
+			counts[s.Status]++
+		}
+		metrics.SetStackCounts(counts)
+	}
+
+	tick() // populate immediately so scrapes right after boot have data
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tick()
+		}
+	}
 }

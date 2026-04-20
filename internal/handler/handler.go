@@ -61,6 +61,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/deploy", h.DeployStack).Methods("POST")
 	api.HandleFunc("/stacks/{id}/deployments", h.ListDeployments).Methods("GET")
 	api.HandleFunc("/stacks/{id}/drift", h.CheckDrift).Methods("GET")
+	api.HandleFunc("/stacks/{id}/preview", h.PreviewDeploy).Methods("POST")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -360,6 +361,93 @@ func (h *Handler) CheckDrift(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, report, http.StatusOK)
+}
+
+// PreviewAction describes what Accelero would do to a single service if
+// deploy were triggered right now.
+type PreviewAction struct {
+	ServiceName string `json:"service_name"`
+	Action      string `json:"action"` // create, recreate, restart, no_change
+	Reason      string `json:"reason,omitempty"`
+	Expected    string `json:"expected,omitempty"`
+	Actual      string `json:"actual,omitempty"`
+}
+
+// PreviewReport is what POST /stacks/{id}/preview returns.  It is a thin
+// layer over the reconciler's drift report: each drift item becomes an
+// "action" the deploy would take, and clean services (no drift) are
+// reported as no_change so operators can see the full plan.
+type PreviewReport struct {
+	StackID    string          `json:"stack_id"`
+	StackName  string          `json:"stack_name"`
+	CheckedAt  time.Time       `json:"checked_at"`
+	HasChanges bool            `json:"has_changes"`
+	Actions    []PreviewAction `json:"actions"`
+}
+
+// PreviewDeploy returns what the next deploy would change without actually
+// touching the Docker host.  It uses the same clone + interpolate + parse
+// pipeline as a real deploy, then maps drift items to per-service actions.
+func (h *Handler) PreviewDeploy(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	stack, err := h.Store.GetStack(id)
+	if err != nil || stack == nil {
+		stack, _ = h.Store.GetStackByName(id)
+	}
+	if stack == nil {
+		writeError(w, "stack not found", http.StatusNotFound)
+		return
+	}
+
+	if h.Reconciler == nil {
+		writeError(w, "reconciler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	driftReport, err := h.Reconciler.CheckDrift(r.Context(), stack)
+	if err != nil {
+		writeError(w, fmt.Sprintf("preview failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	preview := &PreviewReport{
+		StackID:    driftReport.StackID,
+		StackName:  driftReport.StackName,
+		CheckedAt:  driftReport.CheckedAt,
+		HasChanges: driftReport.HasDrift,
+		Actions:    make([]PreviewAction, 0, len(driftReport.Drifts)),
+	}
+
+	for _, d := range driftReport.Drifts {
+		preview.Actions = append(preview.Actions, driftToAction(d))
+	}
+
+	writeJSON(w, preview, http.StatusOK)
+}
+
+// driftToAction maps a drift item to the deploy action it would trigger.
+func driftToAction(d reconciler.DriftItem) PreviewAction {
+	a := PreviewAction{
+		ServiceName: d.ServiceName,
+		Expected:    d.Expected,
+		Actual:      d.Actual,
+		Reason:      d.Message,
+	}
+	switch d.Type {
+	case "missing":
+		a.Action = "create"
+	case "image_mismatch":
+		a.Action = "recreate"
+	case "stopped", "unhealthy":
+		a.Action = "restart"
+	case "extra":
+		a.Action = "remove"
+	case "missing_external":
+		a.Action = "error" // external volume isn't Accelero's to create
+	default:
+		a.Action = "inspect" // unknown drift type — surface for human review
+	}
+	return a
 }
 
 // --------------------------------------------------------------------------

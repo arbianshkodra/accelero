@@ -188,6 +188,51 @@ Performs a one-off drift check comparing the desired state (git compose file) ag
 
 ---
 
+### Preview Deployment
+`POST /api/v1/stacks/{id}/preview`
+
+Runs the same drift check as `/drift` and translates each drift item into the action the next deployment would take. No containers are touched — this is a read-only "what would happen if I deployed right now" endpoint, useful for PR review flows and pre-deploy sanity checks.
+
+**Response:** `200 OK`
+```json
+{
+  "stack_id": "a1b2c3d4...",
+  "stack_name": "my-app",
+  "checked_at": "2025-01-15T12:05:00Z",
+  "has_changes": true,
+  "actions": [
+    {
+      "service_name": "web",
+      "action": "recreate",
+      "reason": "container abc123 has image nginx:1.27.2, expected nginx:1.27.3",
+      "expected": "nginx:1.27.3",
+      "actual": "nginx:1.27.2"
+    },
+    {
+      "service_name": "worker",
+      "action": "create",
+      "reason": "service worker is defined in compose but has no running container",
+      "expected": "myapp-worker:latest"
+    }
+  ]
+}
+```
+
+**Action types:**
+
+| Action | Triggered by | Meaning |
+|--------|--------------|---------|
+| `create` | `missing` | New container will be started |
+| `recreate` | `image_mismatch` | Existing container will be replaced |
+| `restart` | `stopped`, `unhealthy` | Existing container will be restarted |
+| `remove` | `extra` | Unmanaged container will be stopped/removed |
+| `error` | `missing_external` | Deploy will fail — external resource (e.g. `external: true` volume) is absent |
+| `inspect` | _unknown_ | Future drift type not yet mapped; deploy will still attempt to converge |
+
+**Errors:** `404 Not Found` if the stack doesn't exist; `503 Service Unavailable` if the reconciler is not wired (indicates a misconfigured server).
+
+---
+
 ## Legacy Webhook
 
 ### Trigger Webhook
@@ -240,6 +285,30 @@ Returns a summary of all stacks.
   "total": 1
 }
 ```
+
+---
+
+### Metrics
+`GET /metrics`
+
+**No authentication required** (Prometheus convention — scrape targets are unauthenticated, and Accelero's metrics never contain payloads or secrets).
+
+Returns Prometheus exposition format with counters, histograms, and gauges for deployments, drift, HTTP traffic, and reconciler state. Use it as a scrape target in `prometheus.yml`.
+
+**Key metrics:**
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `accelero_deployments_total` | counter | `stack`, `trigger`, `status` | Deployments observed, broken out by outcome |
+| `accelero_deployment_duration_seconds` | histogram | `stack`, `trigger`, `status` | End-to-end deploy duration |
+| `accelero_drift_detected_total` | counter | `stack`, `type` | Drift items seen by the reconciler |
+| `accelero_reconcile_cycles_total` | counter | `stack` | Reconcile cycles that actually ran |
+| `accelero_http_requests_total` | counter | `method`, `path`, `status` | HTTP traffic; `path` is the mux route template to keep cardinality bounded |
+| `accelero_http_request_duration_seconds` | histogram | `method`, `path`, `status` | HTTP latency |
+| `accelero_stacks` | gauge | `status` | Stacks currently in each lifecycle state |
+| `accelero_reconciler_loops` | gauge | — | Reconciler goroutines currently running |
+
+Standard `process_*` and `go_*` collectors are also exposed.
 
 ---
 
