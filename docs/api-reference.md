@@ -450,6 +450,37 @@ websocat \
 
 ---
 
+### Restart a Container
+`POST /api/v1/stacks/{id}/containers/{cid}/restart`
+
+Restart a single managed container. This is the first mutating debug endpoint — it bypasses the GitOps flow (no compose change, no deployment record) but is always audited.
+
+**When to use it:** sparingly. Valid cases are "stuck process, give it another kick" and "temporarily cleared a wedged state for diagnosis." For anything that changes desired state — image tags, replica counts, config — commit to git and redeploy.
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `t` | integer seconds | Docker default (10s) | Grace period before SIGKILL. `-1` waits forever, `0` kills immediately. |
+
+**Response:** `202 Accepted`
+```json
+{
+  "status": "accepted",
+  "container_id": "25a7ef422c8e..."
+}
+```
+
+The 202 reflects that Docker has *received* the restart command and begun stop/start — the container may still be transitioning when the response lands. Poll `/containers/{cid}` to see the new state once the transition completes.
+
+Same stack-membership verification as the other container endpoints: a cid from a different stack returns `404 Not Found` and no Docker call is issued.
+
+**Audit.** Every call writes one `container.restart` audit entry regardless of outcome (success or daemon error). The entry carries actor = `api-key`, resource_id = container ID, request_id (for log correlation), and metadata with the service name, replica index, and timeout if supplied.
+
+**Errors:** `400 Bad Request` for malformed `t`; `404 Not Found` for missing / foreign-stack container; `500 Internal Server Error` when the Docker daemon refuses the operation (audit entry still written, with `outcome: failure` and the error message); `503 Service Unavailable` when Docker introspection isn't configured.
+
+---
+
 ### Stream Events
 `GET /api/v1/stacks/{id}/events`
 

@@ -127,4 +127,10 @@ const (
 	AuditOpDeployRolledBack  = "deploy.rolled_back"
 	AuditOpDriftDetected     = "drift.detected"
 	AuditOpDriftAutoDeployed = "drift.auto_deployed"
+	// Operator actions that bypass the GitOps flow. Always audited so
+	// the trail captures "someone did something imperative here" even
+	// though the action itself may not change desired state (restart)
+	// or may deliberately override it (exec, volume write — not shipped
+	// yet).
+	AuditOpContainerRestart = "container.restart"
 )
