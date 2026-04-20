@@ -35,6 +35,17 @@ type Config struct {
 	// Database
 	DatabasePath string
 
+	// StacksDataDir is where cloned gitops repos are kept per stack:
+	//   <StacksDataDir>/<stack_id>/repo/
+	// Unlike the old /tmp-based clone, this dir is NOT deleted after a
+	// successful deploy — compose services that bind-mount files from the
+	// repo (e.g. `./Caddyfile:/etc/caddy/Caddyfile`) need a stable path.
+	// For the same reason, when Accelero itself runs in a container this
+	// path must exist at the *same* absolute location on the host and
+	// inside the container; otherwise Docker (running on the host) will
+	// look up the bind-mount source at the wrong place.
+	StacksDataDir string
+
 	// Legacy mode: if these are set, a default stack is auto-created on first run
 	LegacyRepoURL      string
 	LegacyRepoUsername  string
@@ -56,6 +67,7 @@ func Load() (*Config, error) {
 		LogLevel:              envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:             envOrDefault("LOG_FORMAT", "text"),
 		DatabasePath:          envOrDefault("DATABASE_PATH", "./data/accelero.db"),
+		StacksDataDir:         envOrDefault("STACKS_DATA_DIR", "./data/stacks"),
 		StatusCleanupInterval: parseDurationOrDefault("STATUS_CLEANUP_INTERVAL", 1*time.Hour),
 		StatusMaxAge:          parseDurationOrDefault("STATUS_MAX_AGE", 24*time.Hour),
 

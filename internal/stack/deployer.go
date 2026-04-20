@@ -69,18 +69,47 @@ type Deployer struct {
 	cli   *client.Client
 	store store.Store
 
+	// stacksDir is the root under which each stack's cloned repo lives:
+	//   <stacksDir>/<stack_id>/repo/
+	// The clone is persisted across deploys so compose bind-mounts that
+	// reference files in the repo (e.g. `./Caddyfile`) keep working.
+	stacksDir string
+
 	// Per-service mutex prevents concurrent deploys of the same service.
 	serviceMu   sync.Mutex
 	serviceLocks map[string]*sync.Mutex
 }
 
-// NewDeployer creates a Deployer with the given Docker client and store.
-func NewDeployer(cli *client.Client, s store.Store) *Deployer {
+// NewDeployer creates a Deployer with the given Docker client, store, and
+// stable stacks-data directory. The stacks-data directory is created
+// lazily during the first deploy.
+func NewDeployer(cli *client.Client, s store.Store, stacksDir string) *Deployer {
 	return &Deployer{
 		cli:          cli,
 		store:        s,
+		stacksDir:    stacksDir,
 		serviceLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// CleanupStackData removes a stack's cloned-repo directory.  Called by the
+// handler's DeleteStack after the DB record is removed so orphan clones
+// don't pile up. A missing directory is not an error — stack may have had
+// no deploys yet.
+func (d *Deployer) CleanupStackData(stackID string) error {
+	if d.stacksDir == "" {
+		return nil
+	}
+	path := filepath.Join(d.stacksDir, stackID)
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("remove stack data dir %q: %w", path, err)
+	}
+	return nil
+}
+
+// stackRepoDir returns the per-stack clone path.
+func (d *Deployer) stackRepoDir(stackID string) string {
+	return filepath.Join(d.stacksDir, stackID, "repo")
 }
 
 // lockService returns a per-service mutex, creating one if it does not yet exist.
@@ -180,16 +209,14 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deployment *store.Deployment) error {
 	log := logctx.FromContext(ctx)
 
-	// 1. Clone repository (shallow, depth=1).
+	// 1. Clone repository (shallow, depth=1) into the stable per-stack dir.
+	//    The directory persists after this deploy returns — compose bind
+	//    mounts that reference files in the repo rely on that stable path.
+	//    Cleanup happens on stack delete via CleanupStackData.
 	repoDir, gitCommit, err := d.cloneRepo(ctx, stack)
 	if err != nil {
 		return fmt.Errorf("git clone failed: %w", err)
 	}
-	defer func() {
-		if removeErr := os.RemoveAll(repoDir); removeErr != nil {
-			log.WithError(removeErr).Warn("Failed to clean up repo directory")
-		}
-	}()
 
 	deployment.GitCommit = gitCommit
 	stack.GitCommit = gitCommit
@@ -253,9 +280,16 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 			continue
 		}
 
-		// Rewrite volume references to use the resolved (possibly scoped)
-		// volume name before we build the container's HostConfig.Binds.
-		svc.Volumes = rewriteVolumeRefs(svc.Volumes, volumeNameMap)
+		// Rewrite relative bind-mount source paths (e.g. `./Caddyfile`)
+		// to absolute paths inside the cloned repo dir, so Docker — which
+		// resolves bind-mount sources against the host — can find them.
+		// Must run BEFORE rewriteVolumeRefs so the named-volume path sees
+		// canonical inputs.
+		rewritten, err := rewriteBindMountPaths(svc.Volumes, repoDir)
+		if err != nil {
+			return fmt.Errorf("service %s: %w", svcName, err)
+		}
+		svc.Volumes = rewriteVolumeRefs(rewritten, volumeNameMap)
 
 		mu := d.lockService(svcName)
 		mu.Lock()
@@ -290,16 +324,25 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 // Git operations
 // --------------------------------------------------------------------------
 
-// cloneRepo performs a shallow clone of the stack's repository and returns the
-// temporary directory, the HEAD commit hash, and any error.
+// cloneRepo performs a shallow clone of the stack's repository into the
+// stable per-stack data dir and returns the directory, the HEAD commit
+// hash, and any error.  If a previous deploy already populated this dir,
+// it is wiped and re-cloned fresh — we treat the clone as an immutable
+// snapshot for this deploy, never a running working tree.
 func (d *Deployer) cloneRepo(ctx context.Context, stack *store.Stack) (string, string, error) {
 	if stack.RepoURL == "" {
 		return "", "", fmt.Errorf("repo_url is empty")
 	}
+	if d.stacksDir == "" {
+		return "", "", fmt.Errorf("stacks data dir is not configured")
+	}
 
-	dir, err := os.MkdirTemp("", "accelero-deploy-*")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create temp dir: %w", err)
+	dir := d.stackRepoDir(stack.ID)
+	if err := os.RemoveAll(dir); err != nil {
+		return "", "", fmt.Errorf("clear previous clone at %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
+		return "", "", fmt.Errorf("create stacks data dir: %w", err)
 	}
 
 	cloneOpts := &gogit.CloneOptions{
@@ -1329,6 +1372,62 @@ func (d *Deployer) verifyExternalVolume(ctx context.Context, name string) error 
 		return fmt.Errorf("external volume does not exist on the host")
 	}
 	return err
+}
+
+// rewriteBindMountPaths walks a service's `volumes:` and rewrites every
+// relative bind-mount source to an absolute path rooted at the cloned
+// repo directory.  Without this pass, Docker (which resolves the source
+// path on the host) would look for `./Caddyfile` relative to the
+// accelero binary's working directory — almost never the right place.
+//
+// Rules (mirror docker-compose semantics):
+//   - Absolute paths (`/etc/foo`)           → passed through unchanged
+//   - Paths that look like named volumes    → passed through unchanged;
+//     resolved later by rewriteVolumeRefs
+//   - Relative paths (`./x`, `../y`, `x.yml`) → prefixed with repoDir
+//   - Any resolved path that escapes repoDir  → deploy fails (security)
+//   - `~` paths are not expanded — matches compose itself.
+//
+// Returning a fresh slice so callers that hold the original aren't mutated.
+func rewriteBindMountPaths(svcVolumes []string, repoDir string) ([]string, error) {
+	if len(svcVolumes) == 0 {
+		return svcVolumes, nil
+	}
+	absRepo, err := filepath.Abs(repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo dir: %w", err)
+	}
+	repoPrefix := absRepo + string(os.PathSeparator)
+
+	out := make([]string, 0, len(svcVolumes))
+	for _, entry := range svcVolumes {
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) < 2 {
+			out = append(out, entry)
+			continue
+		}
+		src, rest := parts[0], parts[1]
+
+		// Named-volume refs: bare identifier, no path separators.
+		// Leave for rewriteVolumeRefs to handle.
+		if !strings.ContainsAny(src, "/.") && !strings.HasPrefix(src, "~") {
+			out = append(out, entry)
+			continue
+		}
+		// Absolute host path: trust the user — this is the escape hatch
+		// for mounting host-managed files like /etc/ssl/certs.
+		if strings.HasPrefix(src, "/") {
+			out = append(out, entry)
+			continue
+		}
+		// Relative path: resolve against the cloned repo dir.
+		resolved := filepath.Clean(filepath.Join(absRepo, src))
+		if resolved != absRepo && !strings.HasPrefix(resolved, repoPrefix) {
+			return nil, fmt.Errorf("bind mount %q resolves outside repo directory (directory traversal blocked)", src)
+		}
+		out = append(out, resolved+":"+rest)
+	}
+	return out, nil
 }
 
 // rewriteVolumeRefs returns a copy of svcVolumes with each compose-level
