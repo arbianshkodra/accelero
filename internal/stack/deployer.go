@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/arbianshkodra/accelero/internal/utils"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	dockernetwork "github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/api/types/registry"
@@ -569,9 +571,9 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
 	log := logctx.FromContext(ctx).WithField("service", serviceName)
 
-	// Pull image.
-	if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
-		return fmt.Errorf("image pull failed: %w", err)
+	// Resolve the image according to svc.PullPolicy.
+	if err := d.resolveImage(ctx, svc, stack, log); err != nil {
+		return err
 	}
 
 	// Find existing containers for this service.
@@ -615,10 +617,11 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 		return fmt.Errorf("failed to create container: %w", err)
 	}
 
+	stopTimeout := stopTimeoutSeconds(svc)
+
 	// Wait for health check.
 	if err := d.waitForHealthy(ctx, containerID); err != nil {
 		// New container is unhealthy -- stop and remove it before returning the error.
-		stopTimeout := 10
 		_, _ = d.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: &stopTimeout})
 		_, _ = d.cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
 		return fmt.Errorf("health check failed for new container %s: %w", containerID[:12], err)
@@ -628,7 +631,6 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 	// Remove old containers only after the new one is confirmed healthy.
 	for _, oldID := range toRemove {
 		log.Infof("Removing old container %s", oldID[:12])
-		stopTimeout := 10
 		if _, err := d.cli.ContainerStop(ctx, oldID, client.ContainerStopOptions{Timeout: &stopTimeout}); err != nil {
 			log.WithError(err).Warnf("Failed to stop old container %s", oldID[:12])
 		}
@@ -643,6 +645,70 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 // --------------------------------------------------------------------------
 // Image pulling
 // --------------------------------------------------------------------------
+
+// resolveImage applies the compose pull_policy to decide whether to pull
+// the image, reuse a local copy, or fail.  Supported policies:
+//
+//	""                — default, same as "always"
+//	"always"          — pull every deploy
+//	"missing" / "if_not_present" — pull only when the image isn't local
+//	"never"           — never pull; fail if the image isn't local
+//	"build"           — rejected: Accelero doesn't build images from Dockerfiles
+func (d *Deployer) resolveImage(ctx context.Context, svc service.ComposeService, stack *store.Stack, log *logrus.Entry) error {
+	policy := strings.ToLower(strings.TrimSpace(svc.PullPolicy))
+
+	switch policy {
+	case "", "always":
+		if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
+			return fmt.Errorf("image pull failed: %w", err)
+		}
+		return nil
+
+	case "missing", "if_not_present":
+		present, err := d.imageIsLocal(ctx, svc.Image)
+		if err != nil {
+			return fmt.Errorf("image lookup failed: %w", err)
+		}
+		if present {
+			log.WithField("image", svc.Image).Info("pull_policy=missing and image is local — skipping pull")
+			return nil
+		}
+		if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
+			return fmt.Errorf("image pull failed: %w", err)
+		}
+		return nil
+
+	case "never":
+		present, err := d.imageIsLocal(ctx, svc.Image)
+		if err != nil {
+			return fmt.Errorf("image lookup failed: %w", err)
+		}
+		if !present {
+			return fmt.Errorf("pull_policy=never but image %q is not present on the host", svc.Image)
+		}
+		log.WithField("image", svc.Image).Info("pull_policy=never — using local image")
+		return nil
+
+	case "build":
+		return fmt.Errorf("pull_policy=build is not supported: Accelero does not build images from Dockerfiles, use a CI pipeline instead")
+
+	default:
+		return fmt.Errorf("unknown pull_policy %q (expected always, missing, if_not_present, never, or build)", svc.PullPolicy)
+	}
+}
+
+// imageIsLocal returns true when the Docker daemon already has the given
+// image reference cached locally.
+func (d *Deployer) imageIsLocal(ctx context.Context, ref string) (bool, error) {
+	_, err := d.cli.ImageInspect(ctx, ref)
+	if err == nil {
+		return true, nil
+	}
+	if cerrdefs.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
 
 // pullImage pulls a Docker image, optionally authenticating with the supplied
 // per-stack registry credentials (not environment variables).
@@ -708,10 +774,24 @@ func (d *Deployer) createAndStartContainer(
 	labels["accelero-stack"] = stackName
 
 	containerConfig := &container.Config{
-		Image:  svc.Image,
-		Env:    envVars,
-		Labels: labels,
-		Cmd:    []string(svc.Command),
+		Image:      svc.Image,
+		Env:        envVars,
+		Labels:     labels,
+		Cmd:        []string(svc.Command),
+		Entrypoint: []string(svc.Entrypoint),
+		WorkingDir: svc.WorkingDir,
+		User:       svc.User,
+		Hostname:   svc.Hostname,
+		Domainname: svc.Domainname,
+		StopSignal: svc.StopSignal,
+	}
+
+	// stop_grace_period -> Config.StopTimeout (seconds, pointer).
+	if svc.StopGracePeriod != "" {
+		if dur := service.ParseDuration(svc.StopGracePeriod); dur > 0 {
+			sec := int(dur.Seconds())
+			containerConfig.StopTimeout = &sec
+		}
 	}
 
 	if svc.HealthCheck.Test != nil {
@@ -726,10 +806,28 @@ func (d *Deployer) createAndStartContainer(
 
 	portBindings, exposedPorts := utils.MapPorts(svc.Ports)
 	containerConfig.ExposedPorts = exposedPorts
+	mergeExposedPorts(containerConfig.ExposedPorts, svc.Expose, log)
 
 	hostConfig := &container.HostConfig{
 		PortBindings: portBindings,
 		Binds:        svc.Volumes,
+		DNS:          parseDNSAddrs(svc.DNS, log),
+		DNSSearch:    []string(svc.DNSSearch),
+		ExtraHosts:   []string(svc.ExtraHosts),
+		CapAdd:       svc.CapAdd,
+		CapDrop:      svc.CapDrop,
+		Privileged:   svc.Privileged,
+		Tmpfs:        map[string]string(svc.Tmpfs),
+		Init:         svc.Init,
+	}
+
+	// shm_size — convert a human-readable string (e.g. "256m") to bytes.
+	if svc.ShmSize != "" {
+		if bytes, parseErr := units.RAMInBytes(svc.ShmSize); parseErr != nil {
+			log.WithError(parseErr).Warnf("Invalid shm_size %q", svc.ShmSize)
+		} else {
+			hostConfig.ShmSize = bytes
+		}
 	}
 
 	if svc.Restart != "" {
@@ -1033,4 +1131,59 @@ func safeName(names []string) string {
 		name = name[1:]
 	}
 	return name
+}
+
+// stopTimeoutSeconds returns the container stop-timeout in seconds, falling
+// back to Docker's default of 10 when the compose service didn't specify
+// `stop_grace_period`.
+func stopTimeoutSeconds(svc service.ComposeService) int {
+	if svc.StopGracePeriod == "" {
+		return 10
+	}
+	d := service.ParseDuration(svc.StopGracePeriod)
+	if d <= 0 {
+		return 10
+	}
+	return int(d.Seconds())
+}
+
+// mergeExposedPorts adds entries from the compose `expose:` list into the
+// container's ExposedPorts map.  Entries without an explicit proto default
+// to "/tcp", matching docker-compose behaviour.  Invalid entries are
+// warned about and skipped.
+func mergeExposedPorts(exposed dockernetwork.PortSet, entries service.ExposeList, log *logrus.Entry) {
+	if exposed == nil {
+		return
+	}
+	for _, raw := range entries {
+		portSpec := raw
+		if !strings.Contains(portSpec, "/") {
+			portSpec += "/tcp"
+		}
+		port, err := dockernetwork.ParsePort(portSpec)
+		if err != nil {
+			log.WithError(err).Warnf("Invalid expose entry %q, skipping", raw)
+			continue
+		}
+		exposed[port] = struct{}{}
+	}
+}
+
+// parseDNSAddrs converts compose DNS string entries into the typed
+// []netip.Addr slice Moby expects.  Invalid addresses are warned about and
+// skipped.
+func parseDNSAddrs(entries service.StringList, log *logrus.Entry) []netip.Addr {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]netip.Addr, 0, len(entries))
+	for _, raw := range entries {
+		addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil {
+			log.WithError(err).Warnf("Invalid DNS address %q, skipping", raw)
+			continue
+		}
+		out = append(out, addr)
+	}
+	return out
 }

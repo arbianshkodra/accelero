@@ -301,6 +301,65 @@ Today, the supported patterns for actual secrets are:
 
 Accelero does not yet natively integrate with external secret stores. The plan is to land Phase 4's secrets track (encrypted-at-rest per-stack secrets + pluggable Vault/KMS/Secrets Manager backends + `${secret:...}` interpolation syntax) so application secrets get a first-class home that doesn't require a committed file at all. Until then, treat interpolation `.env` as config-only and keep secrets in an adjacent `env_file:` you populate through your host's own provisioning.
 
+## Supported compose fields
+
+Accelero parses the subset of docker-compose fields listed below. Anything outside this list is silently ignored at parse time — so a real compose file only fails on genuine misconfiguration, not on newer/niche keys.
+
+### Service-level
+
+| Field | Accepts | Notes |
+|-------|---------|-------|
+| `image` | string (required) | The image reference Accelero pulls and runs |
+| `command` | string or list | Override the image's CMD |
+| `entrypoint` | string or list | Override the image's ENTRYPOINT |
+| `working_dir` | string | Container working directory |
+| `user` | string | `uid`, `uid:gid`, or `name:group` |
+| `hostname` | string | |
+| `domainname` | string | |
+| `environment` | list of `KEY=VALUE` or map | Inline env vars |
+| `env_file` | list of paths | Paths relative to the compose file |
+| `ports` | list (`"host:container"` format) | Published ports |
+| `expose` | list of strings or ints | Exposed (not published) ports |
+| `volumes` | list (`"host:container[:mode]"`) | Bind mounts (named volumes: TBD Phase 2) |
+| `networks` | list | Must exist at the top-level `networks:` block |
+| `depends_on` | list of service names | Ordering only; map form with conditions: TBD Phase 2 |
+| `labels` | map | Merged with Accelero's `managed-by` / `accelero-stack` labels |
+| `restart` | `no` / `always` / `on-failure` / `unless-stopped` | |
+| `healthcheck` | object (`test`, `interval`, `timeout`, `retries`, `start_period`) | Overrides image-level healthcheck |
+| `stop_grace_period` | duration (`30s`, `2m`) | Timeout before force-kill on stop; replaces the old hardcoded 10s |
+| `stop_signal` | string (`SIGTERM`, `SIGHUP`, …) | Signal sent to stop the container gracefully |
+| `dns` | string or list | |
+| `dns_search` | string or list | |
+| `extra_hosts` | list (`"host:ip"`) or map | |
+| `cap_add` / `cap_drop` | list | Linux capabilities |
+| `privileged` | bool | Privileged mode |
+| `tmpfs` | string, list, or map | Map values become mount options (`size=64m`) |
+| `shm_size` | size string (`256m`, `1g`) | |
+| `init` | bool | Run a minimal init process inside the container |
+| `mem_limit` | size string | Memory ceiling |
+| `cpu_limit` | float | CPU quota in fractional cores (e.g. `0.5`) |
+| `pull_policy` | `always`, `missing`, `if_not_present`, `never` | See [pull policy](#pull-policy) below; `build` is rejected |
+
+### Top-level
+
+| Field | Notes |
+|-------|-------|
+| `services` | Required |
+| `networks` | Accelero creates missing networks with the declared driver and `driver_opts` |
+| `volumes` | TBD Phase 2 |
+| `version` | Parsed but not enforced (docker-compose itself has dropped the schema-version gate) |
+
+### Pull policy
+
+Accelero defaults to pulling on every deploy, matching modern docker-compose behaviour. Override per-service with `pull_policy`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `always` (default if unset) | Pull on every deploy, regardless of local cache |
+| `missing` / `if_not_present` | Skip the pull if the image is already present on the host |
+| `never` | Never pull; fail the deploy if the image is missing |
+| `build` | Rejected — Accelero is a CD tool, not a builder; build your images in CI |
+
 ## Upgrading from Legacy Mode
 
 If you were using the older single-stack Accelero with environment variables (`REPO_URL`, `REPO_USERNAME`, etc.), those still work. On first startup, Accelero automatically creates a "default" stack from those values. You can then manage it through the API like any other stack.
