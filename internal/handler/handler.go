@@ -321,18 +321,29 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteStack(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	stack, err := h.Store.GetStack(id)
-	if err != nil || stack == nil {
+	if err != nil {
+		writeError(w, "failed to get stack", http.StatusInternalServerError)
+		return
+	}
+	if stack == nil {
+		// Try by name — matches the other stack CRUD endpoints'
+		// id-or-name convention. Resolve the canonical ID here so the
+		// downstream delete / cleanup references it directly rather
+		// than re-doing the name lookup.
+		stack, _ = h.Store.GetStackByName(id)
+	}
+	if stack == nil {
 		writeError(w, "stack not found", http.StatusNotFound)
 		return
 	}
 
-	if err := h.Store.DeleteStack(id); err != nil {
+	if err := h.Store.DeleteStack(stack.ID); err != nil {
 		writeError(w, "failed to delete stack", http.StatusInternalServerError)
 		return
 	}
 
 	if h.Reconciler != nil {
-		h.Reconciler.RefreshStack(id)
+		h.Reconciler.RefreshStack(stack.ID)
 	}
 
 	// Remove the on-disk clone workdir.  Best-effort: a failure here is

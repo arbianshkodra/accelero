@@ -6,6 +6,7 @@ Everything in this directory represents a **user's GitOps repo** — not Acceler
 
 - **`.env` variable interpolation** — `${NGINX_TAG:-nginx:1.27.1-alpine}` style substitution, with `:?required` for fields that must be set.
 - **Caddy in front** — a reverse-proxy service holds the host port; replicated backends expose only inside the Docker network. This is the pattern that makes zero-downtime actually work (see `docs/usage-overview.md#zero-downtime-deployments` for why).
+- **Caddyfile committed to git** — mounted into the proxy via `./Caddyfile:/etc/caddy/Caddyfile`. Accelero resolves the relative path against the stack's cloned repo dir; see `docs/usage-overview.md#bind-mounts-from-the-gitops-repo`.
 - **`deploy.replicas`** — `web` runs three interchangeable replicas. Accelero rolling-updates them one at a time: create new, wait healthy, remove one old, repeat. At least two replicas stay serving traffic throughout.
 - **Healthchecks that actually work** — `wget --spider` on an alpine nginx image (the debian ones ship neither `wget` nor `curl`).
 
@@ -76,9 +77,14 @@ ok=5580 fail=0
 
 (Actual measurement from a local run: 5580 requests over 45s, all 200s, while rolling from `nginx:1.27.2-alpine` → `nginx:1.27.3-alpine` across 3 replicas. Rolling update took ~19s of that window.)
 
-## Why `caddy reverse-proxy --to web:80` and not a Caddyfile?
+## The Caddyfile
 
-The `caddy reverse-proxy` CLI subcommand handles this minimal pattern in one line, with no external config file. For anything more than a single upstream — TLS, multiple hosts, headers, rate limits — you'd switch to a Caddyfile and mount it into the proxy container. Mounting files from the GitOps repo into a managed container is a separate Accelero feature (tracked in the ROADMAP); for now, this sample stays with the CLI form.
+The proxy runs `caddy run --config /etc/caddy/Caddyfile` and mounts `./Caddyfile` from this repo as the source of that config. Accelero resolves the relative path against the stack's cloned repo directory on every deploy.
+
+**What happens when you change the Caddyfile only (no compose change):**
+The next deploy re-clones the repo — the new Caddyfile is on disk at the expected path. But because nothing in the proxy's compose spec changed, Accelero does not recreate the container, so Caddy keeps running with its original in-memory config. To pick up the new config, change something in the proxy's compose spec (bump a label, tweak an env var) — that will force a recreate, and the new Caddy will read the updated file at start.
+
+For richer Caddy features — TLS, multiple hosts, rate limits, global settings — extend the Caddyfile. It's just a regular Caddyfile; nothing here constrains what you can put in it.
 
 ## When does this pattern NOT apply?
 
