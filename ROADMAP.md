@@ -103,7 +103,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /api/v1/networks` — networks labelled managed-by=accelero with driver/scope/options. Also fixes a pre-existing bug where networks created by accelero were missing management labels. `?stack=<name>` narrows.
 
 **Exceptional debug operations (audited, flagged as drift):**
-- [ ] `POST /containers/{cid}/restart` — logged + audit trail (pure GitOps: don't use; prefer git revert)
+- [x] `POST /api/v1/stacks/{id}/containers/{cid}/restart` — Docker-level restart, optional `?t=` grace period. Always audited (`container.restart` entry) even on Docker-side failure. Pure GitOps reminder: for config/image/replica changes, commit to git + redeploy instead.
 - [ ] `POST /containers/{cid}/exec` — interactive shell via WebSocket (audit-logged, treated as drift event)
 - [ ] `POST /volumes/{name}/write` — emergency file write (off by default, requires `--allow-volume-writes` flag)
 

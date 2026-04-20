@@ -56,6 +56,7 @@ type DockerClient interface {
 	ContainerInspect(ctx context.Context, id string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error)
 	ContainerLogs(ctx context.Context, id string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
 	ContainerStats(ctx context.Context, id string, options client.ContainerStatsOptions) (client.ContainerStatsResult, error)
+	ContainerRestart(ctx context.Context, id string, options client.ContainerRestartOptions) (client.ContainerRestartResult, error)
 	Events(ctx context.Context, options client.EventsListOptions) client.EventsResult
 	ImageList(ctx context.Context, options client.ImageListOptions) (client.ImageListResult, error)
 	VolumeList(ctx context.Context, options client.VolumeListOptions) (client.VolumeListResult, error)
@@ -149,6 +150,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs/stream", h.StreamStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats/stream", h.StreamStackContainerStats).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/restart", h.RestartStackContainer).Methods("POST")
 	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
 
 	// Read-only resource browsers (Phase 3) — root-level; scoped to
@@ -1372,6 +1374,92 @@ func (h *Handler) GetStackContainerStats(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, computeStatsSample(raw, insp.Container.ID, insp.Container.Name), http.StatusOK)
+}
+
+// RestartStackContainer restarts a single managed container.  This is
+// the first mutating introspection endpoint: it bypasses the GitOps
+// flow (no compose change, no deploy record) but is always audited so
+// the trail captures "someone did something imperative here."
+//
+// The restart is best-effort: Docker stops the container, waits up to
+// the grace period for it to exit cleanly, then starts it again. The
+// daemon returns success as soon as it has issued the commands — we
+// return 202 Accepted to match that semantics (the container may still
+// be transitioning when the response lands).
+//
+// Query parameters:
+//   - t: stop grace period in seconds (optional). -1 waits indefinitely;
+//     0 skips graceful shutdown entirely; default is Docker's 10s.
+//
+// On an unhealthy container, restart is useful for "give it another
+// kick" debug scenarios. It is NOT a path for state changes — to change
+// image tags, replica counts, or config, commit to git and redeploy.
+func (h *Handler) RestartStackContainer(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	opts := client.ContainerRestartOptions{}
+	if raw := r.URL.Query().Get("t"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, "t must be an integer (seconds); -1 waits forever, 0 kills immediately", http.StatusBadRequest)
+			return
+		}
+		opts.Timeout = &n
+	}
+
+	// Fire off the restart. Record the audit row regardless of outcome
+	// so operators see "someone tried to restart this" even on failures.
+	_, restartErr := h.Docker.ContainerRestart(ctx, insp.Container.ID, opts)
+
+	entry := audit.FromRequest(r, store.AuditOpContainerRestart)
+	entry.ResourceType = "container"
+	entry.ResourceID = insp.Container.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Metadata = map[string]string{}
+	if insp.Container.Config != nil {
+		if svc := insp.Container.Config.Labels[containerLabelServiceName]; svc != "" {
+			entry.Metadata["service"] = svc
+		}
+		if rep := insp.Container.Config.Labels[containerLabelReplicaIndex]; rep != "" {
+			entry.Metadata["replica"] = rep
+		}
+	}
+	if opts.Timeout != nil {
+		entry.Metadata["timeout_seconds"] = strconv.Itoa(*opts.Timeout)
+	}
+	if restartErr != nil {
+		entry.Outcome = store.AuditOutcomeFailure
+		entry.ErrorMessage = restartErr.Error()
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	if restartErr != nil {
+		logctx.FromContext(ctx).WithError(restartErr).Error("container restart failed")
+		writeError(w, "failed to restart container", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]string{
+		"status":       "accepted",
+		"container_id": insp.Container.ID,
+	}, http.StatusAccepted)
 }
 
 // StreamStackContainerStats upgrades to a WebSocket and emits one
