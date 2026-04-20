@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Store defines the persistence interface for Accelero.
 type Store interface {
@@ -26,5 +29,6 @@ type Store interface {
 	RemoveContainersByStack(stackID string) error
 
 	// Lifecycle
+	Ping(ctx context.Context) error
 	Close() error
 }
