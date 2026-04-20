@@ -335,7 +335,7 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `drift.detected` | `system:reconciler` | One per reconcile cycle with drift (not per drift item — kept compact). Metadata: `drift_count`, per-type counts (`drift_type_missing`, `drift_type_image_mismatch`, etc.). |
 | `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
 
-**Retention.** Entries are not automatically cleaned up in this release. Time-based retention is planned as a follow-up alongside the existing deployment-history cleanup.
+**Retention.** Entries older than `AUDIT_MAX_AGE` (default 90 days) are pruned on the same cadence as the deployment-history cleanup (`STATUS_CLEANUP_INTERVAL`, default hourly). Set `AUDIT_MAX_AGE=0` to disable retention — useful when a compliance regime requires indefinite preservation.
 
 **Correlation with logs.** Every entry carries the `request_id` (for HTTP-originated events) or a `system:<component>` actor (for reconciler/deployer events). The same `request_id` appears on every log line from the same request, so `grep cf4f29994be24c04` in logs gives the full context behind an audit row.
 

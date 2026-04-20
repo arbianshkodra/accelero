@@ -254,7 +254,11 @@ func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
 	}
 }
 
-// deploymentCleanupLoop prunes old deployment records from the database.
+// deploymentCleanupLoop prunes old deployment and audit records on the
+// same cadence. The two have very different retention defaults (deploy
+// history: 24h; audit: 90d) but sharing the ticker keeps the number of
+// background goroutines down — the cleanup work is all cheap DELETE
+// queries.
 func deploymentCleanupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
 	ticker := time.NewTicker(cfg.StatusCleanupInterval)
 	defer ticker.Stop()
@@ -270,6 +274,17 @@ func deploymentCleanupLoop(ctx context.Context, db store.Store, cfg *config.Conf
 				logrus.Errorf("Deployment cleanup error: %v", err)
 			} else if n > 0 {
 				logrus.Infof("Cleaned up %d old deployment records", n)
+			}
+
+			// AuditMaxAge == 0 disables audit retention — rows are kept
+			// forever. Helpful for compliance contexts that require it.
+			if cfg.AuditMaxAge > 0 {
+				n, err := db.CleanupOldAuditEntries(cfg.AuditMaxAge)
+				if err != nil {
+					logrus.Errorf("Audit cleanup error: %v", err)
+				} else if n > 0 {
+					logrus.Infof("Cleaned up %d old audit entries", n)
+				}
 			}
 		}
 	}

@@ -844,6 +844,45 @@ func TestAudit_InsertAndList(t *testing.T) {
 	})
 }
 
+func TestAudit_CleanupOldEntries(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+
+	now := time.Now().UTC()
+	// Three rows: old, borderline, fresh.
+	entries := []*AuditEntry{
+		{ID: "old", Timestamp: now.Add(-48 * time.Hour), Actor: "x", Operation: AuditOpStackCreate, Outcome: AuditOutcomeSuccess},
+		{ID: "borderline", Timestamp: now.Add(-23 * time.Hour), Actor: "x", Operation: AuditOpStackCreate, Outcome: AuditOutcomeSuccess},
+		{ID: "fresh", Timestamp: now.Add(-1 * time.Minute), Actor: "x", Operation: AuditOpStackCreate, Outcome: AuditOutcomeSuccess},
+	}
+	for _, e := range entries {
+		assert.NoError(t, s.CreateAuditEntry(e))
+	}
+
+	t.Run("drops rows older than max age", func(t *testing.T) {
+		n, err := s.CleanupOldAuditEntries(24 * time.Hour)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, n, "only the 48h-old row is beyond 24h cutoff")
+
+		got, _ := s.ListAuditEntries(AuditFilter{})
+		// fresh + borderline survive.
+		assert.Len(t, got, 2)
+	})
+
+	t.Run("zero max age is a no-op", func(t *testing.T) {
+		// AUDIT_MAX_AGE=0 disables retention; nothing should be deleted.
+		n, err := s.CleanupOldAuditEntries(0)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, n)
+	})
+
+	t.Run("negative max age is a no-op", func(t *testing.T) {
+		n, err := s.CleanupOldAuditEntries(-1 * time.Hour)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, n)
+	})
+}
+
 func TestAudit_LimitCap(t *testing.T) {
 	s := newTestStore(t)
 	defer s.Close()

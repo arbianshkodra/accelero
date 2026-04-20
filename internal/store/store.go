@@ -28,10 +28,13 @@ type Store interface {
 	RemoveContainer(containerID string) error
 	RemoveContainersByStack(stackID string) error
 
-	// Audit log — append-only; no update or delete path. Immutability
-	// is the point, so the interface exposes exactly two methods.
+	// Audit log — append-only; no update or delete API. Retention is
+	// time-based and goes through CleanupOldAuditEntries, which is the
+	// only path that removes rows. Prune decisions stay with the app
+	// (see config.AuditMaxAge), not with individual callers.
 	CreateAuditEntry(e *AuditEntry) error
 	ListAuditEntries(filter AuditFilter) ([]*AuditEntry, error)
+	CleanupOldAuditEntries(maxAge time.Duration) (int, error)
 
 	// Lifecycle
 	Ping(ctx context.Context) error
