@@ -99,7 +99,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 **Resource browsers (read-only, filtered to accelero-managed):**
 - [x] `GET /api/v1/images` — images referenced by managed containers with back-references (stack/service/replica/container). `?stack=<name>` narrows.
 - [x] `GET /api/v1/volumes` — volumes labelled managed-by=accelero with driver/mount/labels. `?stack=<name>` narrows.
-- [ ] `GET /volumes/{name}/browse` — read-only file browser for volumes (debugging)
+- [x] `GET /api/v1/volumes/{name}/browse` — read-only file browser backed by an ephemeral busybox helper. List directory contents (10k-entry cap) or `?download=true` to stream a single file (10MB cap). `..` paths rejected. Audited as `volume.browse` / `volume.read`.
 - [x] `GET /api/v1/networks` — networks labelled managed-by=accelero with driver/scope/options. Also fixes a pre-existing bug where networks created by accelero were missing management labels. `?stack=<name>` narrows.
 
 **Exceptional debug operations (audited, flagged as drift):**

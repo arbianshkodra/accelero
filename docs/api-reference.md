@@ -395,6 +395,59 @@ Daemon warnings from the volume list (rare; usually filesystem-level) are surfac
 
 ---
 
+### Browse a Managed Volume
+`GET /api/v1/volumes/{name}/browse`
+
+List files in a managed volume or download a single file's contents. Debug affordance for "what's actually in my postgres data dir" scenarios — read-only, audited, size-capped.
+
+**How it works.** Accelero spawns an ephemeral `busybox:stable` helper container with the target volume mounted read-only at `/volume`, extracts the requested path via Docker's archive API, parses the tar stream, and tears the helper down. The image is auto-pulled on first use; subsequent calls reuse the cached copy. Direct file-system reads of `/var/lib/docker/volumes/...` aren't portable — Docker Desktop keeps those paths inside a VM — so the helper-container trick is the only mechanism that works everywhere.
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `path` | string | `/` | Absolute within the volume. `..` segments are rejected. |
+| `download` | bool | `false` | `true` streams file bytes; omitted returns a JSON listing. |
+
+**List response** (`download=false`): `200 OK`, array of entries — direct children of the requested directory, no recursion.
+```json
+[
+  {
+    "name": "config",
+    "path": "/config",
+    "is_dir": true,
+    "size_bytes": 0,
+    "mode": "-rwxr-xr-x",
+    "mod_time": "2026-04-20T21:40:29Z"
+  },
+  {
+    "name": "greet.txt",
+    "path": "/greet.txt",
+    "is_dir": false,
+    "size_bytes": 18,
+    "mode": "-rw-r--r--",
+    "mod_time": "2026-04-20T21:40:29Z"
+  }
+]
+```
+
+Listings are capped at 10,000 entries (silent truncation). If you need deeper views, browse directory-by-directory.
+
+**Download response** (`download=true`): `200 OK` with `Content-Type: application/octet-stream`, `Content-Disposition: attachment; filename="..."`, and the file bytes as the body. Files larger than 10 MB are refused with `400` — extract those manually via `docker cp` instead.
+
+**Security:**
+
+- Only volumes labelled `managed-by=accelero` are browseable. Unmanaged volumes return `404` indistinguishably from missing volumes so callers can't probe the host.
+- Path traversal (`..`) is rejected at the handler before the browser sees it, and again by the browser itself. Two layers.
+- The helper container mounts the volume **read-only** — nothing the browser does can modify volume contents.
+- Helper containers are cleaned up immediately when the request finishes, including on error paths. They carry `managed-by=accelero` + `accelero-helper=volume-browser` labels for leak detection.
+
+**Audit.** Every call writes one entry: `volume.browse` for listings, `volume.read` for downloads. Both include the path in metadata; downloads additionally record `size_bytes`. Outcome reflects whether the underlying operation succeeded; failures are audited the same way as successes so the trail captures intent.
+
+**Errors:** `400 Bad Request` for malformed paths (including `..`) or oversize downloads; `404 Not Found` for unmanaged or missing volumes; `503 Service Unavailable` when Docker or the browser isn't configured.
+
+---
+
 ### List Managed Networks
 `GET /api/v1/networks`
 

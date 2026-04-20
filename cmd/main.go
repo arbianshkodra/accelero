@@ -20,6 +20,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/stack"
 	"github.com/arbianshkodra/accelero/internal/store"
+	volumepkg "github.com/arbianshkodra/accelero/internal/volume"
 	"github.com/moby/moby/client"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
@@ -112,11 +113,12 @@ func main() {
 	r.Handle("/metrics", metrics.Handler()).Methods("GET")
 
 	h := &handler.Handler{
-		Store:      db,
-		Deployer:   deployer,
-		Reconciler: rec,
-		Audit:      auditRecorder,
-		Docker:     cli,
+		Store:         db,
+		Deployer:      deployer,
+		Reconciler:    rec,
+		Audit:         auditRecorder,
+		Docker:        cli,
+		VolumeBrowser: volumepkg.NewDockerBrowser(cli, ""),
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
