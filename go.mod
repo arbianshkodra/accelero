@@ -7,6 +7,7 @@ require (
 	github.com/docker/go-units v0.5.0
 	github.com/go-git/go-git/v5 v5.18.0
 	github.com/gorilla/mux v1.8.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/moby/moby/api v1.54.1
 	github.com/moby/moby/client v0.4.0
 	github.com/prometheus/client_golang v1.23.2

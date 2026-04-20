@@ -90,6 +90,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /stacks/{id}/containers` — list containers with status, labels, image, ports, replica index
 - [x] `GET /stacks/{id}/containers/{cid}` — inspect container details (state, config, networks, mounts; env redacted by key)
 - [x] `GET /stacks/{id}/containers/{cid}/logs` — one-shot tail with `tail` / `since` / `timestamps`; follow via WebSocket is a separate ticket below
+- [x] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket follow; stdout+stderr demuxed server-side, 30s ping, normal-closure on daemon EOF, X-API-KEY auth on upgrade
 - [ ] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket for live logs
 - [x] `GET /stacks/{id}/containers/{cid}/stats` — CPU%, memory used/limit/%, per-iface network rx/tx, block I/O totals, PIDs (snapshot). Streaming is a separate WebSocket ticket below.
 - [x] `GET /stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources (accelero-service / accelero-replica surfaced). Stack-wide view is the common one; a daemon-wide `/events` variant across all stacks can come later if needed.
