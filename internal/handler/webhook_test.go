@@ -71,6 +71,7 @@ func (m *mockStore) CreateAuditEntry(e *store.AuditEntry) error {
 func (m *mockStore) ListAuditEntries(_ store.AuditFilter) ([]*store.AuditEntry, error) {
 	return m.auditEntries, nil
 }
+func (m *mockStore) CleanupOldAuditEntries(_ time.Duration) (int, error) { return 0, nil }
 func (m *mockStore) Ping(ctx context.Context) error { return nil }
 func (m *mockStore) Close() error                   { return nil }
 

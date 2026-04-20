@@ -421,6 +421,29 @@ func (s *SQLiteStore) ListAuditEntries(filter AuditFilter) ([]*AuditEntry, error
 	return out, rows.Err()
 }
 
+// CleanupOldAuditEntries drops audit rows older than maxAge. The only
+// API that removes audit rows — the handler / recorder paths are
+// strictly append-only. A zero or negative maxAge is a no-op so the
+// caller can disable retention by setting AUDIT_MAX_AGE=0.
+//
+// The cutoff is computed in UTC to match how timestamps are stored
+// (the recorder normalises to UTC at insert time). Using local time
+// here would produce off-by-TZ comparisons on hosts that aren't on
+// UTC — the underlying sqlite driver serialises time.Time to text
+// and text comparisons are lexicographic.
+func (s *SQLiteStore) CleanupOldAuditEntries(maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().Add(-maxAge)
+	result, err := s.db.Exec(`DELETE FROM audit_entries WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 // --- Lifecycle ---
 
 // Ping verifies the database is reachable by running a trivial query under
