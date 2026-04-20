@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/arbianshkodra/accelero/internal/service"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -533,6 +534,110 @@ func TestReadComposeFile_RequiredVarMissingFails(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "TAG")
 	assert.Contains(t, err.Error(), "required")
+}
+
+// ---------------------------------------------------------------------------
+// Simple-field bundle: readComposeFile exposes the new fields on the
+// parsed ComposeService struct so downstream wiring can rely on them.
+// ---------------------------------------------------------------------------
+
+func TestReadComposeFile_SimpleFieldBundle(t *testing.T) {
+	dir := t.TempDir()
+
+	compose := `services:
+  web:
+    image: nginx:1.27.1
+    entrypoint: /docker-entrypoint.sh
+    working_dir: /app
+    user: "1000:1000"
+    hostname: web-01
+    domainname: internal.example
+    expose:
+      - "3000"
+      - 9090
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    pull_policy: missing
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    dns_search: local.example
+    extra_hosts:
+      - "host.docker.internal:10.0.0.1"
+    cap_add:
+      - SYS_PTRACE
+    cap_drop:
+      - MKNOD
+    privileged: true
+    tmpfs:
+      - /run
+      - /tmp
+    shm_size: 256m
+    init: true
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.NoError(t, err)
+	svc := cf.Services["web"]
+
+	assert.Equal(t, service.Command{"/docker-entrypoint.sh"}, svc.Entrypoint)
+	assert.Equal(t, "/app", svc.WorkingDir)
+	assert.Equal(t, "1000:1000", svc.User)
+	assert.Equal(t, "web-01", svc.Hostname)
+	assert.Equal(t, "internal.example", svc.Domainname)
+	assert.Equal(t, service.ExposeList{"3000", "9090"}, svc.Expose)
+	assert.Equal(t, "30s", svc.StopGracePeriod)
+	assert.Equal(t, "SIGTERM", svc.StopSignal)
+	assert.Equal(t, "missing", svc.PullPolicy)
+	assert.Equal(t, service.StringList{"1.1.1.1", "8.8.8.8"}, svc.DNS)
+	assert.Equal(t, service.StringList{"local.example"}, svc.DNSSearch)
+	assert.Equal(t, service.ExtraHosts{"host.docker.internal:10.0.0.1"}, svc.ExtraHosts)
+	assert.Equal(t, []string{"SYS_PTRACE"}, svc.CapAdd)
+	assert.Equal(t, []string{"MKNOD"}, svc.CapDrop)
+	assert.True(t, svc.Privileged)
+	assert.Equal(t, service.Tmpfs{"/run": "", "/tmp": ""}, svc.Tmpfs)
+	assert.Equal(t, "256m", svc.ShmSize)
+	if assert.NotNil(t, svc.Init) {
+		assert.True(t, *svc.Init)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stopTimeoutSeconds honours stop_grace_period with a sane fallback.
+// ---------------------------------------------------------------------------
+
+func TestStopTimeoutSeconds(t *testing.T) {
+	cases := []struct {
+		name string
+		svc  service.ComposeService
+		want int
+	}{
+		{"unset falls back to 10", service.ComposeService{}, 10},
+		{"30 seconds", service.ComposeService{StopGracePeriod: "30s"}, 30},
+		{"2 minutes", service.ComposeService{StopGracePeriod: "2m"}, 120},
+		{"malformed falls back to 10", service.ComposeService{StopGracePeriod: "not-a-duration"}, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, stopTimeoutSeconds(tc.svc))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseDNSAddrs skips invalid entries instead of failing the whole list.
+// ---------------------------------------------------------------------------
+
+func TestParseDNSAddrs(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	got := parseDNSAddrs(service.StringList{"1.1.1.1", "not-an-ip", "8.8.8.8"}, log)
+	assert.Len(t, got, 2)
+	assert.Equal(t, "1.1.1.1", got[0].String())
+	assert.Equal(t, "8.8.8.8", got[1].String())
+
+	assert.Nil(t, parseDNSAddrs(nil, log))
 }
 
 // suppress unused-import warnings when editing happens in bulk
