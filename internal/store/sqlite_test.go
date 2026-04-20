@@ -762,3 +762,115 @@ func TestClose(t *testing.T) {
 	_, err = s.ListStacks()
 	assert.Error(t, err, "queries after Close should fail")
 }
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+func TestAudit_InsertAndList(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	entries := []*AuditEntry{
+		{
+			ID: "a1", Timestamp: now.Add(-3 * time.Minute),
+			Actor: "api-key", Operation: AuditOpStackCreate,
+			ResourceType: "stack", ResourceID: "s1", StackID: "s1", StackName: "alpha",
+			Outcome:  AuditOutcomeSuccess,
+			Metadata: map[string]string{"note": "first"},
+		},
+		{
+			ID: "a2", Timestamp: now.Add(-2 * time.Minute),
+			Actor: "system:reconciler", Operation: AuditOpDriftDetected,
+			ResourceType: "stack", ResourceID: "s1", StackID: "s1", StackName: "alpha",
+			Outcome:  AuditOutcomeSuccess,
+			Metadata: map[string]string{"drift_count": "3"},
+		},
+		{
+			ID: "a3", Timestamp: now.Add(-1 * time.Minute),
+			Actor: "api-key", Operation: AuditOpStackDelete,
+			ResourceType: "stack", ResourceID: "s2", StackID: "s2", StackName: "beta",
+			Outcome: AuditOutcomeSuccess,
+		},
+	}
+	for _, e := range entries {
+		assert.NoError(t, s.CreateAuditEntry(e))
+	}
+
+	t.Run("list-all-newest-first", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{})
+		assert.NoError(t, err)
+		assert.Len(t, got, 3)
+		assert.Equal(t, "a3", got[0].ID, "newest first")
+		assert.Equal(t, "a2", got[1].ID)
+		assert.Equal(t, "a1", got[2].ID)
+	})
+
+	t.Run("filter-by-stack-id", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{StackID: "s1"})
+		assert.NoError(t, err)
+		assert.Len(t, got, 2)
+	})
+
+	t.Run("filter-by-actor", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{Actor: "system:reconciler"})
+		assert.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, "a2", got[0].ID)
+	})
+
+	t.Run("filter-by-operation", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{Operation: AuditOpStackCreate})
+		assert.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.Equal(t, "a1", got[0].ID)
+	})
+
+	t.Run("filter-by-since", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{Since: now.Add(-90 * time.Second)})
+		assert.NoError(t, err)
+		assert.Len(t, got, 1, "only a3 is within the last 90s window")
+		assert.Equal(t, "a3", got[0].ID)
+	})
+
+	t.Run("metadata-round-trips", func(t *testing.T) {
+		got, err := s.ListAuditEntries(AuditFilter{StackID: "s1", Operation: AuditOpDriftDetected})
+		assert.NoError(t, err)
+		assert.Len(t, got, 1)
+		if len(got) == 1 {
+			assert.Equal(t, "3", got[0].Metadata["drift_count"])
+		}
+	})
+}
+
+func TestAudit_LimitCap(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Insert more than the cap; verify the store clamps it.
+	for i := 0; i < 50; i++ {
+		assert.NoError(t, s.CreateAuditEntry(&AuditEntry{
+			ID:        string(rune('a' + i)) + "_" + string(rune('0'+i%10)) + "_x",
+			Timestamp: time.Now().Add(-time.Duration(i) * time.Second),
+			Actor:     "api-key",
+			Operation: AuditOpStackCreate,
+			Outcome:   AuditOutcomeSuccess,
+		}))
+	}
+
+	// Limit=10 returns 10.
+	got, err := s.ListAuditEntries(AuditFilter{Limit: 10})
+	assert.NoError(t, err)
+	assert.Len(t, got, 10)
+
+	// Limit=-5 defaults to 100.
+	got, err = s.ListAuditEntries(AuditFilter{Limit: -5})
+	assert.NoError(t, err)
+	assert.Len(t, got, 50, "all 50 rows fit under the default 100 limit")
+
+	// Limit above cap is clamped to cap.
+	got, err = s.ListAuditEntries(AuditFilter{Limit: 99999})
+	assert.NoError(t, err)
+	assert.LessOrEqual(t, len(got), maxAuditListLimit)
+}
