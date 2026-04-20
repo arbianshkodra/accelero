@@ -48,6 +48,7 @@ type DockerClient interface {
 	ContainerList(ctx context.Context, options client.ContainerListOptions) (client.ContainerListResult, error)
 	ContainerInspect(ctx context.Context, id string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error)
 	ContainerLogs(ctx context.Context, id string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
+	ContainerStats(ctx context.Context, id string, options client.ContainerStatsOptions) (client.ContainerStatsResult, error)
 }
 
 // Handler holds all dependencies for the HTTP API.
@@ -119,6 +120,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers", h.ListStackContainers).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}", h.GetStackContainer).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -912,6 +914,198 @@ func (h *Handler) GetStackContainerLogs(w http.ResponseWriter, r *http.Request) 
 	if _, err := stdcopy.StdCopy(w, w, stream); err != nil {
 		logctx.FromContext(ctx).WithError(err).Warn("truncated demuxed log stream")
 	}
+}
+
+// ContainerStatsSample is a projected view of Docker's raw StatsResponse
+// with the derived percentages already computed. Returning a digested
+// shape keeps callers from having to re-implement Docker's CPU-delta
+// math in every client.
+type ContainerStatsSample struct {
+	ContainerID string                        `json:"container_id"`
+	Name        string                        `json:"name"`
+	ReadAt      time.Time                     `json:"read_at"`
+	CPU         ContainerCPUStats             `json:"cpu"`
+	Memory      ContainerMemoryStats          `json:"memory"`
+	Networks    map[string]ContainerNetStats  `json:"networks,omitempty"`
+	BlockIO     ContainerBlockIOStats         `json:"block_io"`
+	PIDs        uint64                        `json:"pids"`
+}
+
+type ContainerCPUStats struct {
+	Percent     float64 `json:"percent"`
+	OnlineCPUs  uint32  `json:"online_cpus,omitempty"`
+	TotalUsage  uint64  `json:"total_usage_ns"`
+	SystemUsage uint64  `json:"system_usage_ns,omitempty"`
+}
+
+type ContainerMemoryStats struct {
+	UsageBytes uint64  `json:"usage_bytes"`
+	LimitBytes uint64  `json:"limit_bytes"`
+	Percent    float64 `json:"percent"`
+}
+
+type ContainerNetStats struct {
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+type ContainerBlockIOStats struct {
+	ReadBytes  uint64 `json:"read_bytes"`
+	WriteBytes uint64 `json:"write_bytes"`
+}
+
+// GetStackContainerStats returns a single computed stats sample. The
+// endpoint deliberately does not stream — the use case is "what is this
+// container doing right now?" from a polling dashboard. WebSocket-based
+// streaming lives in a separate endpoint (same pattern as logs follow).
+//
+// The sample is taken with IncludePreviousSample=true so the daemon
+// gathers two consecutive readings and we can compute a valid CPU
+// percentage. The call therefore costs ~1s of daemon time, bounded by
+// the request's context deadline.
+func (h *Handler) GetStackContainerStats(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// The daemon sleeps ~1s for the previous-sample gather; give the call
+	// enough headroom for a slow host plus network.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	res, err := h.Docker.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
+		Stream:                false,
+		IncludePreviousSample: true,
+	})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("container stats failed")
+		writeError(w, "failed to read container stats", http.StatusInternalServerError)
+		return
+	}
+	defer res.Body.Close()
+
+	var raw container.StatsResponse
+	if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("decode container stats")
+		writeError(w, "failed to decode container stats", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, computeStatsSample(raw, insp.Container.ID, insp.Container.Name), http.StatusOK)
+}
+
+// computeStatsSample digests a raw StatsResponse into our API shape.
+// Kept pure (no ctx, no I/O) so the math is unit-testable.
+func computeStatsSample(s container.StatsResponse, idFallback, nameFallback string) ContainerStatsSample {
+	id := s.ID
+	if id == "" {
+		id = idFallback
+	}
+	name := strings.TrimPrefix(s.Name, "/")
+	if name == "" {
+		name = strings.TrimPrefix(nameFallback, "/")
+	}
+
+	out := ContainerStatsSample{
+		ContainerID: id,
+		Name:        name,
+		ReadAt:      s.Read,
+		CPU: ContainerCPUStats{
+			Percent:     computeCPUPercent(s),
+			OnlineCPUs:  s.CPUStats.OnlineCPUs,
+			TotalUsage:  s.CPUStats.CPUUsage.TotalUsage,
+			SystemUsage: s.CPUStats.SystemUsage,
+		},
+		Memory:  computeMemoryStats(s.MemoryStats),
+		BlockIO: computeBlockIOStats(s.BlkioStats),
+		PIDs:    s.PidsStats.Current,
+	}
+
+	if len(s.Networks) > 0 {
+		out.Networks = make(map[string]ContainerNetStats, len(s.Networks))
+		for iface, net := range s.Networks {
+			out.Networks[iface] = ContainerNetStats{
+				RxBytes: net.RxBytes,
+				TxBytes: net.TxBytes,
+			}
+		}
+	}
+	return out
+}
+
+// computeCPUPercent mirrors the formula Docker's CLI `docker stats` uses:
+//
+//	(cpuDelta / systemDelta) * onlineCPUs * 100
+//
+// A missing previous sample (both reads are effectively the same moment)
+// yields 0%, which is accurate for "we didn't sample long enough to know".
+func computeCPUPercent(s container.StatsResponse) float64 {
+	cpuDelta := float64(s.CPUStats.CPUUsage.TotalUsage) - float64(s.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(s.CPUStats.SystemUsage) - float64(s.PreCPUStats.SystemUsage)
+	if cpuDelta <= 0 || systemDelta <= 0 {
+		return 0
+	}
+	onlineCPUs := float64(s.CPUStats.OnlineCPUs)
+	if onlineCPUs == 0 {
+		onlineCPUs = float64(len(s.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if onlineCPUs == 0 {
+		onlineCPUs = 1
+	}
+	return (cpuDelta / systemDelta) * onlineCPUs * 100
+}
+
+// computeMemoryStats subtracts kernel page cache from the raw usage
+// figure before reporting. Docker's CLI does the same to give operators
+// the number that actually matters for OOM risk — page cache is
+// reclaimable memory the kernel hands back under pressure, so including
+// it in "usage" is misleading in most monitoring contexts.
+//
+// cgroup v1 reports cache under key "cache"; cgroup v2 reports it under
+// "file". We subtract whichever is present (they're mutually exclusive).
+func computeMemoryStats(m container.MemoryStats) ContainerMemoryStats {
+	usage := m.Usage
+	if cache, ok := m.Stats["cache"]; ok && usage > cache {
+		usage -= cache
+	} else if file, ok := m.Stats["file"]; ok && usage > file {
+		usage -= file
+	}
+
+	out := ContainerMemoryStats{
+		UsageBytes: usage,
+		LimitBytes: m.Limit,
+	}
+	if m.Limit > 0 {
+		out.Percent = float64(usage) / float64(m.Limit) * 100
+	}
+	return out
+}
+
+// computeBlockIOStats sums the per-device read/write byte counters.
+// Docker reports them as repeated rows per (Major,Minor,Op) tuple; we
+// collapse to a single pair to avoid exposing arbitrary device numbers.
+func computeBlockIOStats(b container.BlkioStats) ContainerBlockIOStats {
+	var out ContainerBlockIOStats
+	for _, e := range b.IoServiceBytesRecursive {
+		switch strings.ToLower(e.Op) {
+		case "read":
+			out.ReadBytes += e.Value
+		case "write":
+			out.WriteBytes += e.Value
+		}
+	}
+	return out
 }
 
 // resolveStack is shared between all the /stacks/{id}/* endpoints. It

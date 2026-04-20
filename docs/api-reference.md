@@ -275,6 +275,52 @@ Same stack-membership verification as `GET /containers/{cid}` — a `cid` from a
 
 ---
 
+### Container Stats
+`GET /api/v1/stacks/{id}/containers/{cid}/stats`
+
+Returns a single resource-usage sample with CPU%, memory, per-interface network totals, block I/O totals, and PID count. No streaming — poll this endpoint from a dashboard (~1 second per call; the daemon intentionally collects two samples so the CPU delta is valid).
+
+**Response:** `200 OK`
+```json
+{
+  "container_id": "9b5adf3ee871...",
+  "name": "web_0_1776691620235583000",
+  "read_at": "2026-04-20T13:27:41.638Z",
+  "cpu": {
+    "percent": 100.02,
+    "online_cpus": 14,
+    "total_usage_ns": 4145907000,
+    "system_usage_ns": 203373070000000
+  },
+  "memory": {
+    "usage_bytes": 12500992,
+    "limit_bytes": 134217728,
+    "percent": 9.31
+  },
+  "networks": {
+    "eth0": {"rx_bytes": 1172, "tx_bytes": 126}
+  },
+  "block_io": {"read_bytes": 0, "write_bytes": 12288},
+  "pids": 16
+}
+```
+
+**CPU percent** uses the same formula as `docker stats`:
+
+```
+(cpuDelta / systemDelta) * onlineCPUs * 100
+```
+
+Values above 100 are valid — they indicate the container is using more than one core's worth of CPU time.
+
+**Memory usage** subtracts page cache (`cache` on cgroup v1, `file` on cgroup v2) before reporting, matching the CLI. This reflects the "real" working-set pressure rather than reclaimable cache.
+
+Same stack-membership verification as `/containers/{cid}` — a cid from a different stack returns `404 Not Found`.
+
+**Errors:** `404 Not Found` for missing / foreign-stack container; `503 Service Unavailable` when Docker introspection isn't configured.
+
+---
+
 ### Preview Deployment
 `POST /api/v1/stacks/{id}/preview`
 
