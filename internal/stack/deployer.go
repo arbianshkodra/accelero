@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ type ComposeFile struct {
 	Version  string                            `yaml:"version"`
 	Services map[string]service.ComposeService `yaml:"services"`
 	Networks map[string]network.ComposeNetwork `yaml:"networks,omitempty"`
+	Volumes  map[string]service.ComposeVolume  `yaml:"volumes,omitempty"`
 }
 
 // serviceState captures the pre-deployment state of a single service so that
@@ -224,6 +226,13 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 		}
 	}
 
+	// 6b. Resolve & ensure named volumes.  Returns a map of logical -> actual
+	//     (scoped) names so we can rewrite each service's Volumes entries.
+	volumeNameMap, err := d.ensureVolumes(ctx, stack, composeFile.Volumes)
+	if err != nil {
+		return fmt.Errorf("volume setup failed: %w", err)
+	}
+
 	// 7. Deploy services in dependency order.
 	var deployed []string
 	var changes []string
@@ -233,6 +242,10 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 			log.Warnf("Service %s in dependency graph but missing from compose, skipping", svcName)
 			continue
 		}
+
+		// Rewrite volume references to use the resolved (possibly scoped)
+		// volume name before we build the container's HostConfig.Binds.
+		svc.Volumes = rewriteVolumeRefs(svc.Volumes, volumeNameMap)
 
 		mu := d.lockService(svcName)
 		mu.Lock()
@@ -1146,6 +1159,133 @@ func safeName(names []string) string {
 		name = name[1:]
 	}
 	return name
+}
+
+// --------------------------------------------------------------------------
+// Named volumes
+// --------------------------------------------------------------------------
+
+// resolveVolumeName produces the actual Docker-side name for a compose volume
+// entry.  Rules, in priority order:
+//
+//  1. external: true — use the literal name (cfg.Name when set, else the
+//     compose key).  Accelero neither creates nor deletes external volumes.
+//  2. cfg.Name set — use it verbatim (user has explicitly taken ownership of
+//     the name and accepts cross-stack collision risk).
+//  3. default — scope with "accelero_<stack>_<volname>" to prevent cross-
+//     stack collisions, mirroring docker-compose's project-prefix behaviour.
+func resolveVolumeName(stackName, logicalName string, cfg service.ComposeVolume) string {
+	if cfg.Name != "" {
+		return cfg.Name
+	}
+	if cfg.External {
+		return logicalName
+	}
+	return fmt.Sprintf("accelero_%s_%s", stackName, logicalName)
+}
+
+// ensureVolumes creates every internal named volume declared in the compose
+// file (idempotently) and verifies that every external volume exists.
+// Returns a map of the compose-level logical name -> actual Docker-side
+// name so service volume references can be rewritten to match.
+func (d *Deployer) ensureVolumes(ctx context.Context, stack *store.Stack, volumes map[string]service.ComposeVolume) (map[string]string, error) {
+	if len(volumes) == 0 {
+		return nil, nil
+	}
+
+	log := logctx.FromContext(ctx)
+	out := make(map[string]string, len(volumes))
+
+	// Sort for deterministic ordering (easier to read in logs).
+	names := make([]string, 0, len(volumes))
+	for name := range volumes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, logical := range names {
+		cfg := volumes[logical]
+		actual := resolveVolumeName(stack.Name, logical, cfg)
+		out[logical] = actual
+
+		if cfg.External {
+			if err := d.verifyExternalVolume(ctx, actual); err != nil {
+				return nil, fmt.Errorf("external volume %q: %w", actual, err)
+			}
+			log.WithField("volume", actual).Info("External volume verified")
+			continue
+		}
+
+		// Idempotent: VolumeCreate with an existing name returns the existing
+		// volume unchanged.
+		labels := map[string]string{
+			"managed-by":     "accelero",
+			"accelero-stack": stack.Name,
+		}
+		for k, v := range cfg.Labels {
+			labels[k] = v
+		}
+
+		_, err := d.cli.VolumeCreate(ctx, client.VolumeCreateOptions{
+			Name:       actual,
+			Driver:     cfg.Driver,
+			DriverOpts: cfg.DriverOpts,
+			Labels:     labels,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create volume %q: %w", actual, err)
+		}
+		log.WithFields(logrus.Fields{"volume": actual, "driver": cfg.Driver}).Info("Volume ensured")
+	}
+
+	return out, nil
+}
+
+// verifyExternalVolume returns an error unless the named volume already
+// exists on the Docker host.  External volumes are user-managed; Accelero
+// refuses to silently create one that the user expected to find.
+func (d *Deployer) verifyExternalVolume(ctx context.Context, name string) error {
+	_, err := d.cli.VolumeInspect(ctx, name, client.VolumeInspectOptions{})
+	if err == nil {
+		return nil
+	}
+	if cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("external volume does not exist on the host")
+	}
+	return err
+}
+
+// rewriteVolumeRefs returns a copy of svcVolumes with each compose-level
+// logical name (the "src" part of a "src:dst[:mode]" bind) replaced by its
+// resolved Docker-side name.  Bind mounts (absolute paths, `.` paths, or
+// references to volumes not declared at the top level) pass through
+// unchanged.
+func rewriteVolumeRefs(svcVolumes []string, nameMap map[string]string) []string {
+	if len(nameMap) == 0 {
+		return svcVolumes
+	}
+	out := make([]string, 0, len(svcVolumes))
+	for _, entry := range svcVolumes {
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) < 2 {
+			out = append(out, entry)
+			continue
+		}
+		src := parts[0]
+		// Bind mounts always have '/' or '.' — never a bare identifier.
+		if strings.ContainsAny(src, "/.") || strings.HasPrefix(src, "~") {
+			out = append(out, entry)
+			continue
+		}
+		if resolved, ok := nameMap[src]; ok {
+			out = append(out, resolved+":"+parts[1])
+			continue
+		}
+		// Not a declared top-level volume — leave Docker to interpret it
+		// (anonymous volume or pre-existing named volume).
+		out = append(out, entry)
+	}
+	return out
 }
 
 // --------------------------------------------------------------------------
