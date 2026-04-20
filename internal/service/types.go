@@ -15,7 +15,7 @@ type ComposeService struct {
 	Image       string            `yaml:"image"`
 	Environment EnvVars           `yaml:"environment,omitempty"`
 	EnvFile     []string          `yaml:"env_file,omitempty"`
-	Ports       []string          `yaml:"ports,omitempty"`
+	Ports       Ports             `yaml:"ports,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
 	Command     Command           `yaml:"command,omitempty"`
 	Entrypoint  Command           `yaml:"entrypoint,omitempty"`
@@ -45,6 +45,125 @@ type ComposeService struct {
 	StopGracePeriod string            `yaml:"stop_grace_period,omitempty"`
 	StopSignal      string            `yaml:"stop_signal,omitempty"`
 	PullPolicy      string            `yaml:"pull_policy,omitempty"`
+	Logging         *LoggingConfig    `yaml:"logging,omitempty"`
+}
+
+// LoggingConfig maps onto container.HostConfig.LogConfig.
+//
+//	logging:
+//	  driver: json-file
+//	  options:
+//	    max-size: "10m"
+//	    max-file: "3"
+type LoggingConfig struct {
+	Driver  string            `yaml:"driver"`
+	Options map[string]string `yaml:"options,omitempty"`
+}
+
+// Ports accepts both the short string form and the long map form.  The long
+// form is normalised into the canonical "[host_ip:]host_port:container_port[/proto]"
+// string so downstream helpers (utils.MapPorts) only see one shape.
+type Ports []string
+
+type longPort struct {
+	Target    int    `yaml:"target"`
+	Published any    `yaml:"published"` // int OR string (range); we accept int
+	Protocol  string `yaml:"protocol,omitempty"`
+	HostIP    string `yaml:"host_ip,omitempty"`
+	// Mode (ingress|host) is swarm-only; parsed-and-ignored.
+	Mode string `yaml:"mode,omitempty"`
+}
+
+func (p *Ports) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw []any
+	if err := unmarshal(&raw); err != nil {
+		return fmt.Errorf("ports must be a list: %w", err)
+	}
+
+	for _, entry := range raw {
+		switch v := entry.(type) {
+		case string:
+			*p = append(*p, v)
+		case int:
+			// Bare container port, e.g. `- 80`.
+			*p = append(*p, fmt.Sprintf("%d", v))
+		case map[any]any:
+			// Long form.  Re-serialize + re-parse through longPort so we get
+			// typed fields for free (yaml.v2 hands us map[any]any at the
+			// interface{} boundary).
+			var lp longPort
+			// Manual extraction is simpler than round-tripping.
+			if tgt, ok := v["target"]; ok {
+				if n, ok := tgt.(int); ok {
+					lp.Target = n
+				} else {
+					return fmt.Errorf("ports: target must be int, got %T", tgt)
+				}
+			}
+			if pub, ok := v["published"]; ok {
+				lp.Published = pub
+			}
+			if proto, ok := v["protocol"]; ok {
+				if s, ok := proto.(string); ok {
+					lp.Protocol = s
+				}
+			}
+			if ip, ok := v["host_ip"]; ok {
+				if s, ok := ip.(string); ok {
+					lp.HostIP = s
+				}
+			}
+			s, err := lp.toShortForm()
+			if err != nil {
+				return fmt.Errorf("ports: %w", err)
+			}
+			*p = append(*p, s)
+		default:
+			return fmt.Errorf("ports entry must be a string, int, or map, got %T", entry)
+		}
+	}
+	return nil
+}
+
+func (l longPort) toShortForm() (string, error) {
+	if l.Target == 0 {
+		return "", fmt.Errorf("target is required")
+	}
+	var b strings.Builder
+	if l.HostIP != "" {
+		b.WriteString(l.HostIP)
+		b.WriteByte(':')
+	}
+	switch v := l.Published.(type) {
+	case nil:
+		// No published port — container-only exposure.
+	case int:
+		if v != 0 {
+			b.WriteString(fmt.Sprintf("%d", v))
+		}
+		b.WriteByte(':')
+	case string:
+		if v != "" {
+			b.WriteString(v)
+		}
+		b.WriteByte(':')
+	default:
+		return "", fmt.Errorf("published must be int or string, got %T", l.Published)
+	}
+	// When `published` wasn't written, we still need the separator if there's
+	// a host_ip (otherwise the parser in utils would treat host_ip as the host
+	// port).  Guard: if we only have host_ip + target, drop the host_ip since
+	// compose's contract is that published is required in that case.  This
+	// keeps parsing unambiguous.
+	if l.HostIP != "" && l.Published == nil {
+		return "", fmt.Errorf("host_ip requires published to be set")
+	}
+	b.WriteString(fmt.Sprintf("%d", l.Target))
+	if l.Protocol != "" {
+		b.WriteByte('/')
+		b.WriteString(l.Protocol)
+	}
+	return b.String(), nil
 }
 
 type EnvVars []string
