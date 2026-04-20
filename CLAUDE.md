@@ -105,6 +105,7 @@ Optional:
 - `SERVER_PORT`: HTTP server port (default: 8000)
 - `DOCKER_SOCK`: Docker socket path (default: unix:///var/run/docker.sock)
 - `DATABASE_PATH`: SQLite database path (default: ./data/accelero.db)
+- `STACKS_DATA_DIR`: Root directory for per-stack cloned repos (default: ./data/stacks). Used as the bind-mount source when a compose service references `./path/from/repo`. When Accelero runs in Docker, this path must be the same inside and outside the container — bind-mount the host dir at the same path.
 - `LOG_LEVEL`: Logging level (default: info)
 - `LOG_FORMAT`: Log format — "json" or "text" (default: text)
 - `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)

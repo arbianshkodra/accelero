@@ -9,12 +9,16 @@ docker run -d \
   --name accelero \
   -p 8000:8000 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v accelero-data:/data \
+  -v /var/lib/accelero:/var/lib/accelero \
+  -e DATABASE_PATH=/var/lib/accelero/accelero.db \
+  -e STACKS_DATA_DIR=/var/lib/accelero/stacks \
   -e API_KEY=your-secure-key \
   arbianshkodra/accelero
 ```
 
-The `/data` volume persists the SQLite database across container restarts.
+The `/var/lib/accelero` volume persists the SQLite database *and* each stack's cloned repo across container restarts.
+
+**Why same-path bind mount.** Accelero clones each stack's gitops repo into `$STACKS_DATA_DIR/<stack_id>/repo/` and uses those files as the source for any compose `volumes:` entry that references a relative path (e.g. `./Caddyfile:/etc/caddy/Caddyfile`). Docker resolves bind-mount source paths on the **host**, not inside Accelero's container — so the path has to exist at the same absolute location on both sides. A named volume like `-v accelero-data:/data` won't work here: the host-side path (`/var/lib/docker/volumes/accelero-data/_data`) doesn't match the in-container path. Stacks without relative bind mounts still work, but you lose the ability to commit files like Caddyfiles / nginx configs / TLS certs to your gitops repo and have them mounted into containers.
 
 ### Binary
 
@@ -458,6 +462,37 @@ services:
 ```
 
 Any driver supported by your Docker engine works (`json-file`, `local`, `journald`, `syslog`, `fluentd`, `gelf`, `awslogs`, etc.); Accelero passes the options through unchanged.
+
+### Bind mounts from the gitops repo
+
+Compose `volumes:` entries that reference a relative path are resolved against the stack's cloned repo directory, so files committed alongside your `docker-compose.yaml` can be mounted into containers:
+
+```yaml
+services:
+  proxy:
+    image: caddy:2-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+```
+
+The clone lives at `$STACKS_DATA_DIR/<stack_id>/repo/` and is re-cloned (fresh) on every deploy, then persisted for the lifetime of the stack. Deleting the stack via `DELETE /api/v1/stacks/{id}` removes the directory.
+
+**Rules:**
+
+| Source form | Behaviour |
+|-------------|-----------|
+| `./Caddyfile` | Resolved against the cloned repo dir → `<stacks_dir>/<stack_id>/repo/Caddyfile` |
+| `./conf/nginx.conf` | Same — nested paths allowed, resolved lexically |
+| `../outside` | Rejected at deploy time (directory traversal) |
+| `/etc/ssl/certs` | Absolute host path — passed through unchanged; bind-mounts whatever lives on the host |
+| `pg_data` (bare) | Interpreted as a named-volume reference, not a bind mount — matches compose convention |
+
+**Limitations worth knowing:**
+
+- **Changing a bind-mounted file without changing the compose spec won't recreate the container.** Each deploy re-clones the repo, so the new content is on disk — but the container keeps its existing mount until something in the compose changes (e.g. the service's image tag). To force a reload of a mounted config file, either bump a service label / env var in the compose, or recreate the stack.
+- **Running Accelero in Docker requires a same-path bind mount** for the stacks data dir. See [Installation / Docker](#docker-recommended) for the flag pattern.
 
 ### Named volumes
 

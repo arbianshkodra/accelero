@@ -67,7 +67,7 @@ func main() {
 	logrus.Info("Connected to Docker daemon")
 
 	// 4. Create core components.
-	deployer := stack.NewDeployer(cli, db)
+	deployer := stack.NewDeployer(cli, db, cfg.StacksDataDir)
 	rec := reconciler.New(db, cli, deployer)
 
 	// 5. Migrate legacy env-var config to a "default" stack if needed.
