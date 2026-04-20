@@ -127,6 +127,8 @@ type mockDocker struct {
 	statsByID       map[string]container.StatsResponse
 	statsStreamByID map[string][]container.StatsResponse
 	statsErr        error
+	restartCalls  []restartCall
+	restartErr    error
 	eventsResult  client.EventsResult
 	imageResult   client.ImageListResult
 	imageErr      error
@@ -134,6 +136,11 @@ type mockDocker struct {
 	volumeErr     error
 	networkResult client.NetworkListResult
 	networkErr    error
+}
+
+type restartCall struct {
+	ID      string
+	Timeout *int
 }
 
 func (m *mockDocker) ContainerList(ctx context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -152,6 +159,11 @@ func (m *mockDocker) ContainerInspect(ctx context.Context, id string, _ client.C
 
 func (m *mockDocker) Events(ctx context.Context, _ client.EventsListOptions) client.EventsResult {
 	return m.eventsResult
+}
+
+func (m *mockDocker) ContainerRestart(ctx context.Context, id string, opts client.ContainerRestartOptions) (client.ContainerRestartResult, error) {
+	m.restartCalls = append(m.restartCalls, restartCall{ID: id, Timeout: opts.Timeout})
+	return client.ContainerRestartResult{}, m.restartErr
 }
 
 func (m *mockDocker) ImageList(ctx context.Context, _ client.ImageListOptions) (client.ImageListResult, error) {
@@ -1352,6 +1364,180 @@ func TestStreamStackContainerLogs_DockerUnconfigured503(t *testing.T) {
 
 // Keep the stdcopy multi-frame helper compiled in case future tests want it.
 var _ = frameMulti
+
+// ---------------------------------------------------------------------------
+// Container restart
+// ---------------------------------------------------------------------------
+
+func TestRestartStackContainer_HappyPath(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{Labels: map[string]string{
+					"managed-by":       "accelero",
+					"accelero-stack":   "demo",
+					"accelero-service": "web",
+					"accelero-replica": "0",
+				}},
+			}},
+		},
+	}
+	recorder := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Docker: docker, Audit: recorder}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/demo/containers/cid/restart?t=5", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	require.Len(t, docker.restartCalls, 1)
+	assert.Equal(t, "cid", docker.restartCalls[0].ID)
+	require.NotNil(t, docker.restartCalls[0].Timeout)
+	assert.Equal(t, 5, *docker.restartCalls[0].Timeout)
+
+	// Audit row captured the operator action with service/replica context.
+	require.Len(t, recorder.entries, 1)
+	got := recorder.entries[0]
+	assert.Equal(t, "container.restart", got.Operation)
+	assert.Equal(t, "api-key", got.Actor)
+	assert.Equal(t, "cid", got.ResourceID)
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+	assert.Equal(t, "web", got.Metadata["service"])
+	assert.Equal(t, "0", got.Metadata["replica"])
+	assert.Equal(t, "5", got.Metadata["timeout_seconds"])
+}
+
+func TestRestartStackContainer_DefaultTimeoutUnset(t *testing.T) {
+	// No ?t= → Options.Timeout stays nil (Docker uses its default).
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "demo",
+			}},
+		}},
+	}}
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/demo/containers/cid/restart", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	require.Len(t, docker.restartCalls, 1)
+	assert.Nil(t, docker.restartCalls[0].Timeout, "no ?t= → Timeout pointer stays nil")
+}
+
+func TestRestartStackContainer_BadTimeout400(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "demo",
+			}},
+		}},
+	}}
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/demo/containers/cid/restart?t=not-a-number", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Empty(t, docker.restartCalls, "handler must reject before calling Docker")
+}
+
+func TestRestartStackContainer_ForeignStack404(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "ours", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "theirs",
+			}},
+		}},
+	}}
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/ours/containers/cid/restart", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+	assert.Empty(t, docker.restartCalls, "foreign container: no Docker call issued")
+}
+
+func TestRestartStackContainer_DockerErrorStillAudits(t *testing.T) {
+	// If Docker returns an error, the handler returns 500 — but the
+	// audit row is still written with Outcome=failure so the trail
+	// captures the attempted operator action regardless.
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{Labels: map[string]string{
+					"managed-by":     "accelero",
+					"accelero-stack": "demo",
+				}},
+			}},
+		},
+		restartErr: errReadyzTest("docker daemon unhappy"),
+	}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Docker: docker, Audit: rec}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/demo/containers/cid/restart", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Len(t, rec.entries, 1, "audit row must be written even on failure")
+	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
+	assert.Contains(t, rec.entries[0].ErrorMessage, "docker daemon unhappy")
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket stats stream
