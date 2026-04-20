@@ -148,6 +148,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 **Resource browsers (root-level, read-only):**
 - `GET /api/v1/images` — images referenced by accelero-managed containers, with back-references (stack/service/replica/container). Walks containers to derive "managed" since images don't carry labels.
 - `GET /api/v1/volumes` — volumes labelled managed-by=accelero.
+- `GET /api/v1/volumes/{name}/browse` — list files in a managed volume or (with `?download=true`) stream one file's contents. Read-only; backed by an ephemeral busybox helper container mounted at `/volume:ro`. 10MB download cap, 10k-entry listing cap, `..` paths rejected, volumes.browse/read audited.
 - `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
 - All three accept `?stack=<name>` to narrow to one stack.
 

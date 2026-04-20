@@ -133,4 +133,6 @@ const (
 	// or may deliberately override it (exec, volume write — not shipped
 	// yet).
 	AuditOpContainerRestart = "container.restart"
+	AuditOpVolumeBrowse     = "volume.browse"
+	AuditOpVolumeRead       = "volume.read"
 )
