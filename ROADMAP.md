@@ -74,8 +74,8 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 
 **Observability basics:**
 - [ ] Structured request/deployment ID propagation through all log entries
-- [ ] Prometheus metrics endpoint (`/metrics`) — deployments count, duration, failures, drift events, active reconcile loops
-- [ ] Deployment diff preview (`POST /stacks/{id}/preview` — show what would change without deploying)
+- [x] Prometheus metrics endpoint (`/metrics`) — deployments count, duration, failures, drift events, active reconcile loops
+- [x] Deployment diff preview (`POST /stacks/{id}/preview` — show what would change without deploying)
 - [ ] `/healthz` and `/readyz` endpoints (distinct from `/health`)
 
 ---
