@@ -132,6 +132,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs/stream", h.StreamStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/stats/stream", h.StreamStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
 
 	// Read-only resource browsers (Phase 3) — root-level; scoped to
@@ -1233,6 +1234,119 @@ func (h *Handler) GetStackContainerStats(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, computeStatsSample(raw, insp.Container.ID, insp.Container.Name), http.StatusOK)
+}
+
+// StreamStackContainerStats upgrades to a WebSocket and emits one
+// computed stats sample per Docker sampling tick (roughly 1s).  Shape
+// is identical to the one-shot /stats payload so clients can reuse
+// the same parser; the only difference is that the first sample may
+// report cpu.percent=0 until Docker has a prior sample to diff against.
+//
+// This is the "I want a live graph" counterpart to /stats.  Same X-API-KEY
+// auth on the upgrade GET as the rest of the API.  Ping/close semantics
+// mirror /logs/stream — 30s application pings, normal-closure frame
+// on daemon EOF, read goroutine cancels the upstream stream on
+// client-initiated disconnect.
+func (h *Handler) StreamStackContainerStats(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	conn, err := wsLogUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logctx.FromContext(r.Context()).WithError(err).Debug("websocket upgrade failed")
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Stream=true asks the daemon to emit samples on its own cadence
+	// (~1s). No IncludePreviousSample — each subsequent sample already
+	// carries the prior one in PreCPUStats.
+	res, err := h.Docker.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
+		Stream: true,
+	})
+	if err != nil {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "container stats: "+err.Error()),
+			time.Now().Add(wsWriteTimeout))
+		return
+	}
+	defer res.Body.Close()
+
+	// Monitor the socket for client close and pong replies.
+	go func() {
+		conn.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+			return nil
+		})
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	pings := time.NewTicker(wsPingInterval)
+	defer pings.Stop()
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pings.C:
+				_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout))
+			}
+		}
+	}()
+
+	// Docker streams stats as newline-delimited JSON objects; decode one
+	// per iteration, project, and frame as a WS text message.
+	dec := json.NewDecoder(res.Body)
+	log := logctx.FromContext(ctx)
+	for {
+		var raw container.StatsResponse
+		if err := dec.Decode(&raw); err != nil {
+			if err != io.EOF {
+				log.WithError(err).Debug("stats stream decode ended")
+			}
+			break
+		}
+		sample := computeStatsSample(raw, insp.Container.ID, insp.Container.Name)
+		payload, marshalErr := json.Marshal(sample)
+		if marshalErr != nil {
+			log.WithError(marshalErr).Warn("marshal stats sample")
+			continue
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			break
+		}
+	}
+
+	_ = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(wsWriteTimeout))
+
+	cancel()
+	<-pingDone
 }
 
 // computeStatsSample digests a raw StatsResponse into our API shape.
