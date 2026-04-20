@@ -108,10 +108,11 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [ ] `POST /volumes/{name}/write` — emergency file write (off by default, requires `--allow-volume-writes` flag)
 
 **Audit log:**
-- [ ] Persistent audit log in SQLite — every API action with timestamp, user, operation, resource
-- [ ] `GET /audit` with filtering by stack, user, time range
-- [ ] Audit entries for: deploys, drifts detected, drifts auto-corrected, exec sessions, restarts
-- [ ] Immutable — append-only table, no update/delete API
+- [x] Persistent audit log in SQLite — every notable write / system event with timestamp, actor, operation, resource, outcome, metadata
+- [x] `GET /api/v1/audit` with filtering by stack (id or name), actor, operation, since, limit
+- [x] Audit entries for: stack CRUD; deploy start/complete/failed; drift detected (one per cycle, per-type counts in metadata); drift auto-deployed. Exec sessions / container restarts will hook the same recorder when those endpoints land.
+- [x] Immutable at the store layer — only Create + List exposed, no update/delete path
+- [ ] Time-based retention (follow-up — same pattern as the existing deployment-history cleanup)
 
 ---
 

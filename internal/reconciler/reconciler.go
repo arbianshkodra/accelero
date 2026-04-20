@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/metrics"
@@ -81,12 +82,32 @@ type Reconciler struct {
 	docker   *client.Client
 	deployer Deployer
 
+	// audit records drift observations and auto-deploy triggers as
+	// system:reconciler events. nil disables audit — useful in tests
+	// and minimal setups.
+	audit audit.Recorder
+
 	mu    sync.Mutex          // guards loops
 	loops map[string]*stackLoop // keyed by stack ID
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// SetAudit attaches an audit recorder. Setter rather than constructor
+// param to avoid churning every New() call site.
+func (r *Reconciler) SetAudit(a audit.Recorder) {
+	r.audit = a
+}
+
+// recordAudit is a nil-safe wrapper around the audit recorder. Failures
+// are warn-logged inside the recorder; callers don't check the return.
+func (r *Reconciler) recordAudit(ctx context.Context, e store.AuditEntry) {
+	if r.audit == nil {
+		return
+	}
+	_ = r.audit.Record(ctx, e)
 }
 
 // New creates a Reconciler. Call Start to begin reconciliation loops.
@@ -287,16 +308,48 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 
 	if report.HasDrift {
 		log.Infof("drift detected: %d drift(s)", len(report.Drifts))
+		driftTypes := make(map[string]int, len(report.Drifts))
 		for _, d := range report.Drifts {
 			metrics.RecordDrift(stack.Name, d.Type)
+			driftTypes[d.Type]++
 			log.WithFields(logrus.Fields{
 				"drift_type":   d.Type,
 				"service_name": d.ServiceName,
 			}).Info(d.Message)
 		}
 
+		// One audit row per reconcile cycle with drift, not per item —
+		// a single stack can emit many drift items at steady state
+		// (stopped containers, extra containers) and we don't want to
+		// spam the audit log. Counts by type are stashed in metadata.
+		driftAudit := audit.FromSystem("reconciler", store.AuditOpDriftDetected)
+		driftAudit.ResourceType = "stack"
+		driftAudit.ResourceID = stack.ID
+		driftAudit.StackID = stack.ID
+		driftAudit.StackName = stack.Name
+		driftAudit.Metadata = map[string]string{
+			"drift_count": fmt.Sprintf("%d", len(report.Drifts)),
+		}
+		for t, n := range driftTypes {
+			driftAudit.Metadata["drift_type_"+t] = fmt.Sprintf("%d", n)
+		}
+		r.recordAudit(ctx, driftAudit)
+
 		if stack.AutoDeploy {
 			log.Info("auto-deploying to resolve drift")
+
+			autoAudit := audit.FromSystem("reconciler", store.AuditOpDriftAutoDeployed)
+			autoAudit.ResourceType = "stack"
+			autoAudit.ResourceID = stack.ID
+			autoAudit.StackID = stack.ID
+			autoAudit.StackName = stack.Name
+			autoAudit.Outcome = store.AuditOutcomeInProgress
+			autoAudit.Metadata = map[string]string{
+				"trigger":     store.TriggerReconcile,
+				"drift_count": fmt.Sprintf("%d", len(report.Drifts)),
+			}
+			r.recordAudit(ctx, autoAudit)
+
 			if _, deployErr := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); deployErr != nil {
 				log.WithError(deployErr).Error("auto-deploy failed")
 			}

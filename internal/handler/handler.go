@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
@@ -67,6 +68,11 @@ type Handler struct {
 	Deployer   Deployer
 	Reconciler *reconciler.Reconciler
 
+	// Audit records notable write actions to the audit log. Defaults to
+	// a NoopRecorder when nil so existing tests that don't wire audit
+	// keep passing. Production wires audit.NewStoreRecorder(db).
+	Audit audit.Recorder
+
 	// Docker backs the read-only container introspection endpoints
 	// (/stacks/{id}/containers, .../containers/{cid}, .../logs). Nil
 	// disables those endpoints (they return 503) — useful in tests or
@@ -91,6 +97,16 @@ type Handler struct {
 // server.Shutdown.
 func (h *Handler) SetShuttingDown() {
 	h.shuttingDown.Store(true)
+}
+
+// auditOr returns the handler's configured Audit recorder or a
+// NoopRecorder if none was wired. Call sites can always dereference
+// the result without a nil check.
+func (h *Handler) auditOr() audit.Recorder {
+	if h.Audit == nil {
+		return audit.NoopRecorder{}
+	}
+	return h.Audit
 }
 
 // RegisterRoutes mounts all API endpoints onto the given router.
@@ -140,6 +156,9 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/images", h.ListManagedImages).Methods("GET")
 	api.HandleFunc("/volumes", h.ListManagedVolumes).Methods("GET")
 	api.HandleFunc("/networks", h.ListManagedNetworks).Methods("GET")
+
+	// Audit log — read-only; append-only at the store layer.
+	api.HandleFunc("/audit", h.ListAuditEntries).Methods("GET")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -219,6 +238,13 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 		h.Reconciler.RefreshStack(stack.ID)
 	}
 
+	entry := audit.FromRequest(r, store.AuditOpStackCreate)
+	entry.ResourceType = "stack"
+	entry.ResourceID = stack.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	_ = h.auditOr().Record(r.Context(), entry)
+
 	writeJSON(w, stack, http.StatusCreated)
 }
 
@@ -255,7 +281,15 @@ func (h *Handler) GetStack(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	stack, err := h.Store.GetStack(id)
-	if err != nil || stack == nil {
+	if err != nil {
+		writeError(w, "failed to get stack", http.StatusInternalServerError)
+		return
+	}
+	if stack == nil {
+		// Id-or-name fallback, matching the other stack-CRUD endpoints.
+		stack, _ = h.Store.GetStackByName(id)
+	}
+	if stack == nil {
 		writeError(w, "stack not found", http.StatusNotFound)
 		return
 	}
@@ -330,6 +364,13 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 		h.Reconciler.RefreshStack(stack.ID)
 	}
 
+	entry := audit.FromRequest(r, store.AuditOpStackUpdate)
+	entry.ResourceType = "stack"
+	entry.ResourceID = stack.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	_ = h.auditOr().Record(r.Context(), entry)
+
 	writeJSON(w, stack, http.StatusOK)
 }
 
@@ -371,6 +412,13 @@ func (h *Handler) DeleteStack(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	entry := audit.FromRequest(r, store.AuditOpStackDelete)
+	entry.ResourceType = "stack"
+	entry.ResourceID = stack.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	_ = h.auditOr().Record(r.Context(), entry)
+
 	writeJSON(w, map[string]string{"status": "deleted"}, http.StatusOK)
 }
 
@@ -394,6 +442,18 @@ func (h *Handler) DeployStack(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "deployment already in progress", http.StatusConflict)
 		return
 	}
+
+	// Record the "deploy requested" intent synchronously before the
+	// background goroutine runs. The deployer itself records the
+	// completion/failure outcome once it knows which one applies.
+	startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
+	startEntry.ResourceType = "stack"
+	startEntry.ResourceID = stack.ID
+	startEntry.StackID = stack.ID
+	startEntry.StackName = stack.Name
+	startEntry.Outcome = store.AuditOutcomeInProgress
+	startEntry.Metadata = map[string]string{"trigger": store.TriggerManual}
+	_ = h.auditOr().Record(r.Context(), startEntry)
 
 	// Capture the request's logger so the background goroutine keeps the
 	// request_id on every subsequent log line.
@@ -550,6 +610,75 @@ func driftToAction(d reconciler.DriftItem) PreviewAction {
 }
 
 // --------------------------------------------------------------------------
+// Audit log endpoint
+// --------------------------------------------------------------------------
+
+// ListAuditEntries returns audit rows newest-first. Immutable by design —
+// there's no write/update/delete endpoint here; the store's schema only
+// supports append. Retention is time-based (handled by the cleanup
+// routine, added separately) rather than per-stack cascade.
+//
+// Query parameters:
+//   - stack:     exact match on stack name (convenience — resolves to ID first)
+//   - actor:     exact match on actor
+//   - operation: exact match on operation (see store.AuditOp*)
+//   - since:     Go duration (e.g. "24h") — only entries newer than N ago
+//   - limit:     max rows, default 100, store-capped at 1000
+func (h *Handler) ListAuditEntries(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	filter := store.AuditFilter{
+		Actor:     q.Get("actor"),
+		Operation: q.Get("operation"),
+	}
+
+	// The stack query param accepts either an ID or a name. Resolve
+	// to an ID when it looks like a name — saves the caller having to
+	// know which they have.
+	if raw := q.Get("stack"); raw != "" {
+		if s, _ := h.Store.GetStack(raw); s != nil {
+			filter.StackID = s.ID
+		} else if s, _ := h.Store.GetStackByName(raw); s != nil {
+			filter.StackID = s.ID
+		} else {
+			// Unknown stack — filter by the raw value against stack_name
+			// so entries from a now-deleted stack still surface when
+			// the caller names it.
+			filter.StackName = raw
+		}
+	}
+
+	if raw := q.Get("since"); raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, "since must be a Go duration (e.g. 24h, 5m)", http.StatusBadRequest)
+			return
+		}
+		filter.Since = time.Now().Add(-dur)
+	}
+
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, "limit must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		filter.Limit = n
+	}
+
+	entries, err := h.Store.ListAuditEntries(filter)
+	if err != nil {
+		logctx.FromContext(r.Context()).WithError(err).Error("list audit entries")
+		writeError(w, "failed to list audit entries", http.StatusInternalServerError)
+		return
+	}
+	if entries == nil {
+		entries = []*store.AuditEntry{}
+	}
+	writeJSON(w, entries, http.StatusOK)
+}
+
+// --------------------------------------------------------------------------
 // Legacy webhook — triggers the "default" stack deploy
 // --------------------------------------------------------------------------
 
@@ -595,6 +724,15 @@ func (h *Handler) LegacyWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "no stacks configured", http.StatusNotFound)
 		return
 	}
+
+	startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
+	startEntry.ResourceType = "stack"
+	startEntry.ResourceID = stack.ID
+	startEntry.StackID = stack.ID
+	startEntry.StackName = stack.Name
+	startEntry.Outcome = store.AuditOutcomeInProgress
+	startEntry.Metadata = map[string]string{"trigger": store.TriggerWebhook}
+	_ = h.auditOr().Record(r.Context(), startEntry)
 
 	reqLogger := logctx.FromContext(r.Context())
 
