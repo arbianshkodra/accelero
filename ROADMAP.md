@@ -92,7 +92,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /stacks/{id}/containers/{cid}/logs` — one-shot tail with `tail` / `since` / `timestamps`; follow via WebSocket is a separate ticket below
 - [ ] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket for live logs
 - [x] `GET /stacks/{id}/containers/{cid}/stats` — CPU%, memory used/limit/%, per-iface network rx/tx, block I/O totals, PIDs (snapshot). Streaming is a separate WebSocket ticket below.
-- [ ] `GET /events` — Docker event stream filtered to accelero-managed containers
+- [x] `GET /stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources (accelero-service / accelero-replica surfaced). Stack-wide view is the common one; a daemon-wide `/events` variant across all stacks can come later if needed.
 
 **Resource browsers (read-only, filtered to accelero-managed):**
 - [ ] `GET /images` — images used by managed stacks, with size, layers, pull timestamp
