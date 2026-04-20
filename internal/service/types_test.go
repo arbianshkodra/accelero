@@ -280,3 +280,51 @@ init: true
 	require.NotNil(t, svc.Init)
 	assert.True(t, *svc.Init)
 }
+
+// ---------------------------------------------------------------------------
+// deploy.replicas
+// ---------------------------------------------------------------------------
+
+func TestDesiredReplicas_DefaultsToOne(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want int
+	}{
+		{name: "no deploy block", yaml: `image: nginx`, want: 1},
+		{name: "deploy without replicas", yaml: "image: nginx\ndeploy:\n  mode: replicated", want: 1},
+		{name: "replicas zero treated as default", yaml: "image: nginx\ndeploy:\n  replicas: 0", want: 1},
+		{name: "replicas negative treated as default", yaml: "image: nginx\ndeploy:\n  replicas: -1", want: 1},
+		{name: "replicas one", yaml: "image: nginx\ndeploy:\n  replicas: 1", want: 1},
+		{name: "replicas three", yaml: "image: nginx\ndeploy:\n  replicas: 3", want: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var svc ComposeService
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), &svc))
+			assert.Equal(t, tc.want, svc.DesiredReplicas())
+		})
+	}
+}
+
+func TestHasStaticPublishedPort(t *testing.T) {
+	cases := []struct {
+		name  string
+		ports []string
+		want  bool
+	}{
+		{name: "no ports", ports: nil, want: false},
+		{name: "bare container port", ports: []string{"80"}, want: false},
+		{name: "bare container port with proto", ports: []string{"80/tcp"}, want: false},
+		{name: "published host:container", ports: []string{"8080:80"}, want: true},
+		{name: "published with ip", ports: []string{"127.0.0.1:8080:80"}, want: true},
+		{name: "published with proto", ports: []string{"8080:80/udp"}, want: true},
+		{name: "mixed list triggers if any static", ports: []string{"80", "8080:80"}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := ComposeService{Ports: tc.ports}
+			assert.Equal(t, tc.want, svc.HasStaticPublishedPort())
+		})
+	}
+}
