@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,7 +18,11 @@ import (
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/store"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/gorilla/mux"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 )
 
@@ -35,11 +41,26 @@ type Deployer interface {
 	Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error)
 }
 
+// DockerClient is the subset of the moby client used by the handler's
+// container-introspection endpoints. A narrow interface lets tests drop
+// in a fake without wiring a real daemon.
+type DockerClient interface {
+	ContainerList(ctx context.Context, options client.ContainerListOptions) (client.ContainerListResult, error)
+	ContainerInspect(ctx context.Context, id string, options client.ContainerInspectOptions) (client.ContainerInspectResult, error)
+	ContainerLogs(ctx context.Context, id string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
+}
+
 // Handler holds all dependencies for the HTTP API.
 type Handler struct {
 	Store      store.Store
 	Deployer   Deployer
 	Reconciler *reconciler.Reconciler
+
+	// Docker backs the read-only container introspection endpoints
+	// (/stacks/{id}/containers, .../containers/{cid}, .../logs). Nil
+	// disables those endpoints (they return 503) — useful in tests or
+	// in minimal deploys that don't expose runtime introspection.
+	Docker DockerClient
 
 	// DockerPing is called by /readyz to verify Docker daemon connectivity.
 	// nil disables the Docker check — useful in tests, or in the unlikely
@@ -93,6 +114,11 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/deployments", h.ListDeployments).Methods("GET")
 	api.HandleFunc("/stacks/{id}/drift", h.CheckDrift).Methods("GET")
 	api.HandleFunc("/stacks/{id}/preview", h.PreviewDeploy).Methods("POST")
+
+	// Read-only container introspection (Phase 3).
+	api.HandleFunc("/stacks/{id}/containers", h.ListStackContainers).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}", h.GetStackContainer).Methods("GET")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -641,6 +667,493 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 func readJSON(r *http.Request, v interface{}) error {
 	r.Body = http.MaxBytesReader(nil, r.Body, maxPayloadSize)
 	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// --------------------------------------------------------------------------
+// Container introspection (Phase 3)
+// --------------------------------------------------------------------------
+
+const (
+	containerLabelManagedBy    = "managed-by"
+	containerLabelManagedValue = "accelero"
+	containerLabelStackName    = "accelero-stack"
+	containerLabelServiceName  = "accelero-service"
+	containerLabelReplicaIndex = "accelero-replica"
+
+	// defaultLogTail is the number of log lines returned when the caller
+	// omits ?tail=. maxLogTail guards against accidentally streaming a
+	// gigabyte of history in a single GET.
+	defaultLogTail = 100
+	maxLogTail     = 10000
+
+	containerOpTimeout = 10 * time.Second
+)
+
+// ContainerSummary is the API response shape for the list endpoint.
+// Intentionally narrower than Docker's Summary so the contract can evolve
+// independently of moby internal types.
+type ContainerSummary struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Image     string            `json:"image"`
+	Service   string            `json:"service,omitempty"`
+	Replica   *int              `json:"replica,omitempty"`
+	State     string            `json:"state"`
+	Status    string            `json:"status"`
+	Health    string            `json:"health,omitempty"`
+	CreatedAt time.Time         `json:"created_at"`
+	Ports     []ContainerPort   `json:"ports,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
+}
+
+// ContainerPort is the normalised port-binding view served by both the
+// list and detail endpoints.
+type ContainerPort struct {
+	ContainerPort uint16 `json:"container_port"`
+	Protocol      string `json:"protocol"`
+	HostPort      uint16 `json:"host_port,omitempty"`
+	HostIP        string `json:"host_ip,omitempty"`
+}
+
+// ContainerDetail extends Summary with inspect-level fields for a single
+// container. Env is redacted by default — see redactEnv.
+type ContainerDetail struct {
+	ContainerSummary
+	Cmd           []string                            `json:"cmd,omitempty"`
+	Entrypoint    []string                            `json:"entrypoint,omitempty"`
+	Env           []string                            `json:"env,omitempty"`
+	WorkingDir    string                              `json:"working_dir,omitempty"`
+	User          string                              `json:"user,omitempty"`
+	RestartCount  int                                 `json:"restart_count"`
+	RestartPolicy string                              `json:"restart_policy,omitempty"`
+	StartedAt     string                              `json:"started_at,omitempty"`
+	FinishedAt    string                              `json:"finished_at,omitempty"`
+	ExitCode      int                                 `json:"exit_code"`
+	Networks      map[string]ContainerNetworkEndpoint `json:"networks,omitempty"`
+	Mounts        []ContainerMount                    `json:"mounts,omitempty"`
+}
+
+type ContainerNetworkEndpoint struct {
+	NetworkID  string   `json:"network_id,omitempty"`
+	IPAddress  string   `json:"ip_address,omitempty"`
+	Gateway    string   `json:"gateway,omitempty"`
+	MACAddress string   `json:"mac_address,omitempty"`
+	Aliases    []string `json:"aliases,omitempty"`
+}
+
+type ContainerMount struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Mode        string `json:"mode,omitempty"`
+	Type        string `json:"type,omitempty"`
+	RW          bool   `json:"rw"`
+}
+
+// ListStackContainers returns every container managed by Accelero for the
+// given stack. Label filters ensure we never leak unmanaged containers or
+// containers from a different stack even if the caller guesses names.
+func (h *Handler) ListStackContainers(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
+	defer cancel()
+
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue)).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stack.Name))
+
+	res, err := h.Docker.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: filters,
+	})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("container list failed")
+		writeError(w, "failed to list containers", http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]ContainerSummary, 0, len(res.Items))
+	for _, c := range res.Items {
+		out = append(out, summaryFromDocker(c))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Service != out[j].Service {
+			return out[i].Service < out[j].Service
+		}
+		ri, rj := -1, -1
+		if out[i].Replica != nil {
+			ri = *out[i].Replica
+		}
+		if out[j].Replica != nil {
+			rj = *out[j].Replica
+		}
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].Name < out[j].Name
+	})
+
+	writeJSON(w, out, http.StatusOK)
+}
+
+// GetStackContainer returns inspect-level detail for a single container.
+// Verifies managed-by / stack labels before returning — guesses at another
+// stack's container IDs get a 404, not a data leak.
+func (h *Handler) GetStackContainer(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
+	defer cancel()
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	writeJSON(w, detailFromInspect(insp), http.StatusOK)
+}
+
+// GetStackContainerLogs streams the logs of a single container as
+// text/plain. Multiplexed stdout/stderr from non-TTY containers is
+// demuxed transparently before the body is written to the response.
+//
+// Query params:
+//   - tail      (int)      default 100, capped at maxLogTail
+//   - since     (Go duration, e.g. "5m")
+//   - timestamps(bool)     include Docker's RFC3339Nano timestamps
+func (h *Handler) GetStackContainerLogs(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	tailStr := strconv.Itoa(defaultLogTail)
+	if raw := r.URL.Query().Get("tail"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, "tail must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		if n > maxLogTail {
+			n = maxLogTail
+		}
+		tailStr = strconv.Itoa(n)
+	}
+
+	var since string
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		dur, err := time.ParseDuration(raw)
+		if err != nil {
+			writeError(w, "since must be a Go duration (e.g. 5m, 30s)", http.StatusBadRequest)
+			return
+		}
+		// Docker accepts an RFC3339 / Unix-seconds timestamp for Since;
+		// computing from now() is more intuitive than the raw duration.
+		since = strconv.FormatInt(time.Now().Add(-dur).Unix(), 10)
+	}
+
+	timestamps := r.URL.Query().Get("timestamps") == "true"
+
+	stream, err := h.Docker.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       tailStr,
+		Since:      since,
+		Timestamps: timestamps,
+		Follow:     false,
+	})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("container logs failed")
+		writeError(w, "failed to read container logs", http.StatusInternalServerError)
+		return
+	}
+	defer stream.Close()
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	// TTY containers produce a single raw stream; non-TTY containers use
+	// Docker's framed multiplex which we demux into the response body.
+	if insp.Container.Config != nil && insp.Container.Config.Tty {
+		if _, err := io.Copy(w, stream); err != nil {
+			logctx.FromContext(ctx).WithError(err).Warn("truncated tty log stream")
+		}
+		return
+	}
+
+	if _, err := stdcopy.StdCopy(w, w, stream); err != nil {
+		logctx.FromContext(ctx).WithError(err).Warn("truncated demuxed log stream")
+	}
+}
+
+// resolveStack is shared between all the /stacks/{id}/* endpoints. It
+// writes the response on error and returns (nil, false).
+func (h *Handler) resolveStack(w http.ResponseWriter, r *http.Request) (*store.Stack, bool) {
+	id := mux.Vars(r)["id"]
+	stack, err := h.Store.GetStack(id)
+	if err != nil {
+		writeError(w, "failed to get stack", http.StatusInternalServerError)
+		return nil, false
+	}
+	if stack == nil {
+		stack, _ = h.Store.GetStackByName(id)
+	}
+	if stack == nil {
+		writeError(w, "stack not found", http.StatusNotFound)
+		return nil, false
+	}
+	return stack, true
+}
+
+// resolveStackContainer inspects a container and verifies it is managed by
+// Accelero and belongs to the given stack. Any verification failure maps to
+// a 404 so callers probing foreign IDs cannot distinguish "doesn't exist"
+// from "exists but isn't yours". Writes the error on failure.
+func (h *Handler) resolveStackContainer(
+	ctx context.Context,
+	w http.ResponseWriter,
+	stackName, containerID string,
+) (client.ContainerInspectResult, bool) {
+	var empty client.ContainerInspectResult
+	insp, err := h.Docker.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			writeError(w, "container not found", http.StatusNotFound)
+			return empty, false
+		}
+		logctx.FromContext(ctx).WithError(err).Error("container inspect failed")
+		writeError(w, "failed to inspect container", http.StatusInternalServerError)
+		return empty, false
+	}
+	if !containerBelongsToStack(insp.Container, stackName) {
+		writeError(w, "container not found", http.StatusNotFound)
+		return empty, false
+	}
+	return insp, true
+}
+
+// containerBelongsToStack checks the management labels on a container.
+// Any missing or mismatched label means the container is not Accelero's
+// (or belongs to a different stack) — the caller should present a 404.
+func containerBelongsToStack(c container.InspectResponse, stackName string) bool {
+	if c.Config == nil {
+		return false
+	}
+	if c.Config.Labels[containerLabelManagedBy] != containerLabelManagedValue {
+		return false
+	}
+	if c.Config.Labels[containerLabelStackName] != stackName {
+		return false
+	}
+	return true
+}
+
+// summaryFromDocker projects Docker's Summary onto our API shape.
+func summaryFromDocker(c container.Summary) ContainerSummary {
+	name := ""
+	if len(c.Names) > 0 {
+		name = strings.TrimPrefix(c.Names[0], "/")
+	}
+	replica := parseReplicaLabel(c.Labels[containerLabelReplicaIndex])
+
+	summary := ContainerSummary{
+		ID:        c.ID,
+		Name:      name,
+		Image:     c.Image,
+		Service:   c.Labels[containerLabelServiceName],
+		Replica:   replica,
+		State:     string(c.State),
+		Status:    c.Status,
+		CreatedAt: time.Unix(c.Created, 0).UTC(),
+		Labels:    c.Labels,
+	}
+	if c.Health != nil {
+		summary.Health = string(c.Health.Status)
+	}
+	for _, p := range c.Ports {
+		cp := ContainerPort{
+			ContainerPort: p.PrivatePort,
+			Protocol:      p.Type,
+			HostPort:      p.PublicPort,
+		}
+		if p.IP.IsValid() {
+			cp.HostIP = p.IP.String()
+		}
+		summary.Ports = append(summary.Ports, cp)
+	}
+	return summary
+}
+
+// detailFromInspect builds the richer detail view from an inspect response.
+// Env is redacted — see redactEnv for the policy.
+func detailFromInspect(r client.ContainerInspectResult) ContainerDetail {
+	c := r.Container
+	name := strings.TrimPrefix(c.Name, "/")
+	replica := -1
+	if c.Config != nil {
+		if idx := parseReplicaLabel(c.Config.Labels[containerLabelReplicaIndex]); idx != nil {
+			replica = *idx
+		}
+	}
+
+	detail := ContainerDetail{
+		ContainerSummary: ContainerSummary{
+			ID:     c.ID,
+			Name:   name,
+			Image:  c.Image,
+			Labels: labelsFromConfig(c.Config),
+		},
+	}
+	if replica >= 0 {
+		r := replica
+		detail.Replica = &r
+	}
+	if created, err := time.Parse(time.RFC3339Nano, c.Created); err == nil {
+		detail.CreatedAt = created.UTC()
+	}
+	if c.State != nil {
+		detail.State = string(c.State.Status)
+		detail.Status = fmt.Sprintf("state=%s", c.State.Status)
+		if c.State.Health != nil {
+			detail.Health = string(c.State.Health.Status)
+		}
+		detail.StartedAt = c.State.StartedAt
+		detail.FinishedAt = c.State.FinishedAt
+		detail.ExitCode = c.State.ExitCode
+	}
+	detail.RestartCount = c.RestartCount
+	if c.HostConfig != nil && c.HostConfig.RestartPolicy.Name != "" {
+		detail.RestartPolicy = string(c.HostConfig.RestartPolicy.Name)
+	}
+	if c.Config != nil {
+		detail.Cmd = []string(c.Config.Cmd)
+		detail.Entrypoint = []string(c.Config.Entrypoint)
+		detail.Env = redactEnv(c.Config.Env)
+		detail.WorkingDir = c.Config.WorkingDir
+		detail.User = c.Config.User
+		detail.Service = c.Config.Labels[containerLabelServiceName]
+	}
+
+	if c.NetworkSettings != nil {
+		detail.Networks = make(map[string]ContainerNetworkEndpoint, len(c.NetworkSettings.Networks))
+		for netName, ep := range c.NetworkSettings.Networks {
+			if ep == nil {
+				continue
+			}
+			endpoint := ContainerNetworkEndpoint{
+				NetworkID: ep.NetworkID,
+				Aliases:   ep.Aliases,
+			}
+			if ep.IPAddress.IsValid() {
+				endpoint.IPAddress = ep.IPAddress.String()
+			}
+			if ep.Gateway.IsValid() {
+				endpoint.Gateway = ep.Gateway.String()
+			}
+			if len(ep.MacAddress) > 0 {
+				endpoint.MACAddress = ep.MacAddress.String()
+			}
+			detail.Networks[netName] = endpoint
+		}
+	}
+
+	for _, m := range c.Mounts {
+		detail.Mounts = append(detail.Mounts, ContainerMount{
+			Source:      m.Source,
+			Destination: m.Destination,
+			Mode:        m.Mode,
+			Type:        string(m.Type),
+			RW:          m.RW,
+		})
+	}
+
+	return detail
+}
+
+func labelsFromConfig(cfg *container.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Labels
+}
+
+// parseReplicaLabel returns the replica index, or nil when the label is
+// missing or malformed (legacy containers pre-dating deploy.replicas).
+func parseReplicaLabel(raw string) *int {
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil
+	}
+	return &n
+}
+
+// redactEnv masks values whose key looks like a secret. The goal isn't
+// perfect — anything in a container's env is technically visible to anyone
+// who can exec into the host — but surfacing `API_TOKEN=...` in a JSON
+// response is strictly worse than hiding it and letting the operator drop
+// down to `docker inspect` when they really need the value.
+func redactEnv(env []string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		idx := strings.IndexByte(entry, '=')
+		if idx < 0 {
+			out = append(out, entry)
+			continue
+		}
+		key := entry[:idx]
+		if isSecretKey(key) {
+			out = append(out, key+"=***")
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// isSecretKey recognises the conventional "this is a secret" substrings.
+// Case-insensitive match on the *key*, not the value.
+func isSecretKey(key string) bool {
+	upper := strings.ToUpper(key)
+	for _, needle := range []string{"PASSWORD", "TOKEN", "SECRET", "APIKEY", "API_KEY", "PRIVATE", "CREDENTIAL"} {
+		if strings.Contains(upper, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, data interface{}, status int) {
