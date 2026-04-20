@@ -16,6 +16,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
@@ -122,6 +123,7 @@ type mockDocker struct {
 	logsErr       error
 	statsByID     map[string]container.StatsResponse
 	statsErr      error
+	eventsResult  client.EventsResult
 }
 
 func (m *mockDocker) ContainerList(ctx context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -136,6 +138,10 @@ func (m *mockDocker) ContainerInspect(ctx context.Context, id string, _ client.C
 		return res, nil
 	}
 	return client.ContainerInspectResult{}, errNotFound("container")
+}
+
+func (m *mockDocker) Events(ctx context.Context, _ client.EventsListOptions) client.EventsResult {
+	return m.eventsResult
 }
 
 func (m *mockDocker) ContainerStats(ctx context.Context, id string, _ client.ContainerStatsOptions) (client.ContainerStatsResult, error) {
@@ -695,4 +701,196 @@ func TestGetStackContainerStats_ForeignStack404(t *testing.T) {
 	router.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Events: pure projection
+// ---------------------------------------------------------------------------
+
+func TestProjectEvent_Container(t *testing.T) {
+	msg := events.Message{
+		Type:     events.Type("container"),
+		Action:   events.Action("start"),
+		TimeNano: time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC).UnixNano(),
+		Actor: events.Actor{
+			ID: "cid-full",
+			Attributes: map[string]string{
+				"name":             "web_0_123",
+				"image":            "nginx:1.27.1-alpine",
+				"accelero-service": "web",
+				"accelero-replica": "0",
+				"accelero-stack":   "demo",
+				"managed-by":       "accelero",
+			},
+		},
+	}
+	got := projectEvent(msg)
+
+	assert.Equal(t, "container", got.Type)
+	assert.Equal(t, "start", got.Action)
+	assert.Equal(t, "cid-full", got.ActorID)
+	assert.Equal(t, "web_0_123", got.Name)
+	assert.Equal(t, "nginx:1.27.1-alpine", got.Image)
+	assert.Equal(t, "web", got.Service)
+	require.NotNil(t, got.Replica)
+	assert.Equal(t, 0, *got.Replica)
+	assert.Equal(t, "2026-04-20T12:00:00Z", got.Time.UTC().Format(time.RFC3339))
+	// Attributes pass through verbatim for client dig-ins.
+	assert.Equal(t, "accelero", got.Attributes["managed-by"])
+}
+
+func TestProjectEvent_FallsBackToTimeSecondsWhenNanoMissing(t *testing.T) {
+	msg := events.Message{
+		Type:   events.Type("container"),
+		Action: events.Action("die"),
+		Time:   1_700_000_000,
+		Actor:  events.Actor{ID: "cid"},
+	}
+	got := projectEvent(msg)
+	assert.Equal(t, int64(1_700_000_000), got.Time.Unix())
+}
+
+func TestProjectEvent_UnlabelledContainer(t *testing.T) {
+	// Legacy container with no accelero-service / replica labels —
+	// shouldn't blow up, just skip the optional fields.
+	msg := events.Message{
+		Type:   events.Type("container"),
+		Action: events.Action("destroy"),
+		Actor: events.Actor{
+			ID:         "cid",
+			Attributes: map[string]string{"name": "orphan"},
+		},
+	}
+	got := projectEvent(msg)
+	assert.Equal(t, "orphan", got.Name)
+	assert.Empty(t, got.Service)
+	assert.Nil(t, got.Replica)
+}
+
+// ---------------------------------------------------------------------------
+// Events: endpoint wiring
+// ---------------------------------------------------------------------------
+
+// TestStreamStackEvents_EndToEndSSE exercises the real streaming path:
+// a channel of Docker events gets projected, serialized, and framed
+// as SSE; the handler returns once the source closes. We don't use
+// httptest.ResponseRecorder because SSE flushes require a real
+// http.Flusher — stand up a test server instead.
+func TestStreamStackEvents_EndToEndSSE(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+
+	msgCh := make(chan events.Message, 4)
+	errCh := make(chan error, 1)
+	msgCh <- events.Message{
+		Type:     events.Type("container"),
+		Action:   events.Action("start"),
+		TimeNano: time.Now().UnixNano(),
+		Actor: events.Actor{
+			ID: "cid1",
+			Attributes: map[string]string{
+				"name":             "web_0_1",
+				"accelero-service": "web",
+				"accelero-replica": "0",
+			},
+		},
+	}
+	msgCh <- events.Message{
+		Type:     events.Type("container"),
+		Action:   events.Action("die"),
+		TimeNano: time.Now().UnixNano(),
+		Actor: events.Actor{
+			ID: "cid1",
+			Attributes: map[string]string{
+				"name":             "web_0_1",
+				"accelero-service": "web",
+				"accelero-replica": "0",
+			},
+		},
+	}
+	close(msgCh) // source closes → handler exits the loop
+
+	docker := &mockDocker{eventsResult: client.EventsResult{Messages: msgCh, Err: errCh}}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/stacks/demo/events")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no", resp.Header.Get("X-Accel-Buffering"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	text := string(body)
+
+	// Two events, each framed as "data: {...}\n\n".
+	assert.Equal(t, 2, strings.Count(text, "data: "),
+		"expected two SSE data frames; body was:\n%s", text)
+	assert.Contains(t, text, `"action":"start"`)
+	assert.Contains(t, text, `"action":"die"`)
+	assert.Contains(t, text, `"service":"web"`)
+	assert.Contains(t, text, `"replica":0`)
+}
+
+func TestStreamStackEvents_UnknownStack404(t *testing.T) {
+	h := newTestHandler(&mockStore{}, &mockDocker{})
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/stacks/nope/events")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestStreamStackEvents_BadSinceRejected(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	h := newTestHandler(ms, &mockDocker{})
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/stacks/demo/events?since=yesterday")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestStreamStackEvents_DockerUnconfigured503(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}} // no Docker
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/stacks/demo/events")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }

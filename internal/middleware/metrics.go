@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"time"
 
@@ -58,4 +60,24 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.written = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the underlying writer if it is a Flusher.  Without
+// this delegation, wrapping strips Flusher from the type assertion
+// handlers do (`w.(http.Flusher)`), breaking SSE / chunked-streaming
+// endpoints even though the real writer supports it.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer if it is a Hijacker.
+// Required for WebSocket upgrades; implemented here for future
+// endpoints even though the current tree has no WebSocket handlers.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
 }
