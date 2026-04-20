@@ -22,6 +22,16 @@ type mockStore struct {
 	deployments []*store.Deployment
 }
 
+// newHandler wires a Handler with the three test doubles we need. Kept
+// separate from the existing tests to avoid fighting their literals.
+func newTestHandler(store *mockStore, docker DockerClient) *Handler {
+	return &Handler{
+		Store:    store,
+		Deployer: &mockDeployer{},
+		Docker:   docker,
+	}
+}
+
 func (m *mockStore) CreateStack(s *store.Stack) error               { m.stacks = append(m.stacks, s); return nil }
 func (m *mockStore) GetStack(id string) (*store.Stack, error) {
 	for _, s := range m.stacks {

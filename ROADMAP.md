@@ -87,9 +87,9 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 Goal: operators can observe, debug, and audit GitOps-managed workloads without needing separate tools like `docker logs`, `docker stats`, or SSH to the host.
 
 **Read-only runtime introspection (no mutation):**
-- [ ] `GET /stacks/{id}/containers` — list containers with status, labels, image
-- [ ] `GET /stacks/{id}/containers/{cid}` — inspect container details
-- [ ] `GET /stacks/{id}/containers/{cid}/logs` — tail/download logs (support `since`, `tail`, `follow`)
+- [x] `GET /stacks/{id}/containers` — list containers with status, labels, image, ports, replica index
+- [x] `GET /stacks/{id}/containers/{cid}` — inspect container details (state, config, networks, mounts; env redacted by key)
+- [x] `GET /stacks/{id}/containers/{cid}/logs` — one-shot tail with `tail` / `since` / `timestamps`; follow via WebSocket is a separate ticket below
 - [ ] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket for live logs
 - [ ] `GET /stacks/{id}/containers/{cid}/stats` — CPU, memory, network, I/O stats (snapshot + stream)
 - [ ] `GET /events` — Docker event stream filtered to accelero-managed containers
