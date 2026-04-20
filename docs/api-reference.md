@@ -259,10 +259,60 @@ If `stack` is omitted, Accelero looks for a stack named "default", then falls ba
 
 **No authentication required.**
 
+Liveness probe — returns 200 whenever the HTTP server is responsive. Does not check dependencies. Use `/readyz` for dependency-aware readiness.
+
 **Response:** `200 OK`
 ```json
 {"status": "ok"}
 ```
+
+---
+
+### Liveness (Kubernetes alias)
+`GET /healthz`
+
+**No authentication required.**
+
+Alias for `/health`, following the Kubernetes probe convention. Same body, same status — pick whichever your tooling expects.
+
+---
+
+### Readiness
+`GET /readyz`
+
+**No authentication required.**
+
+Returns 200 only when Accelero is actually ready to serve traffic:
+
+- Database is reachable (SQLite ping)
+- Docker daemon is reachable (Docker ping, 2s timeout)
+- The process is not currently draining for graceful shutdown
+
+**Success:** `200 OK`
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": "ok",
+    "docker":   "ok",
+    "shutdown": "ok"
+  }
+}
+```
+
+**Failure:** `503 Service Unavailable`
+```json
+{
+  "status": "not_ready",
+  "checks": {
+    "database": "ok",
+    "docker":   "unreachable: Cannot connect to the Docker daemon",
+    "shutdown": "ok"
+  }
+}
+```
+
+Use `/readyz` as a Kubernetes readinessProbe or as a load-balancer health check — it will flip to 503 the moment Accelero receives SIGTERM so upstream traffic drains before the HTTP server actually stops accepting connections.
 
 ---
 

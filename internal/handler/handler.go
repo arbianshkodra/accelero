@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/logctx"
@@ -21,6 +22,12 @@ import (
 
 const (
 	maxPayloadSize = 1 << 20 // 1 MB
+
+	// readyzTimeout caps the Docker + DB checks so a wedged dependency
+	// doesn't tarpit the probe endpoint. K8s probes are configured with
+	// their own timeoutSeconds (usually 1–5s); 2s fits inside the usual
+	// defaults.
+	readyzTimeout = 2 * time.Second
 )
 
 // Deployer is the interface the stack deployer must satisfy.
@@ -33,6 +40,25 @@ type Handler struct {
 	Store      store.Store
 	Deployer   Deployer
 	Reconciler *reconciler.Reconciler
+
+	// DockerPing is called by /readyz to verify Docker daemon connectivity.
+	// nil disables the Docker check — useful in tests, or in the unlikely
+	// deployment where Accelero proxies to another host and wouldn't want
+	// its own readiness dependent on local Docker.
+	DockerPing func(ctx context.Context) error
+
+	// shuttingDown is flipped by SetShuttingDown before graceful shutdown
+	// tears down the HTTP server.  /readyz reports 503 once set so load
+	// balancers drain this pod before the server actually stops accepting
+	// connections.
+	shuttingDown atomic.Bool
+}
+
+// SetShuttingDown flips /readyz to draining mode. Safe to call from any
+// goroutine — typically the signal handler in main.go immediately before
+// server.Shutdown.
+func (h *Handler) SetShuttingDown() {
+	h.shuttingDown.Store(true)
 }
 
 // RegisterRoutes mounts all API endpoints onto the given router.
@@ -45,8 +71,13 @@ type Handler struct {
 func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFunc) {
 	r.Use(middleware.RequestID)
 
-	// Unauthenticated
+	// Unauthenticated probes.
+	//   /health  — original, kept for backward compatibility
+	//   /healthz — Kubernetes-style liveness ("process responds at all")
+	//   /readyz  — Kubernetes-style readiness (DB + Docker + not draining)
 	r.HandleFunc("/health", h.Health).Methods("GET")
+	r.HandleFunc("/healthz", h.Health).Methods("GET")
+	r.HandleFunc("/readyz", h.Readyz).Methods("GET")
 
 	// Authenticated API routes
 	api := r.PathPrefix("/api/v1").Subrouter()
@@ -519,8 +550,57 @@ func (h *Handler) LegacyWebhook(w http.ResponseWriter, r *http.Request) {
 // Health & Status
 // --------------------------------------------------------------------------
 
+// Health is a liveness probe: returns 200 whenever the HTTP server can
+// accept a request. It intentionally does not touch dependencies — use
+// /readyz for that. Same body is served at /healthz (K8s convention).
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"}, http.StatusOK)
+}
+
+// Readyz is a readiness probe.  It returns 200 only when Accelero is
+// actually ready to serve traffic: the database answers, the Docker
+// daemon is reachable, and we aren't draining for shutdown.  Returns
+// 503 with a per-check breakdown otherwise so an operator (or k8s)
+// can see which dependency is the problem.
+func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), readyzTimeout)
+	defer cancel()
+
+	checks := map[string]string{}
+	ok := true
+
+	if h.shuttingDown.Load() {
+		checks["shutdown"] = "draining"
+		ok = false
+	} else {
+		checks["shutdown"] = "ok"
+	}
+
+	if h.Store != nil {
+		if err := h.Store.Ping(ctx); err != nil {
+			checks["database"] = "unreachable: " + err.Error()
+			ok = false
+		} else {
+			checks["database"] = "ok"
+		}
+	}
+
+	if h.DockerPing != nil {
+		if err := h.DockerPing(ctx); err != nil {
+			checks["docker"] = "unreachable: " + err.Error()
+			ok = false
+		} else {
+			checks["docker"] = "ok"
+		}
+	}
+
+	status := http.StatusOK
+	body := map[string]any{"status": "ok", "checks": checks}
+	if !ok {
+		status = http.StatusServiceUnavailable
+		body["status"] = "not_ready"
+	}
+	writeJSON(w, body, status)
 }
 
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
