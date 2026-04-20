@@ -39,6 +39,10 @@ const (
 // Deployer is the interface the stack deployer must satisfy.
 type Deployer interface {
 	Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error)
+	// CleanupStackData removes the stack's cloned-repo workdir from disk.
+	// Called by DeleteStack after the DB record is gone so orphan clones
+	// don't accumulate forever.
+	CleanupStackData(stackID string) error
 }
 
 // DockerClient is the subset of the moby client used by the handler's
@@ -329,6 +333,16 @@ func (h *Handler) DeleteStack(w http.ResponseWriter, r *http.Request) {
 
 	if h.Reconciler != nil {
 		h.Reconciler.RefreshStack(id)
+	}
+
+	// Remove the on-disk clone workdir.  Best-effort: a failure here is
+	// logged but doesn't roll back the DB delete — the stack is already
+	// gone logically, leftover files are a GC concern not a user concern.
+	if h.Deployer != nil {
+		if err := h.Deployer.CleanupStackData(stack.ID); err != nil {
+			logctx.FromContext(r.Context()).WithError(err).
+				Warnf("failed to remove stack data dir for %s", stack.ID)
+		}
 	}
 
 	writeJSON(w, map[string]string{"status": "deleted"}, http.StatusOK)

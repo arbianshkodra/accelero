@@ -827,6 +827,115 @@ volumes:
 var _ = service.ComposeService{}
 
 // ---------------------------------------------------------------------------
+// rewriteBindMountPaths
+// ---------------------------------------------------------------------------
+
+func TestRewriteBindMountPaths(t *testing.T) {
+	repo := t.TempDir() // absolute, stable, clean
+
+	cases := []struct {
+		name string
+		in   string
+		want string // "" means "passed through unchanged"
+	}{
+		{
+			name: "dot-relative file",
+			in:   "./Caddyfile:/etc/caddy/Caddyfile:ro",
+			want: filepath.Join(repo, "Caddyfile") + ":/etc/caddy/Caddyfile:ro",
+		},
+		{
+			name: "nested relative dir",
+			in:   "./conf/nginx.conf:/etc/nginx/nginx.conf",
+			want: filepath.Join(repo, "conf/nginx.conf") + ":/etc/nginx/nginx.conf",
+		},
+		{
+			name: "bare filename is treated as named volume (compose convention)",
+			in:   "Caddyfile:/etc/caddy/Caddyfile",
+			want: "", // left alone — rewriteVolumeRefs handles named volumes
+		},
+		{
+			name: "dot-slash filename with dot in name",
+			in:   "./my.conf:/etc/my.conf",
+			want: filepath.Join(repo, "my.conf") + ":/etc/my.conf",
+		},
+		{
+			name: "absolute host path passes through",
+			in:   "/etc/ssl/certs:/etc/ssl/certs:ro",
+			want: "", // unchanged
+		},
+		{
+			name: "named volume ref passes through",
+			in:   "pg_data:/var/lib/postgresql/data",
+			want: "", // rewriteVolumeRefs handles this later
+		},
+		{
+			name: "malformed entry passes through",
+			in:   "/no-colon-at-all",
+			want: "", // no destination → left for Docker to error on
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rewriteBindMountPaths([]string{tc.in}, repo)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+			want := tc.want
+			if want == "" {
+				want = tc.in
+			}
+			assert.Equal(t, want, got[0])
+		})
+	}
+}
+
+func TestRewriteBindMountPaths_RejectsTraversal(t *testing.T) {
+	repo := t.TempDir()
+	_, err := rewriteBindMountPaths([]string{"../../etc/passwd:/etc/passwd"}, repo)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "directory traversal blocked")
+}
+
+func TestRewriteBindMountPaths_EmptyInputIsEmptyOutput(t *testing.T) {
+	got, err := rewriteBindMountPaths(nil, t.TempDir())
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// ---------------------------------------------------------------------------
+// CleanupStackData
+// ---------------------------------------------------------------------------
+
+func TestCleanupStackData_RemovesStackDir(t *testing.T) {
+	stacksDir := t.TempDir()
+	d := &Deployer{stacksDir: stacksDir}
+	stackID := "stack-abc"
+
+	// Simulate a populated clone.
+	repo := filepath.Join(stacksDir, stackID, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "Caddyfile"), []byte(":80 {}"), 0644))
+
+	require.NoError(t, d.CleanupStackData(stackID))
+
+	_, err := os.Stat(filepath.Join(stacksDir, stackID))
+	assert.True(t, os.IsNotExist(err), "expected stack dir to be gone, got err=%v", err)
+}
+
+func TestCleanupStackData_MissingDirIsNotError(t *testing.T) {
+	// Stack may have been created but never deployed → no clone dir.
+	d := &Deployer{stacksDir: t.TempDir()}
+	assert.NoError(t, d.CleanupStackData("never-deployed"))
+}
+
+func TestCleanupStackData_NoStacksDirConfigured(t *testing.T) {
+	// Defensive: running without a stacks dir (tests, minimal setups) is
+	// a no-op rather than an error.
+	d := &Deployer{}
+	assert.NoError(t, d.CleanupStackData("anything"))
+}
+
+// ---------------------------------------------------------------------------
 // deploy.replicas round-trip through readComposeFile
 // ---------------------------------------------------------------------------
 
