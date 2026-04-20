@@ -143,6 +143,88 @@ func TestDependencies_InvalidForm(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestPorts_ShortFormStringsAndInts(t *testing.T) {
+	got := decode[Ports](t, `
+x:
+  - "8080:80"
+  - "127.0.0.1:8081:81/udp"
+  - 3000
+`)
+	assert.Equal(t, Ports{"8080:80", "127.0.0.1:8081:81/udp", "3000"}, got)
+}
+
+func TestPorts_LongForm(t *testing.T) {
+	got := decode[Ports](t, `
+x:
+  - target: 80
+    published: 8080
+  - target: 443
+    published: 8443
+    protocol: tcp
+  - target: 5353
+    published: 5353
+    protocol: udp
+    host_ip: 127.0.0.1
+`)
+	assert.Equal(t, Ports{
+		"8080:80",
+		"8443:443/tcp",
+		"127.0.0.1:5353:5353/udp",
+	}, got)
+}
+
+func TestPorts_LongForm_TargetOnly(t *testing.T) {
+	// No published: container-only exposure (no host binding).
+	got := decode[Ports](t, `
+x:
+  - target: 9090
+`)
+	assert.Equal(t, Ports{"9090"}, got)
+}
+
+func TestPorts_MixedShortAndLong(t *testing.T) {
+	got := decode[Ports](t, `
+x:
+  - "8080:80"
+  - target: 443
+    published: 8443
+    protocol: tcp
+`)
+	assert.Equal(t, Ports{"8080:80", "8443:443/tcp"}, got)
+}
+
+func TestPorts_LongForm_MissingTargetFails(t *testing.T) {
+	var w wrap[Ports]
+	err := yaml.Unmarshal([]byte(`
+x:
+  - published: 8080
+`), &w)
+	require.Error(t, err)
+}
+
+func TestLoggingConfig_RoundTrip(t *testing.T) {
+	yamlText := `
+image: nginx
+logging:
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+`
+	var svc ComposeService
+	require.NoError(t, yaml.Unmarshal([]byte(yamlText), &svc))
+	require.NotNil(t, svc.Logging)
+	assert.Equal(t, "json-file", svc.Logging.Driver)
+	assert.Equal(t, "10m", svc.Logging.Options["max-size"])
+	assert.Equal(t, "3", svc.Logging.Options["max-file"])
+}
+
+func TestLoggingConfig_Absent(t *testing.T) {
+	var svc ComposeService
+	require.NoError(t, yaml.Unmarshal([]byte(`image: nginx`), &svc))
+	assert.Nil(t, svc.Logging)
+}
+
 func TestComposeService_FullFieldRoundTrip(t *testing.T) {
 	yamlText := `
 image: nginx:1.27.0
