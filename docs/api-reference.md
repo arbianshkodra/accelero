@@ -392,6 +392,41 @@ kill / stop / die / destroy  (old replica 0)
 
 ---
 
+### Stream Container Logs (WebSocket)
+`GET /api/v1/stacks/{id}/containers/{cid}/logs/stream`
+
+WebSocket upgrade that follows a container's logs in real time. Each log line arrives as one text message. Non-TTY containers have their multiplexed stdout/stderr demuxed server-side so callers see clean text either way.
+
+**Query parameters** (same surface as `/logs`):
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `tail` | integer | `100` | Backlog lines emitted before live tailing begins. Capped at 10000. |
+| `since` | Go duration | unset | `5m`, `30s`, `2h`. |
+| `timestamps` | bool | `false` | Prefix every line with RFC3339Nano timestamps. |
+
+**Authentication.** Upgrade is a regular HTTP GET — `X-API-KEY` header is checked by the usual auth middleware. Browsers can't set custom headers on `new WebSocket(url)`; a short-lived-token flow for browser clients is planned.
+
+**Lifecycle:**
+
+- The server pings every 30s so the OS surfaces half-closed TCPs.
+- The server closes with code `1000` (normal closure) when the daemon's log stream ends cleanly — container exit, explicit removal, etc.
+- A read goroutine watches for client-initiated close, cancels the upstream Docker stream immediately, and the daemon releases within ~1s.
+
+Same stack-membership verification as the rest of the container endpoints: a cid from a different stack returns `404 Not Found` at the upgrade stage, so the WebSocket handshake never completes.
+
+**Errors:** `400 Bad Request` for malformed `tail` / `since`; `404 Not Found` for missing / foreign-stack container; `503 Service Unavailable` when Docker introspection isn't configured. All of these prevent the upgrade.
+
+**Example (websocat):**
+
+```bash
+websocat \
+  -H "X-API-Key: $ACCELERO_API_KEY" \
+  "ws://localhost:8000/api/v1/stacks/ws/containers/$CID/logs/stream?tail=50&timestamps=true"
+```
+
+---
+
 ### Container Stats
 `GET /api/v1/stacks/{id}/containers/{cid}/stats`
 
