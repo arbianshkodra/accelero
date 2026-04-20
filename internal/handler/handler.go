@@ -19,6 +19,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/store"
+	volumepkg "github.com/arbianshkodra/accelero/internal/volume"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -79,6 +80,12 @@ type Handler struct {
 	// disables those endpoints (they return 503) — useful in tests or
 	// in minimal deploys that don't expose runtime introspection.
 	Docker DockerClient
+
+	// VolumeBrowser backs GET /volumes/{name}/browse. Separated from
+	// DockerClient because the helper-container lifecycle is a bigger
+	// unit of behaviour than a single Docker API call.  Nil disables
+	// the browse endpoint (503).
+	VolumeBrowser volumepkg.Browser
 
 	// DockerPing is called by /readyz to verify Docker daemon connectivity.
 	// nil disables the Docker check — useful in tests, or in the unlikely
@@ -157,6 +164,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	// accelero-managed resources. ?stack=<name> narrows further.
 	api.HandleFunc("/images", h.ListManagedImages).Methods("GET")
 	api.HandleFunc("/volumes", h.ListManagedVolumes).Methods("GET")
+	api.HandleFunc("/volumes/{name}/browse", h.BrowseVolume).Methods("GET")
 	api.HandleFunc("/networks", h.ListManagedNetworks).Methods("GET")
 
 	// Audit log — read-only; append-only at the store layer.
@@ -2044,6 +2052,135 @@ func (h *Handler) ListManagedVolumes(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 	writeJSON(w, out, http.StatusOK)
+}
+
+// maxVolumeFileDownload caps how many bytes a single /browse download
+// may return. Protects against accidental "download all of my 50GB
+// postgres WAL" requests — operators who legitimately need bigger
+// files should exec in and tar it out manually, which gives them a
+// moment to think about what they're doing.
+const maxVolumeFileDownload = 10 * 1024 * 1024 // 10 MB
+
+// volumeIsManaged verifies that the named volume carries the
+// managed-by=accelero label before the browser is allowed to touch
+// it. Same defense-in-depth rule as every other stack-scoped endpoint:
+// never return information (or spawn helpers for) resources we don't
+// claim.
+func (h *Handler) volumeIsManaged(ctx context.Context, name string) (bool, error) {
+	if h.Docker == nil {
+		return false, nil
+	}
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue)).
+		Add("name", name)
+	res, err := h.Docker.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
+	if err != nil {
+		return false, err
+	}
+	for _, v := range res.Items {
+		if v.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// BrowseVolume lists files in a managed volume or streams one file's
+// contents back. This is a debug affordance for "what's actually in my
+// postgres data dir" scenarios — read-only, audited, capped in size.
+//
+// Query parameters:
+//   - path:     absolute within the volume; default "/" (volume root)
+//   - download: "true" returns raw file bytes; omit/false returns JSON listing
+//
+// Unmanaged volumes return 404 indistinguishably from missing volumes
+// so callers can't probe. The handler also blocks `..` in the path
+// before the browser gets it, giving two layers of path-escape defense.
+func (h *Handler) BrowseVolume(w http.ResponseWriter, r *http.Request) {
+	if h.VolumeBrowser == nil || h.Docker == nil {
+		writeError(w, "volume browsing is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := mux.Vars(r)["name"]
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	managed, err := h.volumeIsManaged(ctx, name)
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("check volume managed")
+		writeError(w, "failed to verify volume", http.StatusInternalServerError)
+		return
+	}
+	if !managed {
+		writeError(w, "volume not found", http.StatusNotFound)
+		return
+	}
+
+	reqPath := r.URL.Query().Get("path")
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	download := r.URL.Query().Get("download") == "true"
+
+	if download {
+		h.downloadVolumeFile(ctx, w, r, name, reqPath)
+		return
+	}
+	h.listVolumePath(ctx, w, r, name, reqPath)
+}
+
+func (h *Handler) listVolumePath(ctx context.Context, w http.ResponseWriter, r *http.Request, volumeName, path string) {
+	entries, err := h.VolumeBrowser.ListPath(ctx, volumeName, path)
+	// Audit the browse attempt regardless of outcome — the intent is
+	// worth recording even if the underlying call errored.
+	audit := audit.FromRequest(r, store.AuditOpVolumeBrowse)
+	audit.ResourceType = "volume"
+	audit.ResourceID = volumeName
+	audit.Metadata = map[string]string{"path": path}
+	if err != nil {
+		audit.Outcome = store.AuditOutcomeFailure
+		audit.ErrorMessage = err.Error()
+		_ = h.auditOr().Record(r.Context(), audit)
+		logctx.FromContext(ctx).WithError(err).Warn("volume browse failed")
+		writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = h.auditOr().Record(r.Context(), audit)
+
+	if entries == nil {
+		entries = []volumepkg.FileEntry{}
+	}
+	writeJSON(w, entries, http.StatusOK)
+}
+
+func (h *Handler) downloadVolumeFile(ctx context.Context, w http.ResponseWriter, r *http.Request, volumeName, path string) {
+	res, err := h.VolumeBrowser.ReadFile(ctx, volumeName, path, maxVolumeFileDownload)
+	auditEntry := audit.FromRequest(r, store.AuditOpVolumeRead)
+	auditEntry.ResourceType = "volume"
+	auditEntry.ResourceID = volumeName
+	auditEntry.Metadata = map[string]string{"path": path}
+
+	if err != nil {
+		auditEntry.Outcome = store.AuditOutcomeFailure
+		auditEntry.ErrorMessage = err.Error()
+		_ = h.auditOr().Record(r.Context(), auditEntry)
+		logctx.FromContext(ctx).WithError(err).Warn("volume read failed")
+		writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer res.Content.Close()
+
+	auditEntry.Metadata["size_bytes"] = strconv.FormatInt(res.SizeBytes, 10)
+	_ = h.auditOr().Record(r.Context(), auditEntry)
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(res.SizeBytes, 10))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, res.Name))
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, res.Content); err != nil {
+		logctx.FromContext(ctx).WithError(err).Warn("volume read: truncated stream")
+	}
 }
 
 // ListManagedNetworks returns networks labelled managed-by=accelero.
