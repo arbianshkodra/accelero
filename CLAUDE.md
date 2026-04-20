@@ -131,6 +131,11 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/stacks/{id}/drift` — Check drift (desired vs actual state)
 - `POST /api/v1/stacks/{id}/preview` — Dry-run: show actions the next deploy would take
 
+**Container introspection (read-only):**
+- `GET /api/v1/stacks/{id}/containers` — List containers managed for the stack
+- `GET /api/v1/stacks/{id}/containers/{cid}` — Inspect a container (state/config/networks/mounts; env values redacted when the key looks like a secret)
+- `GET /api/v1/stacks/{id}/containers/{cid}/logs` — Tail logs with `tail` (max 10000) / `since` (Go duration) / `timestamps` query params; stdout+stderr demuxed on non-TTY containers
+
 **Legacy:**
 - `POST /webhook` — Trigger deployment (targets "default" stack or stack specified in payload)
 
