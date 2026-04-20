@@ -46,6 +46,45 @@ type ComposeService struct {
 	StopSignal      string            `yaml:"stop_signal,omitempty"`
 	PullPolicy      string            `yaml:"pull_policy,omitempty"`
 	Logging         *LoggingConfig    `yaml:"logging,omitempty"`
+	Deploy          DeployConfig      `yaml:"deploy,omitempty"`
+}
+
+// DeployConfig mirrors docker-compose's `deploy:` subtree. Only Replicas is
+// acted on today; Mode / Resources / UpdateConfig / RollbackConfig etc.
+// parse but do not change runtime behaviour. The `replicas` field works in
+// non-swarm mode for Accelero because we're not using Docker's swarm stack
+// deployer — we implement the rolling replica strategy ourselves.
+type DeployConfig struct {
+	Replicas *int   `yaml:"replicas,omitempty"`
+	Mode     string `yaml:"mode,omitempty"` // "replicated" | "global"; currently informational
+}
+
+// DesiredReplicas returns the effective replica count for a service.
+// Missing or <= 0 values fall back to 1, matching docker-compose semantics.
+func (s ComposeService) DesiredReplicas() int {
+	if s.Deploy.Replicas == nil || *s.Deploy.Replicas <= 0 {
+		return 1
+	}
+	return *s.Deploy.Replicas
+}
+
+// HasStaticPublishedPort reports whether any port entry binds a fixed host
+// port. Used to reject replicas > 1 with static port publishing, since N
+// replicas on the same host port would collide on container create.
+func (s ComposeService) HasStaticPublishedPort() bool {
+	for _, p := range s.Ports {
+		// Strip protocol suffix: "8080:80/tcp" -> "8080:80"
+		base := p
+		if i := strings.Index(base, "/"); i >= 0 {
+			base = base[:i]
+		}
+		// A bare "80" or "0" is exposed-only, not published — skip.
+		// Anything with a colon has an explicit host port.
+		if strings.Contains(base, ":") {
+			return true
+		}
+	}
+	return false
 }
 
 // LoggingConfig maps onto container.HostConfig.LogConfig.

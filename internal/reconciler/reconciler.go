@@ -29,9 +29,11 @@ import (
 
 // Label constants used to identify containers managed by Accelero.
 const (
-	labelManagedBy = "managed-by"
+	labelManagedBy      = "managed-by"
 	labelManagedByValue = "accelero"
-	labelStackName = "accelero-stack"
+	labelStackName      = "accelero-stack"
+	labelServiceName    = "accelero-service"
+	labelReplicaIndex   = "accelero-replica"
 )
 
 // Deployer is the interface that the stack deployer must satisfy.
@@ -349,9 +351,11 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 	allActualServiceNames := make(map[string]bool)
 
 	for _, c := range actualContainers {
-		svcName := c.Labels[labelStackName + "-service"]
+		svcName := c.Labels[labelServiceName]
 		if svcName == "" {
-			// Fall back: try to derive service name from container names.
+			// Fall back for containers created before the accelero-service
+			// label existed: derive the service from the container name
+			// pattern ("<service>_<replica>_<ts>" or legacy "<service>_<ts>").
 			svcName = deriveServiceName(c.Names, stack.Name)
 		}
 		if svcName == "" {
@@ -379,16 +383,42 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 
 	// ---- 3. For each desired service, detect drift ----
 	for svcName, svc := range filteredServices {
-		containers, exists := actualByService[svcName]
+		containers := actualByService[svcName]
+		desired := svc.DesiredReplicas()
 
-		if !exists || len(containers) == 0 {
+		// Replica count mismatch: missing if under, surplus handled below.
+		// When there are zero containers, report a single "missing" per
+		// service so the drift list stays compact (rather than N items).
+		if len(containers) == 0 {
 			report.Drifts = append(report.Drifts, DriftItem{
 				ServiceName: svcName,
 				Type:        "missing",
 				Expected:    svc.Image,
-				Message:     fmt.Sprintf("service %s is defined in compose but has no running container", svcName),
+				Message: fmt.Sprintf("service %s is defined in compose but has no running container (want %d replica(s))",
+					svcName, desired),
 			})
 			continue
+		}
+		if len(containers) < desired {
+			report.Drifts = append(report.Drifts, DriftItem{
+				ServiceName: svcName,
+				Type:        "missing",
+				Expected:    fmt.Sprintf("%d replica(s)", desired),
+				Actual:      fmt.Sprintf("%d replica(s)", len(containers)),
+				Message: fmt.Sprintf("service %s has %d replica(s) but %d are declared",
+					svcName, len(containers), desired),
+			})
+		}
+		if len(containers) > desired {
+			surplus := len(containers) - desired
+			report.Drifts = append(report.Drifts, DriftItem{
+				ServiceName: svcName,
+				Type:        "extra",
+				Expected:    fmt.Sprintf("%d replica(s)", desired),
+				Actual:      fmt.Sprintf("%d replica(s)", len(containers)),
+				Message: fmt.Sprintf("service %s has %d surplus replica(s) (declared %d, actual %d)",
+					svcName, surplus, desired, len(containers)),
+			})
 		}
 
 		for _, c := range containers {
