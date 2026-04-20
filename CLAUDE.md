@@ -137,7 +137,8 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/stacks/{id}/containers/{cid}` — Inspect a container (state/config/networks/mounts; env values redacted when the key looks like a secret)
 - `GET /api/v1/stacks/{id}/containers/{cid}/logs` — Tail logs with `tail` (max 10000) / `since` (Go duration) / `timestamps` query params; stdout+stderr demuxed on non-TTY containers
 - `GET /api/v1/stacks/{id}/containers/{cid}/logs/stream` — WebSocket upgrade, follows logs in real time. Same tail/since/timestamps surface as the one-shot endpoint. 30s ping cadence; normal-closure frame when the daemon stream ends. Authentication via X-API-KEY header on the upgrade request — browsers need a proxy or token flow.
-- `GET /api/v1/stacks/{id}/containers/{cid}/stats` — One-shot resource sample: CPU% (docker-stats formula), memory (page cache subtracted), per-iface network, block I/O, PIDs. ~1s latency (daemon gathers two samples for a valid CPU delta). Streaming is a separate WebSocket endpoint (not yet implemented).
+- `GET /api/v1/stacks/{id}/containers/{cid}/stats` — One-shot resource sample: CPU% (docker-stats formula), memory (page cache subtracted), per-iface network, block I/O, PIDs. ~1s latency (daemon gathers two samples for a valid CPU delta).
+- `GET /api/v1/stacks/{id}/containers/{cid}/stats/stream` — WebSocket upgrade, one ContainerStatsSample per daemon tick (~1s). First sample typically reports cpu.percent=0 until the daemon has a prior sample to diff against. Same ping/close semantics as logs/stream.
 - `GET /api/v1/stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources. Each event is projected from Docker's raw format with accelero-service / accelero-replica surfaced as first-class fields. 25s keepalive comment during quiet periods; default type filter is `container` (opt in to `network`/`volume`/`image` via `?types=`).
 
 **Resource browsers (root-level, read-only):**

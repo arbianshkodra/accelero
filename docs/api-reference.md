@@ -355,6 +355,35 @@ Connected-container enumeration is deferred — `/api/v1/stacks/{id}/containers`
 
 ---
 
+### Stream Container Stats (WebSocket)
+`GET /api/v1/stacks/{id}/containers/{cid}/stats/stream`
+
+WebSocket upgrade that pushes one computed stats sample per Docker sampling tick (~1s cadence). Each message is the same `ContainerStatsSample` JSON shape as the one-shot `/stats` response, so a live graph and a polling dashboard can share one parser.
+
+The first sample typically reports `cpu.percent=0` — Docker sends the initial sample before having a prior one to diff against. Subsequent samples populate `PreCPUStats` server-side and the CPU percentage reflects real usage.
+
+**Authentication.** Same X-API-KEY on the upgrade GET as the rest of the API. See [Stream Container Logs (WebSocket)](#stream-container-logs-websocket) for browser-specific caveats.
+
+**Lifecycle:**
+
+- 30s application pings; read deadline 2x that interval.
+- Clean `CloseNormalClosure` frame when the daemon closes its stats stream (container exit, removal).
+- Client disconnect cancels the upstream Docker context; daemon releases within ~1s.
+
+Same stack-membership verification as the other container endpoints: a cid from a different stack returns `404 Not Found` before the upgrade completes.
+
+**Errors:** `404 Not Found` for missing / foreign-stack container; `503 Service Unavailable` when Docker introspection isn't configured.
+
+**Example (websocat):**
+
+```bash
+websocat \
+  -H "X-API-Key: $ACCELERO_API_KEY" \
+  "ws://localhost:8000/api/v1/stacks/s/containers/$CID/stats/stream"
+```
+
+---
+
 ### Stream Events
 `GET /api/v1/stacks/{id}/events`
 
