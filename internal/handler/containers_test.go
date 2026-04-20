@@ -15,6 +15,7 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/image"
@@ -1159,3 +1160,180 @@ func TestListManagedNetworks_DockerError_500(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket log follow
+// ---------------------------------------------------------------------------
+
+// dialWSLogs upgrades a WebSocket connection to the log-stream endpoint
+// under a test server URL. Returns the conn and the upgrade response.
+func dialWSLogs(t *testing.T, serverURL, path string) (*websocket.Conn, *http.Response) {
+	t.Helper()
+	// httptest.NewServer gives http://... — rewrite the scheme for the ws dial.
+	wsURL := strings.Replace(serverURL, "http://", "ws://", 1) + path
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err, "ws dial: %v", err)
+	return conn, resp
+}
+
+// frameMulti wraps multiple payloads as a single concatenated stdcopy
+// stream.  mock's ContainerLogs returns the full bytes at once; each
+// frame is "[header 8 bytes][payload]" so a single Write can yield
+// many lines once the handler demuxes.
+func frameMulti(payloads ...string) []byte {
+	var b bytes.Buffer
+	for _, p := range payloads {
+		b.Write(frameStdoutFrame([]byte(p)))
+	}
+	return b.Bytes()
+}
+
+func TestStreamStackContainerLogs_NonTTYDemuxedLines(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{
+					Tty: false,
+					Labels: map[string]string{
+						"managed-by":     "accelero",
+						"accelero-stack": "demo",
+					},
+				},
+			}},
+		},
+		logsByID:     map[string]string{"cid": "line-a\nline-b\nline-c\n"},
+		logsIsFramed: true,
+	}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	conn, _ := dialWSLogs(t, srv.URL, "/api/v1/stacks/demo/containers/cid/logs/stream")
+	defer conn.Close()
+
+	got := make([]string, 0, 3)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for i := 0; i < 3; i++ {
+		msgType, msg, err := conn.ReadMessage()
+		require.NoError(t, err)
+		assert.Equal(t, websocket.TextMessage, msgType)
+		got = append(got, string(msg))
+	}
+	assert.Equal(t, []string{"line-a", "line-b", "line-c"}, got)
+
+	// Next read should be a clean close (daemon stream ended).
+	_, _, err := conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	assert.Equal(t, websocket.CloseNormalClosure, closeErr.Code,
+		"expected server to send a normal-closure close frame, got %v", err)
+}
+
+func TestStreamStackContainerLogs_TTYPassThrough(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{
+					Tty: true,
+					Labels: map[string]string{
+						"managed-by":     "accelero",
+						"accelero-stack": "demo",
+					},
+				},
+			}},
+		},
+		logsByID:     map[string]string{"cid": "tty-line-1\ntty-line-2\n"},
+		logsIsFramed: false, // TTY: no stdcopy framing, raw stream
+	}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	conn, _ := dialWSLogs(t, srv.URL, "/api/v1/stacks/demo/containers/cid/logs/stream")
+	defer conn.Close()
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, msg1, err := conn.ReadMessage()
+	require.NoError(t, err)
+	_, msg2, err := conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, "tty-line-1", string(msg1))
+	assert.Equal(t, "tty-line-2", string(msg2))
+}
+
+func TestStreamStackContainerLogs_ForeignStack404(t *testing.T) {
+	// Container exists but is labelled for a different stack. The
+	// handler refuses the upgrade with a 404 — the WS dial fails.
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "ours", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "theirs",
+			}},
+		}},
+	}}
+
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/ours/containers/cid/logs/stream"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err, "expected dial failure")
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestStreamStackContainerLogs_DockerUnconfigured503(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}} // no Docker
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/logs/stream"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// Keep the stdcopy multi-frame helper compiled in case future tests want it.
+var _ = frameMulti
