@@ -446,7 +446,7 @@ func topologicalSort(targets []string, allServices map[string]service.ComposeSer
 		if !ok {
 			return nil // missing service, will be caught later
 		}
-		for _, dep := range svc.DependsOn {
+		for _, dep := range svc.DependsOn.Names() {
 			if err := expand(dep); err != nil {
 				return err
 			}
@@ -471,7 +471,7 @@ func topologicalSort(targets []string, allServices map[string]service.ComposeSer
 		if !ok {
 			continue
 		}
-		for _, dep := range svc.DependsOn {
+		for _, dep := range svc.DependsOn.Names() {
 			if expanded[dep] {
 				graph[dep] = append(graph[dep], name)
 				inDegree[name]++
@@ -570,6 +570,13 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 
 func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
 	log := logctx.FromContext(ctx).WithField("service", serviceName)
+
+	// Enforce depends_on conditions before doing anything else.  This waits
+	// for health or exit(0) on the declared dependencies; topological order
+	// already guarantees service_started.
+	if err := d.waitForDependencyConditions(ctx, serviceName, svc); err != nil {
+		return err
+	}
 
 	// Resolve the image according to svc.PullPolicy.
 	if err := d.resolveImage(ctx, svc, stack, log); err != nil {
@@ -1131,6 +1138,132 @@ func safeName(names []string) string {
 		name = name[1:]
 	}
 	return name
+}
+
+// --------------------------------------------------------------------------
+// Dependency conditions
+// --------------------------------------------------------------------------
+
+// dependencyWaitTimeout caps how long deployService will block waiting for a
+// dependency to satisfy its condition.  Exceeds typical healthcheck
+// intervals but short enough that a stuck dep surfaces as a deploy failure
+// rather than hanging forever.
+const dependencyWaitTimeout = 2 * time.Minute
+
+// waitForDependencyConditions checks each entry in svc.DependsOn and blocks
+// until the declared condition is satisfied.  service_started is a no-op
+// because the topological sort already ensured deps deployed first.
+func (d *Deployer) waitForDependencyConditions(ctx context.Context, serviceName string, svc service.ComposeService) error {
+	if len(svc.DependsOn) == 0 {
+		return nil
+	}
+	log := logctx.FromContext(ctx).WithField("service", serviceName)
+
+	for _, depName := range svc.DependsOn.Names() {
+		dep := svc.DependsOn[depName]
+		switch dep.Condition {
+		case "", service.DependencyConditionStarted:
+			// already satisfied by deploy order
+		case service.DependencyConditionHealthy:
+			log.Infof("Waiting for dependency %s to be healthy", depName)
+			if err := d.waitForDependencyHealthy(ctx, depName); err != nil {
+				return fmt.Errorf("dependency %q must be healthy before %s: %w", depName, serviceName, err)
+			}
+		case service.DependencyConditionCompletedOK:
+			log.Infof("Waiting for dependency %s to exit successfully", depName)
+			if err := d.waitForDependencyExit(ctx, depName); err != nil {
+				return fmt.Errorf("dependency %q must complete successfully before %s: %w", depName, serviceName, err)
+			}
+		default:
+			return fmt.Errorf("dependency %q has unsupported condition %q", depName, dep.Condition)
+		}
+	}
+	return nil
+}
+
+// waitForDependencyHealthy polls the dep's container until Docker reports
+// State.Health.Status == "healthy".  An absent healthcheck is treated as
+// an error because "service_healthy" was explicitly requested.
+func (d *Deployer) waitForDependencyHealthy(ctx context.Context, depName string) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, dependencyWaitTimeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		containers, err := d.getServiceContainers(timeoutCtx, depName)
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
+		}
+		if len(containers) == 0 {
+			return fmt.Errorf("no containers running for dependency %s", depName)
+		}
+
+		// We only look at the first container (no replicas today).
+		info, err := d.cli.ContainerInspect(timeoutCtx, containers[0].ID, client.ContainerInspectOptions{})
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", containers[0].ID[:12], err)
+		}
+		state := info.Container.State
+		if state == nil {
+			return fmt.Errorf("container %s has no state", containers[0].ID[:12])
+		}
+		if state.Health == nil {
+			return fmt.Errorf("dependency %s has no healthcheck but service_healthy was requested", depName)
+		}
+		switch state.Health.Status {
+		case "healthy":
+			return nil
+		case "unhealthy":
+			return fmt.Errorf("dependency %s is unhealthy", depName)
+		}
+
+		select {
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timed out waiting for %s to become healthy", depName)
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitForDependencyExit polls the dep's container until it has exited with
+// status code 0 (the contract for "service_completed_successfully").
+func (d *Deployer) waitForDependencyExit(ctx context.Context, depName string) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, dependencyWaitTimeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		containers, err := d.getServiceContainers(timeoutCtx, depName)
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
+		}
+		if len(containers) == 0 {
+			return fmt.Errorf("no containers found for dependency %s", depName)
+		}
+
+		info, err := d.cli.ContainerInspect(timeoutCtx, containers[0].ID, client.ContainerInspectOptions{})
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", containers[0].ID[:12], err)
+		}
+		state := info.Container.State
+		if state == nil {
+			return fmt.Errorf("container %s has no state", containers[0].ID[:12])
+		}
+		if !state.Running {
+			if state.ExitCode != 0 {
+				return fmt.Errorf("dependency %s exited with code %d", depName, state.ExitCode)
+			}
+			return nil
+		}
+
+		select {
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timed out waiting for %s to complete", depName)
+		case <-ticker.C:
+		}
+	}
 }
 
 // stopTimeoutSeconds returns the container stop-timeout in seconds, falling

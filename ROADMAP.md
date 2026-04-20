@@ -59,7 +59,7 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 - [x] `entrypoint`, `working_dir`, `user` fields
 - [x] `stop_grace_period` (replaces the old hardcoded 10s)
 - [x] `stop_signal`
-- [ ] `depends_on` map form with conditions (`condition: service_healthy`)
+- [x] `depends_on` map form with conditions (`service_started`, `service_healthy`, `service_completed_successfully`)
 - [ ] `deploy.replicas` for container scaling
 - [ ] Named volumes (top-level `volumes:` section with `docker volume create`)
 - [ ] `logging` driver and options

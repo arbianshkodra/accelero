@@ -87,7 +87,7 @@ mkdocs build
 - **Zero-downtime deployments**: New containers health-checked before old ones removed
 - **Correct rollback**: Pre-deployment state captured BEFORE deploying, restored on failure
 - **Per-service deployment locking**: Prevents concurrent deploys of the same service
-- **Dependency resolution**: Topological sort with transitive dependency expansion and cycle detection
+- **Dependency resolution**: Topological sort with transitive dependency expansion and cycle detection. Long-form `depends_on` conditions (`service_started`, `service_healthy`, `service_completed_successfully`) are enforced — a dependent service's deploy blocks until its dependency's condition is satisfied.
 - **Scoped resource cleanup**: Only prunes Docker resources labeled `managed-by=accelero`
 - **Shallow git clones**: Depth=1 for fast repo fetching
 - **SQLite persistence**: Deployment history, stack config, container tracking survive restarts
