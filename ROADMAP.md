@@ -112,7 +112,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /api/v1/audit` with filtering by stack (id or name), actor, operation, since, limit
 - [x] Audit entries for: stack CRUD; deploy start/complete/failed; drift detected (one per cycle, per-type counts in metadata); drift auto-deployed. Exec sessions / container restarts will hook the same recorder when those endpoints land.
 - [x] Immutable at the store layer — only Create + List exposed, no update/delete path
-- [ ] Time-based retention (follow-up — same pattern as the existing deployment-history cleanup)
+- [x] Time-based retention — `AUDIT_MAX_AGE` (default 90d; `0` disables). Runs on the existing `STATUS_CLEANUP_INTERVAL` cadence (default hourly).
 
 ---
 
