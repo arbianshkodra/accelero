@@ -337,6 +337,70 @@ func TestCreateStackValidation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// DeleteStack — accepts ID or name, and triggers cleanup
+// ---------------------------------------------------------------------------
+
+func TestDeleteStack_ByID(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "abc123", Name: "my-app", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	md := &mockDeployer{}
+	h := &Handler{Store: ms, Deployer: md}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/abc123", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Equal(t, []string{"abc123"}, md.cleanupCalledWith,
+		"cleanup called with the canonical stack ID")
+}
+
+func TestDeleteStack_ByName(t *testing.T) {
+	// Same convention as GetStack/UpdateStack: the URL {id} segment
+	// can be either the ID or the stack name. A regression in this
+	// handler silently left stacks undeletable by name — test guards it.
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "abc123", Name: "my-app", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	md := &mockDeployer{}
+	h := &Handler{Store: ms, Deployer: md}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/my-app", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	// Cleanup must receive the *ID*, not the name — downstream code
+	// (data dir layout, labels) is keyed on IDs.
+	assert.Equal(t, []string{"abc123"}, md.cleanupCalledWith)
+}
+
+func TestDeleteStack_NotFound(t *testing.T) {
+	h := &Handler{Store: &mockStore{}, Deployer: &mockDeployer{}}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/does-not-exist", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
 // Preview endpoint
 // ---------------------------------------------------------------------------
 
