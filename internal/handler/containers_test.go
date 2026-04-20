@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/store"
+	volumepkg "github.com/arbianshkodra/accelero/internal/volume"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/moby/moby/api/types/container"
@@ -1686,4 +1687,212 @@ func TestStreamStackContainerStats_DockerUnconfigured503(t *testing.T) {
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// ---------------------------------------------------------------------------
+// Volume browser endpoint
+// ---------------------------------------------------------------------------
+
+// stubBrowser is a handler-package test double for volumepkg.Browser. It
+// doesn't need to exercise the Docker helper lifecycle — handler tests
+// only care that the right volume name + path reach the browser and
+// the response is faithfully returned to the HTTP client.
+type stubBrowser struct {
+	listCalls []stubBrowseCall
+	readCalls []stubBrowseCall
+	listFn    func(volume, p string) ([]volumepkg.FileEntry, error)
+	readFn    func(volume, p string, max int64) (volumepkg.ReadResult, error)
+}
+
+type stubBrowseCall struct {
+	Volume string
+	Path   string
+	Max    int64
+}
+
+func (s *stubBrowser) ListPath(_ context.Context, v, p string) ([]volumepkg.FileEntry, error) {
+	s.listCalls = append(s.listCalls, stubBrowseCall{Volume: v, Path: p})
+	if s.listFn != nil {
+		return s.listFn(v, p)
+	}
+	return nil, nil
+}
+
+func (s *stubBrowser) ReadFile(_ context.Context, v, p string, max int64) (volumepkg.ReadResult, error) {
+	s.readCalls = append(s.readCalls, stubBrowseCall{Volume: v, Path: p, Max: max})
+	if s.readFn != nil {
+		return s.readFn(v, p, max)
+	}
+	return volumepkg.ReadResult{}, nil
+}
+
+// volumeTestFixture constructs a handler wired to mocks that know about
+// one managed volume ("mine"). Reduces boilerplate across the browse tests.
+func volumeTestFixture(t *testing.T, browser volumepkg.Browser) (*Handler, *mux.Router) {
+	t.Helper()
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: []volume.Volume{
+		{Name: "mine", Driver: "local", Labels: map[string]string{
+			"managed-by":     "accelero",
+			"accelero-stack": "ours",
+		}},
+	}}}
+	rec := &captureRecorder{}
+	h := &Handler{
+		Store:         &mockStore{},
+		Deployer:      &mockDeployer{},
+		Docker:        docker,
+		VolumeBrowser: browser,
+		Audit:         rec,
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	return h, router
+}
+
+func TestBrowseVolume_ListHappyPath(t *testing.T) {
+	browser := &stubBrowser{
+		listFn: func(vol, p string) ([]volumepkg.FileEntry, error) {
+			assert.Equal(t, "mine", vol)
+			assert.Equal(t, "/config", p)
+			return []volumepkg.FileEntry{
+				{Name: "app.yml", Path: "/config/app.yml", SizeBytes: 42, Mode: "-rw-r--r--"},
+				{Name: "secrets", Path: "/config/secrets", IsDir: true, Mode: "drwx------"},
+			}, nil
+		},
+	}
+	h, router := volumeTestFixture(t, browser)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/mine/browse?path=/config", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var got []volumepkg.FileEntry
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2)
+	assert.Equal(t, "app.yml", got[0].Name)
+	assert.Equal(t, int64(42), got[0].SizeBytes)
+	assert.True(t, got[1].IsDir)
+
+	// Audit — one volume.browse row with outcome=success.
+	rec := h.Audit.(*captureRecorder)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, "volume.browse", rec.entries[0].Operation)
+	assert.Equal(t, "success", rec.entries[0].Outcome)
+	assert.Equal(t, "mine", rec.entries[0].ResourceID)
+	assert.Equal(t, "/config", rec.entries[0].Metadata["path"])
+}
+
+func TestBrowseVolume_UnmanagedVolume404(t *testing.T) {
+	// Volume exists per Docker but isn't managed by accelero → 404,
+	// and the browser is NEVER called.
+	browser := &stubBrowser{}
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: nil}}
+	h := &Handler{
+		Store:         &mockStore{},
+		Deployer:      &mockDeployer{},
+		Docker:        docker,
+		VolumeBrowser: browser,
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/unmanaged/browse", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+	assert.Empty(t, browser.listCalls, "browser must not be invoked for unmanaged volumes")
+}
+
+func TestBrowseVolume_DefaultPathIsRoot(t *testing.T) {
+	browser := &stubBrowser{
+		listFn: func(_, p string) ([]volumepkg.FileEntry, error) {
+			assert.Equal(t, "/", p, "omitted ?path= defaults to /")
+			return []volumepkg.FileEntry{}, nil
+		},
+	}
+	_, router := volumeTestFixture(t, browser)
+	req := httptest.NewRequest("GET", "/api/v1/volumes/mine/browse", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusOK, rr.Code)
+}
+
+func TestBrowseVolume_BrowserErrorAuditedAsFailure(t *testing.T) {
+	browser := &stubBrowser{
+		listFn: func(_, _ string) ([]volumepkg.FileEntry, error) {
+			return nil, errReadyzTest("tar parse bad magic")
+		},
+	}
+	h, router := volumeTestFixture(t, browser)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/mine/browse?path=/bad", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+
+	rec := h.Audit.(*captureRecorder)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, "failure", rec.entries[0].Outcome)
+	assert.Contains(t, rec.entries[0].ErrorMessage, "tar parse bad magic")
+}
+
+func TestBrowseVolume_DownloadStreamsBody(t *testing.T) {
+	contents := []byte("hello from the volume")
+	browser := &stubBrowser{
+		readFn: func(vol, p string, max int64) (volumepkg.ReadResult, error) {
+			assert.Equal(t, "mine", vol)
+			assert.Equal(t, "/greet.txt", p)
+			assert.Equal(t, int64(maxVolumeFileDownload), max)
+			return volumepkg.ReadResult{
+				Content:   io.NopCloser(bytes.NewReader(contents)),
+				Name:      "greet.txt",
+				Path:      "/greet.txt",
+				SizeBytes: int64(len(contents)),
+				Mode:      "-rw-r--r--",
+			}, nil
+		},
+	}
+	h, router := volumeTestFixture(t, browser)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/mine/browse?path=/greet.txt&download=true", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "application/octet-stream", rr.Header().Get("Content-Type"))
+	assert.Contains(t, rr.Header().Get("Content-Disposition"), `filename="greet.txt"`)
+	assert.Equal(t, string(contents), rr.Body.String())
+
+	rec := h.Audit.(*captureRecorder)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, "volume.read", rec.entries[0].Operation)
+	assert.Equal(t, "success", rec.entries[0].Outcome)
+	assert.Equal(t, "21", rec.entries[0].Metadata["size_bytes"])
+}
+
+func TestBrowseVolume_BrowserUnconfigured503(t *testing.T) {
+	// Volume browsing requires both Docker (for the label check) and the
+	// browser. Nil browser → 503 even if Docker is available.
+	h := &Handler{
+		Store:    &mockStore{},
+		Deployer: &mockDeployer{},
+		Docker:   &mockDocker{},
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/mine/browse", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
 }
