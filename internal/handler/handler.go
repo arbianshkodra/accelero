@@ -55,6 +55,9 @@ type DockerClient interface {
 	ContainerLogs(ctx context.Context, id string, options client.ContainerLogsOptions) (client.ContainerLogsResult, error)
 	ContainerStats(ctx context.Context, id string, options client.ContainerStatsOptions) (client.ContainerStatsResult, error)
 	Events(ctx context.Context, options client.EventsListOptions) client.EventsResult
+	ImageList(ctx context.Context, options client.ImageListOptions) (client.ImageListResult, error)
+	VolumeList(ctx context.Context, options client.VolumeListOptions) (client.VolumeListResult, error)
+	NetworkList(ctx context.Context, options client.NetworkListOptions) (client.NetworkListResult, error)
 }
 
 // Handler holds all dependencies for the HTTP API.
@@ -128,6 +131,12 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers/{cid}/logs", h.GetStackContainerLogs).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
+
+	// Read-only resource browsers (Phase 3) — root-level; scoped to
+	// accelero-managed resources. ?stack=<name> narrows further.
+	api.HandleFunc("/images", h.ListManagedImages).Methods("GET")
+	api.HandleFunc("/volumes", h.ListManagedVolumes).Methods("GET")
+	api.HandleFunc("/networks", h.ListManagedNetworks).Methods("GET")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -1310,6 +1319,239 @@ func projectEvent(m events.Message) StackEvent {
 		}
 	}
 	return evt
+}
+
+// --------------------------------------------------------------------------
+// Resource browsers (Phase 3)
+// --------------------------------------------------------------------------
+
+// ManagedImage is a projected image entry for the /images endpoint.
+// "Managed" here means "currently referenced by at least one container
+// with managed-by=accelero" — Docker images themselves don't carry our
+// labels, so we derive usage by walking managed containers.
+type ManagedImage struct {
+	ID        string        `json:"id"`
+	RepoTags  []string      `json:"repo_tags,omitempty"`
+	SizeBytes int64         `json:"size_bytes"`
+	CreatedAt time.Time     `json:"created_at"`
+	UsedBy    []ImageUsage  `json:"used_by"`
+}
+
+// ImageUsage is a back-reference from an image to the containers that
+// currently pull from it. Sorted lexically so scrapes are deterministic.
+type ImageUsage struct {
+	Stack     string `json:"stack"`
+	Service   string `json:"service,omitempty"`
+	Replica   *int   `json:"replica,omitempty"`
+	Container string `json:"container_id"`
+}
+
+// ManagedVolume is the projected view of a Docker volume filtered to
+// accelero-managed resources.
+type ManagedVolume struct {
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Stack      string            `json:"stack,omitempty"`
+	MountPoint string            `json:"mount_point"`
+	CreatedAt  string            `json:"created_at,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+}
+
+// ManagedNetwork is the projected view of a Docker network.
+// Connected-container enumeration is deferred — the /stacks/{id}/containers
+// endpoint already lets operators see which containers belong to each
+// stack. If a view of "who's on this network" becomes load-bearing we
+// can add a verbose mode that hits NetworkInspect.
+type ManagedNetwork struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Driver    string            `json:"driver"`
+	Scope     string            `json:"scope"`
+	Stack     string            `json:"stack,omitempty"`
+	CreatedAt time.Time         `json:"created_at"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Options   map[string]string `json:"options,omitempty"`
+}
+
+// ListManagedImages returns every image currently pulled into use by an
+// accelero-managed container. Query param ?stack=<name> narrows to one
+// stack.  We have to walk containers first because Docker images
+// themselves don't carry management labels.
+func (h *Handler) ListManagedImages(w http.ResponseWriter, r *http.Request) {
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
+	defer cancel()
+
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue))
+	if stackName := r.URL.Query().Get("stack"); stackName != "" {
+		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
+	}
+
+	containers, err := h.Docker.ContainerList(ctx, client.ContainerListOptions{
+		All:     true,
+		Filters: filters,
+	})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("container list failed")
+		writeError(w, "failed to list containers", http.StatusInternalServerError)
+		return
+	}
+
+	// Map each image ID to the containers that reference it.
+	usageByImage := make(map[string][]ImageUsage)
+	for _, c := range containers.Items {
+		use := ImageUsage{
+			Stack:     c.Labels[containerLabelStackName],
+			Service:   c.Labels[containerLabelServiceName],
+			Replica:   parseReplicaLabel(c.Labels[containerLabelReplicaIndex]),
+			Container: c.ID,
+		}
+		usageByImage[c.ImageID] = append(usageByImage[c.ImageID], use)
+	}
+
+	if len(usageByImage) == 0 {
+		writeJSON(w, []ManagedImage{}, http.StatusOK)
+		return
+	}
+
+	// Docker has no "filter by image id" option on ImageList, so we list
+	// all and intersect. On a typical host this is cheap — only images
+	// we actually care about get projected into the response.
+	imageList, err := h.Docker.ImageList(ctx, client.ImageListOptions{All: false})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("image list failed")
+		writeError(w, "failed to list images", http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]ManagedImage, 0, len(usageByImage))
+	for _, img := range imageList.Items {
+		usage, ok := usageByImage[img.ID]
+		if !ok {
+			continue
+		}
+		sort.Slice(usage, func(i, j int) bool {
+			if usage[i].Stack != usage[j].Stack {
+				return usage[i].Stack < usage[j].Stack
+			}
+			if usage[i].Service != usage[j].Service {
+				return usage[i].Service < usage[j].Service
+			}
+			return usage[i].Container < usage[j].Container
+		})
+		out = append(out, ManagedImage{
+			ID:        img.ID,
+			RepoTags:  img.RepoTags,
+			SizeBytes: img.Size,
+			CreatedAt: time.Unix(img.Created, 0).UTC(),
+			UsedBy:    usage,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return firstTag(out[i].RepoTags) < firstTag(out[j].RepoTags)
+	})
+
+	writeJSON(w, out, http.StatusOK)
+}
+
+// firstTag returns the first repo tag for deterministic sort, or empty.
+func firstTag(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	return tags[0]
+}
+
+// ListManagedVolumes returns volumes labelled managed-by=accelero.
+// Scope-narrowing via ?stack=<name>. Warnings from the daemon are
+// surfaced via logs — not worth polluting the response for rare
+// filesystem-level issues that don't affect the listing.
+func (h *Handler) ListManagedVolumes(w http.ResponseWriter, r *http.Request) {
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
+	defer cancel()
+
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue))
+	if stackName := r.URL.Query().Get("stack"); stackName != "" {
+		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
+	}
+
+	res, err := h.Docker.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("volume list failed")
+		writeError(w, "failed to list volumes", http.StatusInternalServerError)
+		return
+	}
+	for _, warn := range res.Warnings {
+		logctx.FromContext(ctx).Warnf("docker volume list warning: %s", warn)
+	}
+
+	out := make([]ManagedVolume, 0, len(res.Items))
+	for _, v := range res.Items {
+		out = append(out, ManagedVolume{
+			Name:       v.Name,
+			Driver:     v.Driver,
+			Stack:      v.Labels[containerLabelStackName],
+			MountPoint: v.Mountpoint,
+			CreatedAt:  v.CreatedAt,
+			Labels:     v.Labels,
+			Options:    v.Options,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	writeJSON(w, out, http.StatusOK)
+}
+
+// ListManagedNetworks returns networks labelled managed-by=accelero.
+// Scope-narrowing via ?stack=<name>.
+func (h *Handler) ListManagedNetworks(w http.ResponseWriter, r *http.Request) {
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
+	defer cancel()
+
+	filters := make(client.Filters).
+		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue))
+	if stackName := r.URL.Query().Get("stack"); stackName != "" {
+		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
+	}
+
+	res, err := h.Docker.NetworkList(ctx, client.NetworkListOptions{Filters: filters})
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("network list failed")
+		writeError(w, "failed to list networks", http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]ManagedNetwork, 0, len(res.Items))
+	for _, n := range res.Items {
+		out = append(out, ManagedNetwork{
+			ID:        n.ID,
+			Name:      n.Name,
+			Driver:    n.Driver,
+			Scope:     n.Scope,
+			Stack:     n.Labels[containerLabelStackName],
+			CreatedAt: n.Created.UTC(),
+			Labels:    n.Labels,
+			Options:   n.Options,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	writeJSON(w, out, http.StatusOK)
 }
 
 // resolveStack is shared between all the /stacks/{id}/* endpoints. It
