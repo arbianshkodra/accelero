@@ -109,6 +109,7 @@ func main() {
 		Store:      db,
 		Deployer:   deployer,
 		Reconciler: rec,
+		Docker:     cli,
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
