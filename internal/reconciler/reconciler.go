@@ -152,6 +152,8 @@ func (r *Reconciler) publishLoopGauge() {
 // deleted. It stops any existing loop for the stack and, if the stack still
 // exists and has reconciliation enabled, starts a new one.
 func (r *Reconciler) RefreshStack(stackID string) {
+	log := logrus.WithField("stack_id", stackID)
+
 	r.mu.Lock()
 	if existing, ok := r.loops[stackID]; ok {
 		existing.cancel()
@@ -162,23 +164,25 @@ func (r *Reconciler) RefreshStack(stackID string) {
 
 	stack, err := r.store.GetStack(stackID)
 	if err != nil {
-		logrus.Errorf("reconciler: failed to get stack %s during refresh: %v", stackID, err)
+		log.WithError(err).Error("reconciler: failed to get stack during refresh")
 		return
 	}
 
 	// Stack may have been deleted.
 	if stack == nil {
-		logrus.Infof("reconciler: stack %s removed, loop stopped", stackID)
+		log.Info("reconciler: stack removed, loop stopped")
 		return
 	}
 
+	// Enrich subsequent log lines with the resolved stack_name.
+	log = log.WithField("stack_name", stack.Name)
+
 	if stack.ReconcileInterval > 0 && stack.Status == store.StackStatusActive {
 		r.startStackLoop(stack)
-		logrus.Infof("reconciler: refreshed loop for stack %s (%s) with interval %ds",
-			stack.ID, stack.Name, stack.ReconcileInterval)
+		log.WithField("interval_seconds", stack.ReconcileInterval).
+			Info("reconciler: refreshed reconcile loop")
 	} else {
-		logrus.Infof("reconciler: stack %s (%s) does not require a reconcile loop",
-			stack.ID, stack.Name)
+		log.Info("reconciler: stack does not require a reconcile loop")
 	}
 	r.publishLoopGauge()
 }
