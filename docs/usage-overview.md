@@ -375,6 +375,7 @@ Accelero parses the subset of docker-compose fields listed below. Anything outsi
 | `cpu_limit` | float | CPU quota in fractional cores (e.g. `0.5`) |
 | `pull_policy` | `always`, `missing`, `if_not_present`, `never` | See [pull policy](#pull-policy) below; `build` is rejected |
 | `logging` | `{driver, options}` | Maps 1:1 to Docker's `LogConfig` — e.g. `json-file` with `max-size` / `max-file` options |
+| `deploy` | object | Only `replicas` is acted on — see [Replicas](#replicas) below. `mode` parses but is informational; other `deploy.*` fields (resources, restart_policy) are ignored |
 
 ### Top-level
 
@@ -494,6 +495,58 @@ Managed volumes are labelled `managed-by=accelero` and `accelero-stack=<name>` s
 **Drift detection:** a declared named volume missing from the host shows up as a drift item (`type: "missing"` for internal, `type: "missing_external"` for external). Extra volumes on the host that Accelero didn't declare are ignored.
 
 **State survives redeploys.** Changing a service's image tag rebuilds the container but re-attaches the same volume — data persists.
+
+### Replicas
+
+`deploy.replicas` runs N interchangeable containers for a service. Accelero uses a rolling strategy: it creates a new replica, waits for it to become healthy, then removes one of the old replicas. This keeps at least `keep - 1` healthy replicas up at every point in the rollout, so image bumps on replicated services are zero-downtime end-to-end.
+
+```yaml
+services:
+  web:
+    image: nginx:1.27.1
+    expose:
+      - "80"
+    networks: [app]
+    deploy:
+      replicas: 3
+```
+
+Each replica gets a unique container name (`<service>_<index>_<timestamp>`) and the labels `accelero-service=<name>` and `accelero-replica=<index>` for observability:
+
+```bash
+$ docker ps --filter label=accelero-service=web --format '{{.Names}} {{.Label "accelero-replica"}}'
+web_0_... 0
+web_1_... 1
+web_2_... 2
+```
+
+**Scaling.** Change `replicas:` in git and redeploy. Accelero keeps healthy replicas running on the target image, adds more when scaling up, and removes surplus ones when scaling down.
+
+**Idempotent re-deploys.** Re-running `deploy` when the stack is already in sync (N healthy replicas on the target image) is a no-op — no containers are recreated.
+
+**`depends_on` with replicated dependencies.**
+- `service_healthy`: any replica healthy unblocks dependents (matches Swarm's semantics; Docker DNS round-robins to healthy endpoints as soon as one is up).
+- `service_completed_successfully`: all replicas must have exited with code 0.
+
+#### Static host ports collide with replicas
+
+Accelero rejects any deploy where `replicas > 1` and the service publishes a static host port:
+
+```yaml
+services:
+  web:
+    image: nginx:1.27.1
+    ports:
+      - "80:80"          # ❌ static host port
+    deploy:
+      replicas: 3         # ❌ would collide on host port 80
+```
+
+The deploy fails up front with:
+
+> `service "web" has replicas=2 with a static published host port; replicas would collide on the host port. Use \`expose:\` + a reverse proxy, or reduce replicas to 1`
+
+This mirrors docker-compose's non-swarm behaviour. The GitOps-correct pattern for replicated services is `expose:` (internal-only) plus a reverse-proxy or load-balancer service (also managed by Accelero) that fans out to the `accelero-service` label of the replicated service.
 
 ### Pull policy
 

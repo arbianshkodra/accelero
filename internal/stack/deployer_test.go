@@ -825,3 +825,34 @@ volumes:
 
 // suppress unused-import warnings when editing happens in bulk
 var _ = service.ComposeService{}
+
+// ---------------------------------------------------------------------------
+// deploy.replicas round-trip through readComposeFile
+// ---------------------------------------------------------------------------
+
+func TestReadComposeFile_DeployReplicas(t *testing.T) {
+	dir := t.TempDir()
+	compose := `services:
+  web:
+    image: nginx:1.27.1
+    deploy:
+      replicas: 3
+      mode: replicated
+  worker:
+    image: my/worker:1.0
+  one-off:
+    image: my/one-off:1.0
+    deploy:
+      replicas: 1
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, cf.Services["web"].DesiredReplicas(), "explicit replicas: 3")
+	assert.Equal(t, 1, cf.Services["worker"].DesiredReplicas(), "missing deploy block defaults to 1")
+	assert.Equal(t, 1, cf.Services["one-off"].DesiredReplicas(), "explicit replicas: 1")
+	assert.Equal(t, "replicated", cf.Services["web"].Deploy.Mode, "mode round-trips even if unused")
+}
