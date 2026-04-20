@@ -13,6 +13,7 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
+	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
@@ -114,6 +115,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 		}
 	}
 
+	r.publishLoopGauge()
 	logrus.Infof("reconciler: started with %d active reconcile loops", len(r.loops))
 }
 
@@ -130,8 +132,18 @@ func (r *Reconciler) Stop() {
 	}
 	r.mu.Unlock()
 
+	r.publishLoopGauge()
 	r.wg.Wait()
 	logrus.Info("reconciler: all loops stopped")
+}
+
+// publishLoopGauge reports the current loop count to the metrics registry.
+// Must be called while holding the lock, or immediately after releasing it.
+func (r *Reconciler) publishLoopGauge() {
+	r.mu.Lock()
+	n := len(r.loops)
+	r.mu.Unlock()
+	metrics.SetReconcilerLoops(n)
 }
 
 // RefreshStack should be called whenever a stack is created, updated, or
@@ -166,6 +178,7 @@ func (r *Reconciler) RefreshStack(stackID string) {
 		logrus.Infof("reconciler: stack %s (%s) does not require a reconcile loop",
 			stack.ID, stack.Name)
 	}
+	r.publishLoopGauge()
 }
 
 // CheckDrift performs a one-off drift check for the given stack. This is
@@ -258,6 +271,8 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 		return
 	}
 
+	metrics.RecordReconcileCycle(stack.Name)
+
 	report, err := r.checkDrift(ctx, stack)
 	if err != nil {
 		log.WithError(err).Error("drift check failed")
@@ -267,6 +282,7 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 	if report.HasDrift {
 		log.Infof("drift detected: %d drift(s)", len(report.Drifts))
 		for _, d := range report.Drifts {
+			metrics.RecordDrift(stack.Name, d.Type)
 			log.WithFields(logrus.Fields{
 				"drift_type":   d.Type,
 				"service_name": d.ServiceName,

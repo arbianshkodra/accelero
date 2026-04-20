@@ -19,6 +19,7 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
+	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/network"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
@@ -159,6 +160,15 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	if err := d.store.UpdateStack(stack); err != nil {
 		log.WithError(err).Error("Failed to update stack record")
 	}
+
+	// Record metrics for the completed (or failed) deploy.  The deployment's
+	// StartedAt is set earlier in this function so duration is always valid.
+	metrics.RecordDeployment(
+		stack.Name,
+		trigger,
+		deployment.Status,
+		deployment.CompletedAt.Sub(deployment.StartedAt).Seconds(),
+	)
 
 	return deployment, deployErr
 }
