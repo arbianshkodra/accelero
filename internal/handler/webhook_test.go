@@ -18,8 +18,9 @@ import (
 
 // mockStore implements store.Store for testing.
 type mockStore struct {
-	stacks      []*store.Stack
-	deployments []*store.Deployment
+	stacks       []*store.Stack
+	deployments  []*store.Deployment
+	auditEntries []*store.AuditEntry
 }
 
 // newHandler wires a Handler with the three test doubles we need. Kept
@@ -63,8 +64,15 @@ func (m *mockStore) TrackContainer(c *store.ManagedContainer) error             
 func (m *mockStore) ListContainers(stackID string) ([]*store.ManagedContainer, error) { return nil, nil }
 func (m *mockStore) RemoveContainer(containerID string) error                     { return nil }
 func (m *mockStore) RemoveContainersByStack(stackID string) error                 { return nil }
-func (m *mockStore) Ping(ctx context.Context) error                               { return nil }
-func (m *mockStore) Close() error                                                 { return nil }
+func (m *mockStore) CreateAuditEntry(e *store.AuditEntry) error {
+	m.auditEntries = append(m.auditEntries, e)
+	return nil
+}
+func (m *mockStore) ListAuditEntries(_ store.AuditFilter) ([]*store.AuditEntry, error) {
+	return m.auditEntries, nil
+}
+func (m *mockStore) Ping(ctx context.Context) error { return nil }
+func (m *mockStore) Close() error                   { return nil }
 
 // mockDeployer implements Deployer for testing.
 type mockDeployer struct {
@@ -494,4 +502,151 @@ func TestPreviewDeploy_StackNotFound(t *testing.T) {
 	router.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+// captureRecorder is a tiny audit.Recorder used by handler tests to
+// assert that write endpoints emit the right audit entries. We don't
+// pull in the real StoreRecorder here because the handler tests already
+// use mockStore, which implements the audit store API directly.
+type captureRecorder struct {
+	entries []store.AuditEntry
+}
+
+func (r *captureRecorder) Record(_ context.Context, e store.AuditEntry) error {
+	r.entries = append(r.entries, e)
+	return nil
+}
+
+func TestCreateStack_EmitsAuditEntry(t *testing.T) {
+	ms := &mockStore{}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"name":         "audited-stack",
+		"repo_url":     "https://example/repo",
+		"compose_path": "docker-compose.yaml",
+	})
+	req := httptest.NewRequest("POST", "/api/v1/stacks", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusCreated, rr.Code)
+	require.Len(t, rec.entries, 1, "one audit entry per create")
+	got := rec.entries[0]
+	assert.Equal(t, "stack.create", got.Operation)
+	assert.Equal(t, "api-key", got.Actor)
+	assert.Equal(t, "stack", got.ResourceType)
+	assert.Equal(t, "audited-stack", got.StackName)
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+	assert.NotEmpty(t, got.StackID)
+}
+
+func TestDeleteStack_EmitsAuditEntry(t *testing.T) {
+	// DeleteStack records even when the caller passed a *name*, and the
+	// audit row carries the canonical *ID* in ResourceID/StackID so that
+	// a later "what happened to stack X" query by ID still finds it.
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "real-id", Name: "named-stack", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/named-stack", nil)
+	rr := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, "stack.delete", got.Operation)
+	assert.Equal(t, "real-id", got.ResourceID, "canonical ID lands in audit, not the name")
+	assert.Equal(t, "real-id", got.StackID)
+	assert.Equal(t, "named-stack", got.StackName)
+}
+
+func TestDeployStack_EmitsInProgressAuditEntry(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "app", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	req := httptest.NewRequest("POST", "/api/v1/stacks/app/deploy", nil)
+	rr := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	require.Len(t, rec.entries, 1, "handler records 'deploy.start'; deployer records completion")
+	got := rec.entries[0]
+	assert.Equal(t, "deploy.start", got.Operation)
+	assert.Equal(t, store.AuditOutcomeInProgress, got.Outcome)
+	assert.Equal(t, "manual", got.Metadata["trigger"])
+}
+
+func TestListAuditEntries_Endpoint(t *testing.T) {
+	// End-to-end check through the real GET /api/v1/audit handler —
+	// asserts the store-returned rows come back as JSON.
+	now := time.Now().UTC()
+	ms := &mockStore{
+		auditEntries: []*store.AuditEntry{
+			{
+				ID:        "entry-1",
+				Timestamp: now,
+				Actor:     "api-key",
+				Operation: store.AuditOpStackCreate,
+				StackID:   "s1",
+				StackName: "app",
+				Outcome:   store.AuditOutcomeSuccess,
+			},
+		},
+	}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}}
+
+	req := httptest.NewRequest("GET", "/api/v1/audit?operation=stack.create", nil)
+	rr := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var out []*store.AuditEntry
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &out))
+	require.Len(t, out, 1)
+	assert.Equal(t, "stack.create", out[0].Operation)
+	assert.Equal(t, "app", out[0].StackName)
+}
+
+func TestListAuditEntries_BadSinceRejected(t *testing.T) {
+	h := &Handler{Store: &mockStore{}, Deployer: &mockDeployer{}}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("GET", "/api/v1/audit?since=yesterday", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }

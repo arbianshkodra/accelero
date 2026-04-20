@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/metrics"
@@ -75,6 +76,11 @@ type Deployer struct {
 	// reference files in the repo (e.g. `./Caddyfile`) keep working.
 	stacksDir string
 
+	// audit records lifecycle outcomes — deploy.complete /
+	// deploy.failed / deploy.rolled_back — as system:deployer events.
+	// nil means no audit (tests, minimal setups).
+	audit audit.Recorder
+
 	// Per-service mutex prevents concurrent deploys of the same service.
 	serviceMu   sync.Mutex
 	serviceLocks map[string]*sync.Mutex
@@ -90,6 +96,23 @@ func NewDeployer(cli *client.Client, s store.Store, stacksDir string) *Deployer 
 		stacksDir:    stacksDir,
 		serviceLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// SetAudit attaches an audit recorder. Keeping this as a setter rather
+// than a constructor parameter avoids churning every NewDeployer call
+// site in tests and out-of-tree callers.
+func (d *Deployer) SetAudit(r audit.Recorder) {
+	d.audit = r
+}
+
+// recordAudit is a nil-safe helper for audit writes from the deployer.
+// Failures are already warn-logged inside the recorder; callers don't
+// need to do anything with the return value.
+func (d *Deployer) recordAudit(ctx context.Context, e store.AuditEntry) {
+	if d.audit == nil {
+		return
+	}
+	_ = d.audit.Record(ctx, e)
 }
 
 // CleanupStackData removes a stack's cloned-repo directory.  Called by the
@@ -199,7 +222,46 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 		deployment.CompletedAt.Sub(deployment.StartedAt).Seconds(),
 	)
 
+	// Audit the outcome so the /audit log shows the full deploy lifecycle
+	// (request-time start is logged by the HTTP handler; completion here).
+	auditEntry := audit.FromSystem("deployer", deployOpForStatus(deployment.Status))
+	auditEntry.ResourceType = "deployment"
+	auditEntry.ResourceID = deployment.ID
+	auditEntry.StackID = stack.ID
+	auditEntry.StackName = stack.Name
+	auditEntry.Metadata = map[string]string{
+		"trigger":          trigger,
+		"git_commit":       deployment.GitCommit,
+		"duration_seconds": fmt.Sprintf("%.3f", deployment.CompletedAt.Sub(deployment.StartedAt).Seconds()),
+	}
+	if deployErr != nil {
+		auditEntry.Outcome = store.AuditOutcomeFailure
+		auditEntry.ErrorMessage = deployErr.Error()
+	} else {
+		auditEntry.Outcome = store.AuditOutcomeSuccess
+		if deployment.Changes != "" {
+			auditEntry.Metadata["changes"] = deployment.Changes
+		}
+	}
+	d.recordAudit(ctx, auditEntry)
+
 	return deployment, deployErr
+}
+
+// deployOpForStatus maps a terminal deployment status to its audit
+// operation name.  DeploymentRolledBack currently can't be observed
+// here — the Deploy() function clobbers it to Failed before we get
+// this far — so the mapping is: Completed→complete, anything else→failed.
+// If the rollback-status plumbing is fixed later, just add the case.
+func deployOpForStatus(status string) string {
+	switch status {
+	case store.DeploymentCompleted:
+		return store.AuditOpDeployComplete
+	case store.DeploymentRolledBack:
+		return store.AuditOpDeployRolledBack
+	default:
+		return store.AuditOpDeployFailed
+	}
 }
 
 // --------------------------------------------------------------------------
