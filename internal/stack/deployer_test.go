@@ -702,5 +702,126 @@ func TestParseDNSAddrs(t *testing.T) {
 	assert.Nil(t, parseDNSAddrs(nil, log))
 }
 
+// ---------------------------------------------------------------------------
+// Named volumes: scoping + service rewriting
+// ---------------------------------------------------------------------------
+
+func TestResolveVolumeName(t *testing.T) {
+	cases := []struct {
+		name    string
+		stack   string
+		logical string
+		cfg     service.ComposeVolume
+		want    string
+	}{
+		{
+			name:    "default scopes with stack prefix",
+			stack:   "prod",
+			logical: "pg_data",
+			cfg:     service.ComposeVolume{},
+			want:    "accelero_prod_pg_data",
+		},
+		{
+			name:    "explicit name bypasses scoping",
+			stack:   "prod",
+			logical: "pg_data",
+			cfg:     service.ComposeVolume{Name: "shared_pg"},
+			want:    "shared_pg",
+		},
+		{
+			name:    "external uses logical name verbatim",
+			stack:   "prod",
+			logical: "legacy_logs",
+			cfg:     service.ComposeVolume{External: true},
+			want:    "legacy_logs",
+		},
+		{
+			name:    "external + explicit name prefers explicit name",
+			stack:   "prod",
+			logical: "ignored",
+			cfg:     service.ComposeVolume{External: true, Name: "real_name"},
+			want:    "real_name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, resolveVolumeName(tc.stack, tc.logical, tc.cfg))
+		})
+	}
+}
+
+func TestRewriteVolumeRefs(t *testing.T) {
+	nameMap := map[string]string{
+		"pg_data":     "accelero_mystack_pg_data",
+		"legacy_logs": "legacy_logs", // external-style entry, maps to itself
+	}
+
+	input := []string{
+		"pg_data:/var/lib/postgresql/data",            // known named volume → rewritten
+		"legacy_logs:/var/log/legacy:ro",              // known + mode → rewritten
+		"/host/abs:/container/abs",                    // absolute bind → untouched
+		"./relative:/container/rel",                   // relative bind → untouched
+		"~/home:/container/home",                      // tilde bind → untouched
+		"some_unknown_volume:/container/anon",         // unknown name → leave for Docker
+		"/just-a-path-no-colon",                       // malformed → untouched
+	}
+	got := rewriteVolumeRefs(input, nameMap)
+
+	assert.Equal(t, []string{
+		"accelero_mystack_pg_data:/var/lib/postgresql/data",
+		"legacy_logs:/var/log/legacy:ro",
+		"/host/abs:/container/abs",
+		"./relative:/container/rel",
+		"~/home:/container/home",
+		"some_unknown_volume:/container/anon",
+		"/just-a-path-no-colon",
+	}, got)
+}
+
+func TestRewriteVolumeRefs_EmptyMapIsPassthrough(t *testing.T) {
+	input := []string{"some_name:/data"}
+	got := rewriteVolumeRefs(input, nil)
+	assert.Equal(t, input, got)
+}
+
+// ---------------------------------------------------------------------------
+// readComposeFile accepts the top-level volumes section.
+// ---------------------------------------------------------------------------
+
+func TestReadComposeFile_TopLevelVolumes(t *testing.T) {
+	dir := t.TempDir()
+	compose := `services:
+  db:
+    image: postgres:16
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - /host/bind:/etc/config
+volumes:
+  pg_data:
+    driver: local
+    driver_opts:
+      type: tmpfs
+  legacy_logs:
+    external: true
+    name: shared_legacy_logs
+`
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte(compose), 0644))
+
+	d := newTestDeployer()
+	cf, err := d.readComposeFile(dir, "docker-compose.yaml")
+	assert.NoError(t, err)
+	require.Len(t, cf.Volumes, 2)
+
+	pg := cf.Volumes["pg_data"]
+	assert.Equal(t, "local", pg.Driver)
+	assert.Equal(t, "tmpfs", pg.DriverOpts["type"])
+	assert.False(t, pg.External)
+	assert.Empty(t, pg.Name)
+
+	legacy := cf.Volumes["legacy_logs"]
+	assert.True(t, legacy.External)
+	assert.Equal(t, "shared_legacy_logs", legacy.Name)
+}
+
 // suppress unused-import warnings when editing happens in bulk
 var _ = service.ComposeService{}
