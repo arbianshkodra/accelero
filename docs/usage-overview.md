@@ -496,9 +496,45 @@ Managed volumes are labelled `managed-by=accelero` and `accelero-stack=<name>` s
 
 **State survives redeploys.** Changing a service's image tag rebuilds the container but re-attaches the same volume — data persists.
 
+### Zero-downtime deployments
+
+Zero-downtime is the whole point: pushing a new image tag should not interrupt traffic. For that to actually hold, you need **two things together**:
+
+1. **The backend service runs as replicas** (`deploy.replicas: N` with `expose:` only, no published host port). Accelero rolls replicas one at a time — create new, wait healthy, remove one old.
+2. **Something in front holds the host port** and routes to the replicas via Docker's internal DNS. Typically a reverse proxy (Caddy, Traefik, nginx). The proxy itself never rolls; only the backend does.
+
+Without the proxy in front, externally-reachable services cannot be zero-downtime deployed under Docker — only one container at a time can hold a host port. An image bump on a service that publishes `"80:80"` directly either **fails with a port conflict** (Docker rejects the new container's bind) or **has a measurable outage** during container swap. There's no path around this at the Docker level; it has to be solved by traffic indirection.
+
+See `samples/` in the accelero repo for a working end-to-end example (nginx + Caddy + replicas + a scripted proof). The pattern boils down to:
+
+```yaml
+services:
+  web:
+    image: nginx:1.27.1-alpine
+    expose: ["80"]
+    networks: [app]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 5s
+    deploy:
+      replicas: 3
+
+  proxy:
+    image: caddy:2-alpine
+    command: ["caddy", "reverse-proxy", "--from", ":80", "--to", "web:80"]
+    ports: ["80:80"]        # only the proxy binds the host port
+    depends_on: [web]
+    networks: [app]
+
+networks:
+  app: { driver: bridge }
+```
+
+On an image bump of `web`, Accelero rolls the three replicas while Caddy keeps resolving `web` to whichever ones are healthy via Docker DNS.
+
 ### Replicas
 
-`deploy.replicas` runs N interchangeable containers for a service. Accelero uses a rolling strategy: it creates a new replica, waits for it to become healthy, then removes one of the old replicas. This keeps at least `keep - 1` healthy replicas up at every point in the rollout, so image bumps on replicated services are zero-downtime end-to-end.
+`deploy.replicas` runs N interchangeable containers for a service. Accelero uses a rolling strategy: it creates a new replica, waits for it to become healthy, then removes one of the old replicas. With a proxy in front (see "Zero-downtime deployments" above), at least N−1 replicas stay up at any point in the rollout.
 
 ```yaml
 services:
