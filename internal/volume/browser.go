@@ -40,6 +40,11 @@ import (
 type Browser interface {
 	ListPath(ctx context.Context, volumeName, subPath string) ([]FileEntry, error)
 	ReadFile(ctx context.Context, volumeName, subPath string, maxBytes int64) (ReadResult, error)
+	// WriteFile overwrites (or creates) a file at subPath inside the
+	// volume. mode is the POSIX file mode (defaults to 0644 when 0 is
+	// passed). Parent directories are created as needed.  Implementations
+	// mount the helper read-write for this call specifically.
+	WriteFile(ctx context.Context, volumeName, subPath string, mode uint32, content io.Reader, size int64) error
 }
 
 // FileEntry is one row in a directory listing.
@@ -207,6 +212,118 @@ func (b *DockerBrowser) ReadFile(ctx context.Context, volumeName, subPath string
 	return ReadResult{}, fmt.Errorf("path %q is a directory, not a file", abs)
 }
 
+// WriteFile creates or overwrites a file inside the volume. The caller
+// supplies the bytes + their size; implementations stream the payload
+// into the container without buffering the whole thing in memory (so
+// large writes up to the configured cap don't OOM accelero).
+//
+// Parent directories are created as needed — Docker's CopyToContainer
+// extracts our tar into DestinationPath, so we include TypeDir entries
+// for each parent the tar references.
+//
+// Refuses to write to the volume root (subPath == "/"): the destination
+// has to be a file, not a directory, and overwriting the whole volume
+// with one byte-stream isn't a sensible operation.
+func (b *DockerBrowser) WriteFile(ctx context.Context, volumeName, subPath string, mode uint32, content io.Reader, size int64) error {
+	abs, err := cleanSubPath(subPath)
+	if err != nil {
+		return err
+	}
+	if abs == "/" || strings.HasSuffix(abs, "/") {
+		return fmt.Errorf("subPath must point at a file, not a directory")
+	}
+	if mode == 0 {
+		mode = 0o644
+	}
+
+	id, err := b.createHelperRW(ctx, volumeName)
+	if err != nil {
+		return err
+	}
+	defer b.removeHelper(ctx, id)
+
+	// Build a tar with directory entries for each parent (so missing
+	// intermediate dirs get created during extraction) plus the file
+	// payload. DestinationPath=/volume means names in the tar are
+	// volume-relative.
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- writeVolumeTar(pw, abs, mode, content, size)
+	}()
+
+	if _, err := b.cli.CopyToContainer(ctx, id, client.CopyToContainerOptions{
+		DestinationPath: "/volume",
+		Content:         pr,
+	}); err != nil {
+		pr.CloseWithError(err) // unblock the writer if it's still pushing
+		<-done
+		return fmt.Errorf("copy to helper: %w", err)
+	}
+
+	if err := <-done; err != nil {
+		return fmt.Errorf("tar stream: %w", err)
+	}
+	return nil
+}
+
+// writeVolumeTar emits a tar stream suitable for CopyToContainer:
+// TypeDir entries for every parent path component (so Docker's
+// extractor creates them), followed by a single TypeReg entry for
+// the file with the caller's content.
+//
+// Parent dirs are emitted with mode 0755 — enough for the daemon to
+// cd in, which is all we need for the file to land. If the dir already
+// exists, Docker extraction is a no-op for the TypeDir entry; if it
+// doesn't, it's created. Either way the file is placed.
+func writeVolumeTar(w *io.PipeWriter, abs string, mode uint32, content io.Reader, size int64) error {
+	tw := tar.NewWriter(w)
+	defer func() {
+		_ = tw.Close()
+		_ = w.Close()
+	}()
+
+	// Emit every parent dir as TypeDir so the extractor can create
+	// any that don't exist yet. path.Split leaves trailing slashes on
+	// directories, strip before splitting.
+	parts := strings.Split(strings.TrimPrefix(path.Dir(abs), "/"), "/")
+	var accum string
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		if accum == "" {
+			accum = p
+		} else {
+			accum = accum + "/" + p
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     accum + "/",
+			Typeflag: tar.TypeDir,
+			Mode:     0o755,
+			ModTime:  time.Now(),
+		}); err != nil {
+			return err
+		}
+	}
+
+	// The file itself. Tar names are relative to DestinationPath, so
+	// strip the leading slash off abs.
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     strings.TrimPrefix(abs, "/"),
+		Typeflag: tar.TypeReg,
+		Mode:     int64(mode),
+		Size:     size,
+		ModTime:  time.Now(),
+	}); err != nil {
+		return err
+	}
+	if _, err := io.Copy(tw, content); err != nil {
+		return err
+	}
+	return nil
+}
+
 // parseListing walks the tar headers and keeps only direct children of
 // the requested directory. Nested entries are ignored — the caller
 // explicitly asked for one level.
@@ -267,8 +384,26 @@ func (b *DockerBrowser) parseListing(r io.Reader, requestedDir, rootName string)
 // any container that exists, and not starting saves ~100ms per request
 // plus avoids spurious "container exited immediately" log noise.
 func (b *DockerBrowser) createHelper(ctx context.Context, volumeName string) (string, error) {
+	return b.createHelperWithMode(ctx, volumeName, true)
+}
+
+// createHelperRW is the read-write variant used by WriteFile.  Split
+// out rather than parameterised on createHelper because every other
+// browse path should stay strictly read-only by construction — making
+// callers opt in to RW makes it obvious in code review which paths
+// can mutate volume contents.
+func (b *DockerBrowser) createHelperRW(ctx context.Context, volumeName string) (string, error) {
+	return b.createHelperWithMode(ctx, volumeName, false)
+}
+
+func (b *DockerBrowser) createHelperWithMode(ctx context.Context, volumeName string, readonly bool) (string, error) {
 	if err := b.ensureHelperImage(ctx); err != nil {
 		return "", err
+	}
+
+	mountFlag := "ro"
+	if !readonly {
+		mountFlag = "rw"
 	}
 
 	resp, err := b.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -283,7 +418,7 @@ func (b *DockerBrowser) createHelper(ctx context.Context, volumeName string) (st
 			},
 		},
 		HostConfig: &container.HostConfig{
-			Binds:      []string{fmt.Sprintf("%s:/volume:ro", volumeName)},
+			Binds:      []string{fmt.Sprintf("%s:/volume:%s", volumeName, mountFlag)},
 			AutoRemove: false,
 		},
 	})

@@ -137,4 +137,5 @@ const (
 	AuditOpContainerExecEnd   = "container.exec_end"
 	AuditOpVolumeBrowse       = "volume.browse"
 	AuditOpVolumeRead         = "volume.read"
+	AuditOpVolumeWrite        = "volume.write"
 )
