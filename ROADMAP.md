@@ -105,7 +105,7 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 **Exceptional debug operations (audited, flagged as drift):**
 - [x] `POST /api/v1/stacks/{id}/containers/{cid}/restart` — Docker-level restart, optional `?t=` grace period. Always audited (`container.restart` entry) even on Docker-side failure. Pure GitOps reminder: for config/image/replica changes, commit to git + redeploy instead.
 - [x] `GET /api/v1/stacks/{id}/containers/{cid}/exec` — WebSocket exec. TTY mode only (non-TTY requires stdcopy demux on output — flagged as follow-up). cmd/tty/user/workdir query params; binary frames both directions; CloseNormalClosure with `exit_code=N` in the reason. Two audit rows per session (`container.exec_start` in_progress + `container.exec_end` with outcome/exit_code/duration).
-- [ ] `POST /volumes/{name}/write` — emergency file write (off by default, requires `--allow-volume-writes` flag)
+- [x] `POST /api/v1/volumes/{name}/files?path=<p>&mode=<oct>` — emergency file write. Off by default; opt in via `ALLOW_VOLUME_WRITES=true`. Same helper-container pattern as the browser, mounted RW for the single call. 10MB body cap, parent dirs auto-created, `..` rejected, audited as `volume.write` with path/size/mode metadata.
 
 **Audit log:**
 - [x] Persistent audit log in SQLite — every notable write / system event with timestamp, actor, operation, resource, outcome, metadata

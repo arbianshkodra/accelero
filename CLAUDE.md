@@ -106,6 +106,7 @@ Optional:
 - `DOCKER_SOCK`: Docker socket path (default: unix:///var/run/docker.sock)
 - `DATABASE_PATH`: SQLite database path (default: ./data/accelero.db)
 - `STACKS_DATA_DIR`: Root directory for per-stack cloned repos (default: ./data/stacks). Used as the bind-mount source when a compose service references `./path/from/repo`. When Accelero runs in Docker, this path must be the same inside and outside the container — bind-mount the host dir at the same path.
+- `ALLOW_VOLUME_WRITES`: Set to `true` to enable `POST /volumes/{name}/files` (emergency file write into a managed volume). Default `false`. Every call is audited as `volume.write` regardless of outcome.
 - `LOG_LEVEL`: Logging level (default: info)
 - `LOG_FORMAT`: Log format — "json" or "text" (default: text)
 - `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)
@@ -150,6 +151,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/images` — images referenced by accelero-managed containers, with back-references (stack/service/replica/container). Walks containers to derive "managed" since images don't carry labels.
 - `GET /api/v1/volumes` — volumes labelled managed-by=accelero.
 - `GET /api/v1/volumes/{name}/browse` — list files in a managed volume or (with `?download=true`) stream one file's contents. Read-only; backed by an ephemeral busybox helper container mounted at `/volume:ro`. 10MB download cap, 10k-entry listing cap, `..` paths rejected, volumes.browse/read audited.
+- `POST /api/v1/volumes/{name}/files?path=<p>&mode=<oct>` — write file bytes into a managed volume (emergency patch affordance). Gated behind `ALLOW_VOLUME_WRITES=true`; 403 otherwise. 10MB body cap, parent dirs auto-created, `..` rejected. Audited as `volume.write`.
 - `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
 - All three accept `?stack=<name>` to narrow to one stack.
 
