@@ -571,6 +571,55 @@ kill / stop / die / destroy  (old replica 0)
 
 ---
 
+### Exec (WebSocket)
+`GET /api/v1/stacks/{id}/containers/{cid}/exec`
+
+Upgrade the connection to a WebSocket and run a command inside a container with stdin/stdout/stderr wired back to the client. The heaviest debug endpoint — the thing operators reach for when logs, stats, and restart couldn't answer the question.
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `cmd` | string, **repeatable** | — | The command and its arguments. At least one required. Examples: `?cmd=sh`, `?cmd=sh&cmd=-c&cmd=ls+-la`. |
+| `tty` | bool | `true` | Interactive shells need a TTY. MVP is TTY-only; `tty=false` returns `400` until non-TTY stdcopy demux lands. |
+| `user` | string | container default | Runs as this user inside the container. |
+| `workdir` | string | container default | Starts in this working directory. |
+
+**WebSocket protocol (TTY mode):**
+
+- **Binary messages** both directions.
+- Client → server: stdin bytes (anything you'd normally type into a shell).
+- Server → client: raw output bytes from the TTY, already merged stdout+stderr as Docker wrote them.
+- On exit: server sends a `CloseNormalClosure` frame with the exit code in the reason text, e.g. `"exit_code=0"` or `"exit_code=42"`.
+
+**Authentication.** Same `X-API-KEY` header as the rest of the API. Browsers can't set custom headers on `new WebSocket()` — for now, exec from a server-side process or via a proxy that injects the header.
+
+**Lifecycle guarantees:**
+
+- 30-second application pings, read deadline 2× that interval — detects half-closed TCPs the kernel hasn't noticed.
+- Client disconnect closes the stdin write side so tools that exit on stdin EOF terminate cleanly; Docker tears the exec down immediately afterward.
+- Container death closes the exec connection, which closes the WebSocket with the final exit code.
+
+**Audit — two rows per session:**
+
+- `container.exec_start` on connect — outcome `in_progress`, metadata includes `cmd`, `tty`, `user`, `workdir`, `exec_id`.
+- `container.exec_end` on disconnect — outcome `success` if exit_code was 0 and the stream didn't error; `failure` otherwise. Metadata adds `exit_code` and `duration_seconds` and inherits the start row's cmd/user/workdir.
+
+Pre-existing audit queries (`/audit?operation=container.exec_start`, `operation=container.exec_end`) give you the session history; the two rows share a `request_id` so `grep <request_id>` in logs stitches the timeline together.
+
+**This bypasses GitOps.** Exec is a debug affordance, never a substitute for compose changes + redeploy. Anything observable-and-persistent — image tags, replica counts, config — belongs in git. Exec exists so you can answer *why* the pod behaved the way it did, not to change state in place. The audit trail makes that answerable after the fact.
+
+**Errors:** `400 Bad Request` for missing `cmd` or `tty=false`; `404 Not Found` for missing / foreign-stack container; `500 Internal Server Error` if `ExecCreate` or `ExecAttach` fails (the `exec_end` audit row still gets written with `outcome: failure`); `503 Service Unavailable` when Docker introspection isn't configured.
+
+**Example (websocat):**
+```bash
+websocat \
+  -H "X-API-Key: $ACCELERO_API_KEY" \
+  "ws://localhost:8000/api/v1/stacks/demo/containers/$CID/exec?cmd=sh"
+```
+
+---
+
 ### Stream Container Logs (WebSocket)
 `GET /api/v1/stacks/{id}/containers/{cid}/logs/stream`
 
