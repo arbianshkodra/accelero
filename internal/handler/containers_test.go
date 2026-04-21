@@ -1723,16 +1723,25 @@ func TestStreamStackContainerStats_DockerUnconfigured503(t *testing.T) {
 // only care that the right volume name + path reach the browser and
 // the response is faithfully returned to the HTTP client.
 type stubBrowser struct {
-	listCalls []stubBrowseCall
-	readCalls []stubBrowseCall
-	listFn    func(volume, p string) ([]volumepkg.FileEntry, error)
-	readFn    func(volume, p string, max int64) (volumepkg.ReadResult, error)
+	listCalls  []stubBrowseCall
+	readCalls  []stubBrowseCall
+	writeCalls []stubWriteCall
+	listFn     func(volume, p string) ([]volumepkg.FileEntry, error)
+	readFn     func(volume, p string, max int64) (volumepkg.ReadResult, error)
+	writeFn    func(volume, p string, mode uint32, body []byte) error
 }
 
 type stubBrowseCall struct {
 	Volume string
 	Path   string
 	Max    int64
+}
+
+type stubWriteCall struct {
+	Volume string
+	Path   string
+	Mode   uint32
+	Body   []byte
 }
 
 func (s *stubBrowser) ListPath(_ context.Context, v, p string) ([]volumepkg.FileEntry, error) {
@@ -1749,6 +1758,15 @@ func (s *stubBrowser) ReadFile(_ context.Context, v, p string, max int64) (volum
 		return s.readFn(v, p, max)
 	}
 	return volumepkg.ReadResult{}, nil
+}
+
+func (s *stubBrowser) WriteFile(_ context.Context, v, p string, mode uint32, content io.Reader, _ int64) error {
+	body, _ := io.ReadAll(content)
+	s.writeCalls = append(s.writeCalls, stubWriteCall{Volume: v, Path: p, Mode: mode, Body: body})
+	if s.writeFn != nil {
+		return s.writeFn(v, p, mode, body)
+	}
+	return nil
 }
 
 // volumeTestFixture constructs a handler wired to mocks that know about
@@ -1920,6 +1938,161 @@ func TestBrowseVolume_BrowserUnconfigured503(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Volume file write (POST /files)
+// ---------------------------------------------------------------------------
+
+// volumeWriteFixture wires a handler with AllowVolumeWrites=true and one
+// managed volume named "mine". Tests that want the write path disabled
+// build their own handler without the flag set.
+func volumeWriteFixture(t *testing.T, browser volumepkg.Browser) (*Handler, *mux.Router) {
+	t.Helper()
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: []volume.Volume{
+		{Name: "mine", Driver: "local", Labels: map[string]string{
+			"managed-by":     "accelero",
+			"accelero-stack": "ours",
+		}},
+	}}}
+	rec := &captureRecorder{}
+	h := &Handler{
+		Store:             &mockStore{},
+		Deployer:          &mockDeployer{},
+		Docker:            docker,
+		VolumeBrowser:     browser,
+		Audit:             rec,
+		AllowVolumeWrites: true,
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	return h, router
+}
+
+func TestWriteVolumeFile_HappyPath(t *testing.T) {
+	browser := &stubBrowser{}
+	h, router := volumeWriteFixture(t, browser)
+
+	body := bytes.NewReader([]byte("new contents\n"))
+	req := httptest.NewRequest("POST", "/api/v1/volumes/mine/files?path=/config/app.yml&mode=0640", body)
+	req.Header.Set("X-API-Key", "test-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	// Browser received the right inputs including the parsed mode.
+	require.Len(t, browser.writeCalls, 1)
+	assert.Equal(t, "mine", browser.writeCalls[0].Volume)
+	assert.Equal(t, "/config/app.yml", browser.writeCalls[0].Path)
+	assert.Equal(t, uint32(0o640), browser.writeCalls[0].Mode)
+	assert.Equal(t, "new contents\n", string(browser.writeCalls[0].Body))
+
+	// Audit success row present with path, size, mode.
+	rec := h.Audit.(*captureRecorder)
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, "volume.write", got.Operation)
+	assert.Equal(t, "success", got.Outcome)
+	assert.Equal(t, "/config/app.yml", got.Metadata["path"])
+	assert.Equal(t, "13", got.Metadata["size_bytes"])
+	assert.Equal(t, "0640", got.Metadata["mode"])
+}
+
+func TestWriteVolumeFile_DisabledByDefault(t *testing.T) {
+	// The flag defaults to false; request should 403 without the
+	// browser ever being invoked.
+	browser := &stubBrowser{}
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: []volume.Volume{
+		{Name: "mine", Labels: map[string]string{"managed-by": "accelero"}},
+	}}}
+	h := &Handler{
+		Store:         &mockStore{},
+		Deployer:      &mockDeployer{},
+		Docker:        docker,
+		VolumeBrowser: browser,
+		// AllowVolumeWrites: false (default)
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/volumes/mine/files?path=/x", bytes.NewReader([]byte("data")))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusForbidden, rr.Code)
+	assert.Empty(t, browser.writeCalls, "disabled endpoint must not invoke the browser")
+}
+
+func TestWriteVolumeFile_MissingPath400(t *testing.T) {
+	browser := &stubBrowser{}
+	_, router := volumeWriteFixture(t, browser)
+
+	req := httptest.NewRequest("POST", "/api/v1/volumes/mine/files", bytes.NewReader([]byte("data")))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Empty(t, browser.writeCalls)
+}
+
+func TestWriteVolumeFile_UnmanagedVolume404(t *testing.T) {
+	browser := &stubBrowser{}
+	docker := &mockDocker{volumeResult: client.VolumeListResult{Items: nil}}
+	h := &Handler{
+		Store:             &mockStore{},
+		Deployer:          &mockDeployer{},
+		Docker:            docker,
+		VolumeBrowser:     browser,
+		AllowVolumeWrites: true,
+	}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/volumes/nope/files?path=/x", bytes.NewReader([]byte("data")))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+	assert.Empty(t, browser.writeCalls)
+}
+
+func TestWriteVolumeFile_BrowserFailureIsAudited(t *testing.T) {
+	browser := &stubBrowser{writeFn: func(_, _ string, _ uint32, _ []byte) error {
+		return errReadyzTest("volume is full")
+	}}
+	h, router := volumeWriteFixture(t, browser)
+
+	req := httptest.NewRequest("POST", "/api/v1/volumes/mine/files?path=/x", bytes.NewReader([]byte("data")))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+
+	rec := h.Audit.(*captureRecorder)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, "failure", rec.entries[0].Outcome)
+	assert.Contains(t, rec.entries[0].ErrorMessage, "volume is full")
+}
+
+func TestWriteVolumeFile_OversizedRejected(t *testing.T) {
+	// Body larger than maxVolumeFileUpload is rejected before the
+	// browser is invoked. Use a payload 1 byte over the cap so the
+	// test doesn't actually allocate 10MB for no reason.
+	browser := &stubBrowser{}
+	_, router := volumeWriteFixture(t, browser)
+
+	payload := bytes.Repeat([]byte{'X'}, maxVolumeFileUpload+1)
+	req := httptest.NewRequest("POST", "/api/v1/volumes/mine/files?path=/x", bytes.NewReader(payload))
+	req.ContentLength = int64(len(payload))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
+	assert.Empty(t, browser.writeCalls)
 }
 
 // ---------------------------------------------------------------------------

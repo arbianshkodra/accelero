@@ -113,12 +113,13 @@ func main() {
 	r.Handle("/metrics", metrics.Handler()).Methods("GET")
 
 	h := &handler.Handler{
-		Store:         db,
-		Deployer:      deployer,
-		Reconciler:    rec,
-		Audit:         auditRecorder,
-		Docker:        cli,
-		VolumeBrowser: volumepkg.NewDockerBrowser(cli, ""),
+		Store:             db,
+		Deployer:          deployer,
+		Reconciler:        rec,
+		Audit:             auditRecorder,
+		Docker:            cli,
+		VolumeBrowser:     volumepkg.NewDockerBrowser(cli, ""),
+		AllowVolumeWrites: cfg.AllowVolumeWrites,
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
