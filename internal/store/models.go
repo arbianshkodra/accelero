@@ -132,7 +132,9 @@ const (
 	// though the action itself may not change desired state (restart)
 	// or may deliberately override it (exec, volume write — not shipped
 	// yet).
-	AuditOpContainerRestart = "container.restart"
-	AuditOpVolumeBrowse     = "volume.browse"
-	AuditOpVolumeRead       = "volume.read"
+	AuditOpContainerRestart   = "container.restart"
+	AuditOpContainerExecStart = "container.exec_start"
+	AuditOpContainerExecEnd   = "container.exec_end"
+	AuditOpVolumeBrowse       = "volume.browse"
+	AuditOpVolumeRead         = "volume.read"
 )

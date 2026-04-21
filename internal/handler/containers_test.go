@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -130,6 +131,9 @@ type mockDocker struct {
 	statsErr        error
 	restartCalls  []restartCall
 	restartErr    error
+	execCreateFn  func(id string, opts client.ExecCreateOptions) (client.ExecCreateResult, error)
+	execAttachFn  func(id string, opts client.ExecAttachOptions) (client.ExecAttachResult, error)
+	execInspectFn func(id string) (client.ExecInspectResult, error)
 	eventsResult  client.EventsResult
 	imageResult   client.ImageListResult
 	imageErr      error
@@ -165,6 +169,27 @@ func (m *mockDocker) Events(ctx context.Context, _ client.EventsListOptions) cli
 func (m *mockDocker) ContainerRestart(ctx context.Context, id string, opts client.ContainerRestartOptions) (client.ContainerRestartResult, error) {
 	m.restartCalls = append(m.restartCalls, restartCall{ID: id, Timeout: opts.Timeout})
 	return client.ContainerRestartResult{}, m.restartErr
+}
+
+func (m *mockDocker) ExecCreate(_ context.Context, id string, opts client.ExecCreateOptions) (client.ExecCreateResult, error) {
+	if m.execCreateFn != nil {
+		return m.execCreateFn(id, opts)
+	}
+	return client.ExecCreateResult{ID: "exec-" + id}, nil
+}
+
+func (m *mockDocker) ExecAttach(_ context.Context, id string, opts client.ExecAttachOptions) (client.ExecAttachResult, error) {
+	if m.execAttachFn != nil {
+		return m.execAttachFn(id, opts)
+	}
+	return client.ExecAttachResult{}, errNotFound("exec")
+}
+
+func (m *mockDocker) ExecInspect(_ context.Context, id string, _ client.ExecInspectOptions) (client.ExecInspectResult, error) {
+	if m.execInspectFn != nil {
+		return m.execInspectFn(id)
+	}
+	return client.ExecInspectResult{}, errNotFound("exec")
 }
 
 func (m *mockDocker) ImageList(ctx context.Context, _ client.ImageListOptions) (client.ImageListResult, error) {
@@ -1895,4 +1920,197 @@ func TestBrowseVolume_BrowserUnconfigured503(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket exec
+// ---------------------------------------------------------------------------
+
+// execFixture wires a handler with one managed container ready to exec.
+// The docker exec side is driven via net.Pipe so tests can act as the
+// container, writing to stdout and reading stdin as a real daemon would.
+func execFixture(t *testing.T) (*Handler, *mockDocker, *captureRecorder, net.Conn, *mux.Router) {
+	t.Helper()
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+
+	// Pipe: one side given to the handler as the exec connection,
+	// the other returned to the test so it can play "docker".
+	serverConn, testConn := net.Pipe()
+
+	docker := &mockDocker{
+		inspectByID: map[string]client.ContainerInspectResult{
+			"cid": {Container: container.InspectResponse{
+				ID: "cid",
+				Config: &container.Config{Labels: map[string]string{
+					"managed-by":     "accelero",
+					"accelero-stack": "demo",
+				}},
+			}},
+		},
+		execCreateFn: func(id string, _ client.ExecCreateOptions) (client.ExecCreateResult, error) {
+			return client.ExecCreateResult{ID: "exec-" + id}, nil
+		},
+		execAttachFn: func(_ string, _ client.ExecAttachOptions) (client.ExecAttachResult, error) {
+			return client.ExecAttachResult{
+				HijackedResponse: client.NewHijackedResponse(serverConn, "application/vnd.docker.raw-stream"),
+			}, nil
+		},
+		execInspectFn: func(_ string) (client.ExecInspectResult, error) {
+			return client.ExecInspectResult{ExitCode: 0}, nil
+		},
+	}
+
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Docker: docker, Audit: rec}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	return h, docker, rec, testConn, router
+}
+
+func TestExecStackContainer_Bidirectional(t *testing.T) {
+	_, _, rec, testConn, router := execFixture(t)
+	defer testConn.Close()
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=sh"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	// "Docker" side: write bytes that should arrive on the WS as output,
+	// and read bytes that the WS will send as stdin.
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := testConn.Write([]byte("hi from exec\n"))
+		errCh <- err
+	}()
+
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msgType, payload, err := ws.ReadMessage()
+	require.NoError(t, err)
+	assert.Equal(t, websocket.BinaryMessage, msgType)
+	assert.Equal(t, "hi from exec\n", string(payload))
+
+	// Client → server stdin.
+	require.NoError(t, ws.WriteMessage(websocket.BinaryMessage, []byte("input-from-ws\n")))
+	// Read it back from the "docker" side.
+	buf := make([]byte, 64)
+	testConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := testConn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "input-from-ws\n", string(buf[:n]))
+
+	// Close the docker-side conn → handler's reader returns, WS closes
+	// with a CloseNormalClosure frame containing the exit code.
+	testConn.Close()
+
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = ws.ReadMessage()
+	var ce *websocket.CloseError
+	require.ErrorAs(t, err, &ce)
+	assert.Equal(t, websocket.CloseNormalClosure, ce.Code)
+	assert.Contains(t, ce.Text, "exit_code=0")
+
+	// Audit trail captured both start and end with matching resource IDs.
+	require.GreaterOrEqual(t, len(rec.entries), 2)
+	var gotStart, gotEnd bool
+	for _, e := range rec.entries {
+		switch e.Operation {
+		case "container.exec_start":
+			gotStart = true
+			assert.Equal(t, "in_progress", e.Outcome)
+			assert.Equal(t, "sh", e.Metadata["cmd"])
+			assert.Equal(t, "true", e.Metadata["tty"])
+		case "container.exec_end":
+			gotEnd = true
+			assert.Equal(t, "success", e.Outcome)
+			assert.Equal(t, "0", e.Metadata["exit_code"])
+			assert.Contains(t, e.Metadata, "duration_seconds")
+		}
+	}
+	assert.True(t, gotStart, "exec_start audit row missing")
+	assert.True(t, gotEnd, "exec_end audit row missing")
+}
+
+func TestExecStackContainer_MissingCmd400(t *testing.T) {
+	_, _, _, _, router := execFixture(t)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestExecStackContainer_NonTTYRejected400(t *testing.T) {
+	// MVP is TTY-only — non-TTY requires stdcopy demux on the output
+	// side to avoid returning Docker's 8-byte frame headers as if they
+	// were data. Rejecting up front is better than returning garbage.
+	_, _, _, _, router := execFixture(t)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=ls&tty=false"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestExecStackContainer_ForeignStack404(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "ours", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	docker := &mockDocker{inspectByID: map[string]client.ContainerInspectResult{
+		"cid": {Container: container.InspectResponse{
+			ID: "cid",
+			Config: &container.Config{Labels: map[string]string{
+				"managed-by":     "accelero",
+				"accelero-stack": "theirs",
+			}},
+		}},
+	}}
+	h := newTestHandler(ms, docker)
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/ours/containers/cid/exec?cmd=sh"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestExecStackContainer_DockerUnconfigured503(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "demo", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}}
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=sh"
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
