@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -90,6 +91,12 @@ type Handler struct {
 	// the browse endpoint (503).
 	VolumeBrowser volumepkg.Browser
 
+	// AllowVolumeWrites gates POST /volumes/{name}/files. Defaults to
+	// false; an operator opts in via ALLOW_VOLUME_WRITES=true only on
+	// hosts where the trade-off (emergency-write capability vs. one
+	// well-placed bug wiping volume data) is acceptable.
+	AllowVolumeWrites bool
+
 	// DockerPing is called by /readyz to verify Docker daemon connectivity.
 	// nil disables the Docker check — useful in tests, or in the unlikely
 	// deployment where Accelero proxies to another host and wouldn't want
@@ -169,6 +176,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/images", h.ListManagedImages).Methods("GET")
 	api.HandleFunc("/volumes", h.ListManagedVolumes).Methods("GET")
 	api.HandleFunc("/volumes/{name}/browse", h.BrowseVolume).Methods("GET")
+	api.HandleFunc("/volumes/{name}/files", h.WriteVolumeFile).Methods("POST")
 	api.HandleFunc("/networks", h.ListManagedNetworks).Methods("GET")
 
 	// Audit log — read-only; append-only at the store layer.
@@ -2425,6 +2433,111 @@ func (h *Handler) downloadVolumeFile(ctx context.Context, w http.ResponseWriter,
 	if _, err := io.Copy(w, res.Content); err != nil {
 		logctx.FromContext(ctx).WithError(err).Warn("volume read: truncated stream")
 	}
+}
+
+// maxVolumeFileUpload caps how many bytes a single /files write can
+// push. Same ceiling as maxVolumeFileDownload — this endpoint is for
+// "emergency config patch" scenarios, not for seeding a 50GB dataset.
+const maxVolumeFileUpload = 10 * 1024 * 1024 // 10 MB
+
+// WriteVolumeFile writes (or overwrites) a file inside a managed
+// volume. Disabled by default — operators opt in by setting
+// ALLOW_VOLUME_WRITES=true on the accelero process. Every call is
+// audited as volume.write whether it succeeded or not.
+//
+// Query parameters:
+//   - path:  absolute within the volume; required; must point at a file
+//   - mode:  optional octal POSIX file mode, e.g. "0644". Defaults to 0644.
+//
+// The request body is the raw file bytes (Content-Type is ignored;
+// stored verbatim). Content-Length determines how many bytes are
+// streamed into the helper container, so callers should set it.
+// The 10 MB cap is enforced via http.MaxBytesReader — exceeding it
+// produces a 413 Request Entity Too Large before the tar stream
+// starts.
+func (h *Handler) WriteVolumeFile(w http.ResponseWriter, r *http.Request) {
+	if !h.AllowVolumeWrites {
+		writeError(w, "volume writes are disabled on this server (set ALLOW_VOLUME_WRITES=true to enable)", http.StatusForbidden)
+		return
+	}
+	if h.VolumeBrowser == nil || h.Docker == nil {
+		writeError(w, "volume browsing is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := mux.Vars(r)["name"]
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	managed, err := h.volumeIsManaged(ctx, name)
+	if err != nil {
+		logctx.FromContext(ctx).WithError(err).Error("check volume managed")
+		writeError(w, "failed to verify volume", http.StatusInternalServerError)
+		return
+	}
+	if !managed {
+		writeError(w, "volume not found", http.StatusNotFound)
+		return
+	}
+
+	reqPath := r.URL.Query().Get("path")
+	if reqPath == "" {
+		writeError(w, "path query param is required", http.StatusBadRequest)
+		return
+	}
+
+	var mode uint32 = 0o644
+	if raw := r.URL.Query().Get("mode"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 8, 32)
+		if err != nil {
+			writeError(w, "mode must be an octal POSIX file mode (e.g. 0644)", http.StatusBadRequest)
+			return
+		}
+		mode = uint32(parsed)
+	}
+
+	// The body must be bounded — otherwise a caller could stream until
+	// disk fills. maxBytesReader returns an error on Read past the cap
+	// which surfaces cleanly to the client as a 413-ish bad request.
+	body := http.MaxBytesReader(w, r.Body, maxVolumeFileUpload)
+	defer body.Close()
+
+	// Buffer into memory so we can compute the size without trusting
+	// Content-Length (which may be missing or a lie). 10MB in-memory
+	// is acceptable for an emergency-patch endpoint.
+	buf, err := io.ReadAll(body)
+	if err != nil {
+		writeError(w, "failed to read request body (possibly exceeded 10 MB limit)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	writeErr := h.VolumeBrowser.WriteFile(ctx, name, reqPath, mode, bytes.NewReader(buf), int64(len(buf)))
+
+	entry := audit.FromRequest(r, store.AuditOpVolumeWrite)
+	entry.ResourceType = "volume"
+	entry.ResourceID = name
+	entry.Metadata = map[string]string{
+		"path":       reqPath,
+		"size_bytes": strconv.Itoa(len(buf)),
+		"mode":       fmt.Sprintf("0%o", mode),
+	}
+	if writeErr != nil {
+		entry.Outcome = store.AuditOutcomeFailure
+		entry.ErrorMessage = writeErr.Error()
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	if writeErr != nil {
+		logctx.FromContext(ctx).WithError(writeErr).Warn("volume write failed")
+		writeError(w, writeErr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"status":     "written",
+		"path":       reqPath,
+		"size_bytes": len(buf),
+	}, http.StatusOK)
 }
 
 // ListManagedNetworks returns networks labelled managed-by=accelero.

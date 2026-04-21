@@ -448,6 +448,54 @@ Listings are capped at 10,000 entries (silent truncation). If you need deeper vi
 
 ---
 
+### Write a File to a Managed Volume
+`POST /api/v1/volumes/{name}/files`
+
+Write (create or overwrite) a single file inside a managed volume. **Disabled by default** — must be explicitly enabled with `ALLOW_VOLUME_WRITES=true` in Accelero's env. Every call is audited regardless of outcome.
+
+This is an **emergency-patch affordance**. Not a distribution channel, not a config management system. Use it when you need to patch a Caddyfile at 3am because a cert expired, or drop a single env file into a volume before the next deploy picks it up. Anything persistent and observable belongs in your gitops repo; things committed to git survive a rebuild, things written through this endpoint don't.
+
+**Query parameters:**
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `path` | string | **required** | Absolute within the volume; `..` segments rejected. Must point at a file, not a directory. |
+| `mode` | octal | `0644` | POSIX file mode, e.g. `0600`, `0644`. |
+
+**Request body:** raw file bytes. Content-Type is ignored and not stored. 10 MB cap enforced via `http.MaxBytesReader` — larger writes return `413 Request Entity Too Large` before the tar stream even starts.
+
+**Behaviour:**
+
+- **Parent dirs auto-created.** A request to write `/config/deep/nested.yml` creates `/config/` and `/config/deep/` as `0755` if they don't exist yet.
+- **Overwrites existing files.** There is no "don't clobber" option.
+- **Read-write helper.** Same ephemeral busybox helper the read-only browse uses, but mounted read-write for the duration of this single write. Torn down immediately after.
+
+**Response:** `200 OK`
+```json
+{
+  "status": "written",
+  "path": "/config/deep/nested.yml",
+  "size_bytes": 42
+}
+```
+
+**Audit.** One `volume.write` entry per call with outcome (`success` or `failure`), path, size_bytes, and mode in metadata. Failures — including traversal rejections, oversize uploads, and daemon errors — also leave an audit row so the trail captures intent.
+
+**Errors:** `400 Bad Request` for missing path, `..` segments, invalid `mode`, or any browser-side error; `403 Forbidden` when `ALLOW_VOLUME_WRITES` is off; `404 Not Found` for unmanaged volumes; `413 Request Entity Too Large` for bodies exceeding 10 MB; `503 Service Unavailable` when Docker isn't configured.
+
+**Example:**
+```bash
+# Patch a Caddyfile and reload it — replace with docker exec nginx -s reload
+# after the write since mounted file changes don't automatically trigger a
+# config reload on the running container.
+curl -X POST \
+  -H "X-API-Key: $ACCELERO_API_KEY" \
+  --data-binary @new-Caddyfile \
+  "http://localhost:8000/api/v1/volumes/accelero_app_caddy/files?path=/Caddyfile&mode=0644"
+```
+
+---
+
 ### List Managed Networks
 `GET /api/v1/networks`
 
