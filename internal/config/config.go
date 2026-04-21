@@ -39,6 +39,14 @@ type Config struct {
 	// Database
 	DatabasePath string
 
+	// AllowVolumeWrites gates the POST /api/v1/volumes/{name}/files
+	// endpoint. It's a foot-gun — writing arbitrary bytes into a
+	// managed volume is the kind of operation that will cause a
+	// production outage the one time the operator got the path
+	// wrong — so it's off by default. Set ALLOW_VOLUME_WRITES=true
+	// to enable. Every write is still audited.
+	AllowVolumeWrites bool
+
 	// StacksDataDir is where cloned gitops repos are kept per stack:
 	//   <StacksDataDir>/<stack_id>/repo/
 	// Unlike the old /tmp-based clone, this dir is NOT deleted after a
@@ -72,6 +80,7 @@ func Load() (*Config, error) {
 		LogFormat:             envOrDefault("LOG_FORMAT", "text"),
 		DatabasePath:          envOrDefault("DATABASE_PATH", "./data/accelero.db"),
 		StacksDataDir:         envOrDefault("STACKS_DATA_DIR", "./data/stacks"),
+		AllowVolumeWrites:     envOrDefault("ALLOW_VOLUME_WRITES", "false") == "true",
 		StatusCleanupInterval: parseDurationOrDefault("STATUS_CLEANUP_INTERVAL", 1*time.Hour),
 		StatusMaxAge:          parseDurationOrDefault("STATUS_MAX_AGE", 24*time.Hour),
 		AuditMaxAge:           parseDurationOrDefault("AUDIT_MAX_AGE", 90*24*time.Hour),
