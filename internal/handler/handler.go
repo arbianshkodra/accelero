@@ -62,6 +62,9 @@ type DockerClient interface {
 	ImageList(ctx context.Context, options client.ImageListOptions) (client.ImageListResult, error)
 	VolumeList(ctx context.Context, options client.VolumeListOptions) (client.VolumeListResult, error)
 	NetworkList(ctx context.Context, options client.NetworkListOptions) (client.NetworkListResult, error)
+	ExecCreate(ctx context.Context, containerID string, options client.ExecCreateOptions) (client.ExecCreateResult, error)
+	ExecAttach(ctx context.Context, execID string, options client.ExecAttachOptions) (client.ExecAttachResult, error)
+	ExecInspect(ctx context.Context, execID string, options client.ExecInspectOptions) (client.ExecInspectResult, error)
 }
 
 // Handler holds all dependencies for the HTTP API.
@@ -158,6 +161,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats", h.GetStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/stats/stream", h.StreamStackContainerStats).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}/restart", h.RestartStackContainer).Methods("POST")
+	api.HandleFunc("/stacks/{id}/containers/{cid}/exec", h.ExecStackContainer).Methods("GET")
 	api.HandleFunc("/stacks/{id}/events", h.StreamStackEvents).Methods("GET")
 
 	// Read-only resource browsers (Phase 3) — root-level; scoped to
@@ -1468,6 +1472,242 @@ func (h *Handler) RestartStackContainer(w http.ResponseWriter, r *http.Request) 
 		"status":       "accepted",
 		"container_id": insp.Container.ID,
 	}, http.StatusAccepted)
+}
+
+// ExecStackContainer upgrades the request to a WebSocket and runs a
+// command inside the target container with stdin/stdout/stderr
+// wired back to the client. The headline debug op — the one an
+// operator reaches for when logs + stats + restart didn't answer
+// the question.
+//
+// Query params:
+//   - cmd     — repeatable; the command + args. At least one required.
+//     Example: ?cmd=sh    or    ?cmd=sh&cmd=-c&cmd=ls+-la
+//   - tty     — bool, default true. Interactive shells use TTY=true;
+//     the MVP only supports TTY mode so output is a single raw stream
+//     and no stdcopy demux is needed either direction.
+//   - user    — optional, runs as this user inside the container.
+//   - workdir — optional, starts in this directory.
+//
+// WebSocket protocol (MVP, TTY):
+//   - Client → server: binary messages containing stdin bytes.
+//   - Server → client: binary messages containing raw output bytes.
+//   - On exit: server sends a CloseNormalClosure frame with the exit
+//     code encoded in the reason text (e.g. "exit_code=0").
+//
+// This is a mutation of live container state. Both exec_start and
+// exec_end are audited with actor=api-key, request_id for log
+// correlation, and metadata (cmd, tty, user, exit_code, duration).
+func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	if h.Docker == nil {
+		writeError(w, "container introspection is not configured on this server", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Parse params before touching the socket so failures are clean
+	// JSON errors, not half-complete WS handshakes.
+	cmd := r.URL.Query()["cmd"]
+	if len(cmd) == 0 {
+		writeError(w, "cmd query param is required (pass it multiple times for additional args)", http.StatusBadRequest)
+		return
+	}
+	useTTY := r.URL.Query().Get("tty") != "false" // default true
+	// Non-TTY mode needs stdcopy demux on the output side; MVP is
+	// TTY-only so interactive shells work and we don't ship a known-
+	// broken code path. Removing this guard is the whole scope of the
+	// follow-up work noted in ROADMAP.
+	if !useTTY {
+		writeError(w, "tty=false is not yet supported; use tty=true for now", http.StatusBadRequest)
+		return
+	}
+	user := r.URL.Query().Get("user")
+	workdir := r.URL.Query().Get("workdir")
+
+	cid := mux.Vars(r)["cid"]
+	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	if !ok {
+		return
+	}
+
+	// Create the exec instance BEFORE upgrading — a failure here is a
+	// clean 500/JSON response, not a half-open WS. Requires a timeout
+	// context that outlives only the setup phase.
+	setupCtx, setupCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	createRes, err := h.Docker.ExecCreate(setupCtx, insp.Container.ID, client.ExecCreateOptions{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		TTY:          useTTY,
+		Cmd:          cmd,
+		User:         user,
+		WorkingDir:   workdir,
+	})
+	setupCancel()
+	if err != nil {
+		logctx.FromContext(r.Context()).WithError(err).Error("exec create failed")
+		writeError(w, "failed to create exec session", http.StatusInternalServerError)
+		return
+	}
+
+	startEntry := audit.FromRequest(r, store.AuditOpContainerExecStart)
+	startEntry.ResourceType = "container"
+	startEntry.ResourceID = insp.Container.ID
+	startEntry.StackID = stack.ID
+	startEntry.StackName = stack.Name
+	startEntry.Outcome = store.AuditOutcomeInProgress
+	startEntry.Metadata = map[string]string{
+		"exec_id": createRes.ID,
+		"cmd":     strings.Join(cmd, " "),
+		"tty":     strconv.FormatBool(useTTY),
+	}
+	if user != "" {
+		startEntry.Metadata["user"] = user
+	}
+	if workdir != "" {
+		startEntry.Metadata["workdir"] = workdir
+	}
+	_ = h.auditOr().Record(r.Context(), startEntry)
+
+	conn, err := wsLogUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logctx.FromContext(r.Context()).WithError(err).Debug("websocket upgrade failed")
+		return
+	}
+	defer conn.Close()
+
+	// Attach runs until the exec finishes (container exit, command
+	// completion, or we tear it down). ExecAttach returns a raw
+	// net.Conn; the returned HijackedResponse owns the underlying
+	// connection and must be closed.
+	attachCtx, attachCancel := context.WithCancel(r.Context())
+	defer attachCancel()
+
+	attachRes, err := h.Docker.ExecAttach(attachCtx, createRes.ID, client.ExecAttachOptions{
+		TTY: useTTY,
+	})
+	if err != nil {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "exec attach: "+err.Error()),
+			time.Now().Add(wsWriteTimeout))
+		h.recordExecEnd(r, startEntry, 0, time.Now(), err)
+		return
+	}
+	defer attachRes.Conn.Close()
+
+	execStart := time.Now()
+	exitCode := execPipe(attachCtx, conn, attachRes, useTTY)
+
+	// ExecInspect to get the authoritative exit code when possible;
+	// falls back to the pipe's best guess (0 for clean close, non-zero
+	// on errors). Exit code wedged at -1 means we couldn't determine.
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer inspectCancel()
+	if ins, err := h.Docker.ExecInspect(inspectCtx, createRes.ID, client.ExecInspectOptions{}); err == nil {
+		exitCode = ins.ExitCode
+	}
+
+	_ = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, fmt.Sprintf("exit_code=%d", exitCode)),
+		time.Now().Add(wsWriteTimeout))
+
+	h.recordExecEnd(r, startEntry, exitCode, execStart, nil)
+}
+
+// execPipe shuttles bytes between the WebSocket and the exec
+// connection until either side closes. Returns a best-guess exit
+// code (0 on clean close, -1 if the stream was torn down abnormally);
+// the caller prefers the ExecInspect value when available.
+func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachResult, useTTY bool) int {
+	done := make(chan struct{}, 2)
+
+	// WS → exec: stdin
+	go func() {
+		defer func() { done <- struct{}{} }()
+		ws.SetPongHandler(func(string) error {
+			ws.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+			return nil
+		})
+		ws.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
+		for {
+			_, data, err := ws.ReadMessage()
+			if err != nil {
+				// Close write side of the exec conn so Docker sees EOF
+				// on stdin and the command can terminate cleanly (many
+				// tools exit on stdin EOF).
+				_ = attach.CloseWrite()
+				return
+			}
+			if _, err := attach.Conn.Write(data); err != nil {
+				return
+			}
+		}
+	}()
+
+	// exec → WS: stdout/stderr
+	// In TTY mode the stream is raw; in non-TTY mode it would be
+	// stdcopy-multiplexed (not yet supported in this MVP — guard is
+	// above).
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := attach.Reader.Read(buf)
+			if n > 0 {
+				_ = ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	pings := time.NewTicker(wsPingInterval)
+	defer pings.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return -1
+		case <-done:
+			return 0
+		case <-pings.C:
+			_ = ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout))
+		}
+	}
+}
+
+// recordExecEnd writes the terminating audit row. Always called even
+// when the exec never got past ExecAttach, so the trail captures
+// attempts that failed.  startEntry is passed in so we inherit its
+// ResourceID / StackID / Metadata without rebuilding.
+func (h *Handler) recordExecEnd(r *http.Request, start store.AuditEntry, exitCode int, startTime time.Time, attachErr error) {
+	end := audit.FromRequest(r, store.AuditOpContainerExecEnd)
+	end.ResourceType = start.ResourceType
+	end.ResourceID = start.ResourceID
+	end.StackID = start.StackID
+	end.StackName = start.StackName
+	end.Metadata = map[string]string{}
+	for k, v := range start.Metadata {
+		end.Metadata[k] = v
+	}
+	end.Metadata["duration_seconds"] = fmt.Sprintf("%.3f", time.Since(startTime).Seconds())
+	end.Metadata["exit_code"] = strconv.Itoa(exitCode)
+
+	if attachErr != nil {
+		end.Outcome = store.AuditOutcomeFailure
+		end.ErrorMessage = attachErr.Error()
+	} else if exitCode != 0 {
+		end.Outcome = store.AuditOutcomeFailure
+	} else {
+		end.Outcome = store.AuditOutcomeSuccess
+	}
+	_ = h.auditOr().Record(r.Context(), end)
 }
 
 // StreamStackContainerStats upgrades to a WebSocket and emits one

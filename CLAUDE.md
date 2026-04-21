@@ -143,6 +143,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 
 **Debug mutations (audited, use sparingly):**
 - `POST /api/v1/stacks/{id}/containers/{cid}/restart` — Docker-level restart. Optional `?t=<seconds>` grace period (-1 = wait forever, 0 = immediate kill). Returns 202. Every call writes a `container.restart` audit entry regardless of outcome. Bypasses GitOps — for state changes commit to git + redeploy instead.
+- `GET /api/v1/stacks/{id}/containers/{cid}/exec` — WebSocket exec. Query params: `cmd` (repeatable), `tty` (default true; tty=false is 400 until demux lands), `user`, `workdir`. Binary frames both directions. CloseNormalClosure with `exit_code=N` in the reason text. Two audit rows per session: `container.exec_start` (in_progress) on connect, `container.exec_end` (success if exit=0, failure otherwise) on disconnect, with duration + exit_code in metadata.
 - `GET /api/v1/stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources. Each event is projected from Docker's raw format with accelero-service / accelero-replica surfaced as first-class fields. 25s keepalive comment during quiet periods; default type filter is `container` (opt in to `network`/`volume`/`image` via `?types=`).
 
 **Resource browsers (root-level, read-only):**
