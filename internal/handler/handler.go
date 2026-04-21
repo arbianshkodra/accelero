@@ -1610,11 +1610,15 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 		exitCode = ins.ExitCode
 	}
 
+	// Record the audit end BEFORE writing the close frame. Policy: by
+	// the time a client observes session termination, the trail must
+	// be durable. Otherwise a well-timed crash or slow recorder would
+	// leave a "started, unknown outcome" audit gap.
+	h.recordExecEnd(r, startEntry, exitCode, execStart, nil)
+
 	_ = conn.WriteControl(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, fmt.Sprintf("exit_code=%d", exitCode)),
 		time.Now().Add(wsWriteTimeout))
-
-	h.recordExecEnd(r, startEntry, exitCode, execStart, nil)
 }
 
 // execPipe shuttles bytes between the WebSocket and the exec
