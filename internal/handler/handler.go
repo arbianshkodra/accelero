@@ -66,6 +66,7 @@ type DockerClient interface {
 	ExecCreate(ctx context.Context, containerID string, options client.ExecCreateOptions) (client.ExecCreateResult, error)
 	ExecAttach(ctx context.Context, execID string, options client.ExecAttachOptions) (client.ExecAttachResult, error)
 	ExecInspect(ctx context.Context, execID string, options client.ExecInspectOptions) (client.ExecInspectResult, error)
+	ExecResize(ctx context.Context, execID string, options client.ExecResizeOptions) (client.ExecResizeResult, error)
 }
 
 // Handler holds all dependencies for the HTTP API.
@@ -1524,14 +1525,6 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	useTTY := r.URL.Query().Get("tty") != "false" // default true
-	// Non-TTY mode needs stdcopy demux on the output side; MVP is
-	// TTY-only so interactive shells work and we don't ship a known-
-	// broken code path. Removing this guard is the whole scope of the
-	// follow-up work noted in ROADMAP.
-	if !useTTY {
-		writeError(w, "tty=false is not yet supported; use tty=true for now", http.StatusBadRequest)
-		return
-	}
 	user := r.URL.Query().Get("user")
 	workdir := r.URL.Query().Get("workdir")
 
@@ -1606,8 +1599,28 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	defer attachRes.Conn.Close()
 
+	// Resize callback — only meaningful in TTY mode. For non-TTY we
+	// bind it to a no-op so control frames that arrive anyway (clients
+	// don't always know whether they got a TTY) are silently ignored.
+	resize := func(uint, uint) {}
+	if useTTY {
+		execID := createRes.ID
+		resize = func(rows, cols uint) {
+			if rows == 0 || cols == 0 {
+				return
+			}
+			rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer rcancel()
+			if _, err := h.Docker.ExecResize(rctx, execID, client.ExecResizeOptions{
+				Height: rows, Width: cols,
+			}); err != nil {
+				logctx.FromContext(r.Context()).WithError(err).Debug("exec resize failed")
+			}
+		}
+	}
+
 	execStart := time.Now()
-	exitCode := execPipe(attachCtx, conn, attachRes, useTTY)
+	exitCode := execPipe(attachCtx, conn, attachRes, useTTY, resize)
 
 	// ExecInspect to get the authoritative exit code when possible;
 	// falls back to the pipe's best guess (0 for clean close, non-zero
@@ -1633,10 +1646,21 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 // connection until either side closes. Returns a best-guess exit
 // code (0 on clean close, -1 if the stream was torn down abnormally);
 // the caller prefers the ExecInspect value when available.
-func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachResult, useTTY bool) int {
+//
+// Message typing on the WS:
+//   - BinaryMessage from the client → stdin written to the exec conn.
+//   - TextMessage  from the client → JSON control frame. Today we
+//     understand {"type":"resize","rows":N,"cols":N}; unknown types
+//     are silently ignored for forward compatibility.
+//   - BinaryMessage from the server → container output. In TTY mode
+//     the daemon's output is a raw stream, copied as-is; in non-TTY
+//     mode it's stdcopy-framed (stdout/stderr multiplexed with
+//     8-byte headers) and we demux both streams into the same WS
+//     output so the client sees clean text.
+func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachResult, useTTY bool, onResize func(rows, cols uint)) int {
 	done := make(chan struct{}, 2)
 
-	// WS → exec: stdin
+	// WS → exec: stdin (+ control frames)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		ws.SetPongHandler(func(string) error {
@@ -1645,7 +1669,7 @@ func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachR
 		})
 		ws.SetReadDeadline(time.Now().Add(wsPingInterval * 2))
 		for {
-			_, data, err := ws.ReadMessage()
+			msgType, data, err := ws.ReadMessage()
 			if err != nil {
 				// Close write side of the exec conn so Docker sees EOF
 				// on stdin and the command can terminate cleanly (many
@@ -1653,31 +1677,41 @@ func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachR
 				_ = attach.CloseWrite()
 				return
 			}
-			if _, err := attach.Conn.Write(data); err != nil {
-				return
+			switch msgType {
+			case websocket.BinaryMessage:
+				if _, err := attach.Conn.Write(data); err != nil {
+					return
+				}
+			case websocket.TextMessage:
+				handleExecControl(data, onResize)
 			}
 		}
 	}()
 
 	// exec → WS: stdout/stderr
-	// In TTY mode the stream is raw; in non-TTY mode it would be
-	// stdcopy-multiplexed (not yet supported in this MVP — guard is
-	// above).
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := attach.Reader.Read(buf)
-			if n > 0 {
-				_ = ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-				if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+		if useTTY {
+			// TTY stream is raw — copy chunks straight through.
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := attach.Reader.Read(buf)
+				if n > 0 {
+					_ = ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+					if werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+						return
+					}
+				}
+				if err != nil {
 					return
 				}
 			}
-			if err != nil {
-				return
-			}
 		}
+		// Non-TTY: demux stdcopy frames. Both stdout and stderr
+		// targets write into the same WS stream — callers get a
+		// single merged view, same shape as the TTY case.
+		wsw := &execWSWriter{ws: ws}
+		_, _ = stdcopy.StdCopy(wsw, wsw, attach.Reader)
 	}()
 
 	pings := time.NewTicker(wsPingInterval)
@@ -1690,6 +1724,50 @@ func execPipe(ctx context.Context, ws *websocket.Conn, attach client.ExecAttachR
 			return 0
 		case <-pings.C:
 			_ = ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout))
+		}
+	}
+}
+
+// execWSWriter wraps a WebSocket conn as an io.Writer that emits one
+// BinaryMessage per call. Used in non-TTY mode as the destination for
+// stdcopy.StdCopy, which reads Docker's multiplexed framing and writes
+// the demuxed payload into the writer in chunks.
+type execWSWriter struct {
+	ws *websocket.Conn
+}
+
+func (w *execWSWriter) Write(p []byte) (int, error) {
+	_ = w.ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	if err := w.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// execControlFrame is the JSON shape clients send as WebSocket
+// TextMessages to control an exec session. Today "resize" is the only
+// type; unknown types are silently ignored so future additions don't
+// break old servers or vice versa.
+type execControlFrame struct {
+	Type string `json:"type"`
+	Rows uint   `json:"rows,omitempty"`
+	Cols uint   `json:"cols,omitempty"`
+}
+
+// handleExecControl parses a control frame and dispatches recognised
+// commands. Malformed JSON is silently dropped — a TTY session
+// shouldn't die because a client sent a bad frame, and the audit trail
+// doesn't need per-frame detail. Debug logs would be the place to
+// surface parse failures if they become a support headache.
+func handleExecControl(data []byte, onResize func(rows, cols uint)) {
+	var frame execControlFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return
+	}
+	switch frame.Type {
+	case "resize":
+		if onResize != nil {
+			onResize(frame.Rows, frame.Cols)
 		}
 	}
 }

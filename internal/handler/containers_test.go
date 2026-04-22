@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -134,6 +135,9 @@ type mockDocker struct {
 	execCreateFn  func(id string, opts client.ExecCreateOptions) (client.ExecCreateResult, error)
 	execAttachFn  func(id string, opts client.ExecAttachOptions) (client.ExecAttachResult, error)
 	execInspectFn func(id string) (client.ExecInspectResult, error)
+	execResizeFn  func(id string, opts client.ExecResizeOptions) error
+	resizeMu      sync.Mutex
+	resizeCalls   []resizeCall
 	eventsResult  client.EventsResult
 	imageResult   client.ImageListResult
 	imageErr      error
@@ -146,6 +150,12 @@ type mockDocker struct {
 type restartCall struct {
 	ID      string
 	Timeout *int
+}
+
+type resizeCall struct {
+	ID     string
+	Height uint
+	Width  uint
 }
 
 func (m *mockDocker) ContainerList(ctx context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
@@ -190,6 +200,26 @@ func (m *mockDocker) ExecInspect(_ context.Context, id string, _ client.ExecInsp
 		return m.execInspectFn(id)
 	}
 	return client.ExecInspectResult{}, errNotFound("exec")
+}
+
+func (m *mockDocker) ExecResize(_ context.Context, id string, opts client.ExecResizeOptions) (client.ExecResizeResult, error) {
+	m.resizeMu.Lock()
+	m.resizeCalls = append(m.resizeCalls, resizeCall{ID: id, Height: opts.Height, Width: opts.Width})
+	m.resizeMu.Unlock()
+	if m.execResizeFn != nil {
+		return client.ExecResizeResult{}, m.execResizeFn(id, opts)
+	}
+	return client.ExecResizeResult{}, nil
+}
+
+// getResizeCalls is the thread-safe accessor for tests that poll
+// resize calls while the handler goroutine may be writing them.
+func (m *mockDocker) getResizeCalls() []resizeCall {
+	m.resizeMu.Lock()
+	defer m.resizeMu.Unlock()
+	out := make([]resizeCall, len(m.resizeCalls))
+	copy(out, m.resizeCalls)
+	return out
 }
 
 func (m *mockDocker) ImageList(ctx context.Context, _ client.ImageListOptions) (client.ImageListResult, error) {
@@ -2224,19 +2254,122 @@ func TestExecStackContainer_MissingCmd400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
-func TestExecStackContainer_NonTTYRejected400(t *testing.T) {
-	// MVP is TTY-only — non-TTY requires stdcopy demux on the output
-	// side to avoid returning Docker's 8-byte frame headers as if they
-	// were data. Rejecting up front is better than returning garbage.
-	_, _, _, _, router := execFixture(t)
+func TestExecStackContainer_NonTTYDemuxesStdcopy(t *testing.T) {
+	// tty=false receives Docker's stdcopy-framed output on the exec
+	// conn; the handler must demux it before forwarding so clients
+	// see clean text rather than 8-byte frame headers.
+	_, _, _, testConn, router := execFixture(t)
+	defer testConn.Close()
+
 	srv := httptest.NewServer(router)
 	defer srv.Close()
 
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=ls&tty=false"
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	require.Error(t, err)
-	require.NotNil(t, resp)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	// Write two framed payloads — one to stdout, one to stderr. Both
+	// must arrive at the client as clean text (the demux merges them
+	// into the same output stream).
+	go func() {
+		_, _ = testConn.Write(frameStreamPayload(1, []byte("stdout line\n")))
+		_, _ = testConn.Write(frameStreamPayload(2, []byte("stderr line\n")))
+	}()
+
+	got := make([]string, 0, 2)
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 2; i++ {
+		msgType, payload, err := ws.ReadMessage()
+		require.NoError(t, err)
+		assert.Equal(t, websocket.BinaryMessage, msgType)
+		got = append(got, string(payload))
+	}
+
+	assert.Contains(t, got, "stdout line\n")
+	assert.Contains(t, got, "stderr line\n")
+	testConn.Close()
+}
+
+func TestExecStackContainer_ResizeControlFrame(t *testing.T) {
+	// TTY mode: a TextMessage control frame of type=resize should
+	// invoke Docker's ExecResize with the given rows+cols.
+	_, docker, _, testConn, router := execFixture(t)
+	defer testConn.Close()
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=sh"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	require.NoError(t, ws.WriteMessage(websocket.TextMessage,
+		[]byte(`{"type":"resize","rows":40,"cols":120}`)))
+
+	// Resize is fire-and-forget — poll briefly for the mock to see it.
+	deadline := time.Now().Add(2 * time.Second)
+	var calls []resizeCall
+	for time.Now().Before(deadline) {
+		calls = docker.getResizeCalls()
+		if len(calls) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Len(t, calls, 1)
+	assert.Equal(t, uint(40), calls[0].Height)
+	assert.Equal(t, uint(120), calls[0].Width)
+
+	testConn.Close()
+}
+
+func TestExecStackContainer_MalformedControlFrameIgnored(t *testing.T) {
+	// Bad JSON in a text frame must not crash the session or invoke
+	// resize with zero dims. Everything else about the session keeps
+	// working — the bidirectional binary stream is untouched.
+	_, docker, _, testConn, router := execFixture(t)
+	defer testConn.Close()
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1) + "/api/v1/stacks/demo/containers/cid/exec?cmd=sh"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	// Junk JSON.
+	require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte("not-json-at-all")))
+	// Unknown type — ignored silently.
+	require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"who-knows","rows":10,"cols":20}`)))
+
+	// Binary stdin still flows through as before.
+	require.NoError(t, ws.WriteMessage(websocket.BinaryMessage, []byte("hello\n")))
+	buf := make([]byte, 32)
+	testConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := testConn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello\n", string(buf[:n]))
+
+	// No resize occurred.
+	assert.Empty(t, docker.getResizeCalls())
+
+	testConn.Close()
+}
+
+// frameStreamPayload wraps raw bytes in Docker's stdcopy format for a
+// given stream (1=stdout, 2=stderr). Used by the non-TTY demux test
+// to simulate what the daemon actually writes.
+func frameStreamPayload(stream byte, payload []byte) []byte {
+	var buf bytes.Buffer
+	header := make([]byte, 8)
+	header[0] = stream
+	binary.BigEndian.PutUint32(header[4:], uint32(len(payload)))
+	buf.Write(header)
+	buf.Write(payload)
+	return buf.Bytes()
 }
 
 func TestExecStackContainer_ForeignStack404(t *testing.T) {
