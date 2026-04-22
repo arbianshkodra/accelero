@@ -629,16 +629,24 @@ Upgrade the connection to a WebSocket and run a command inside a container with 
 | Param | Type | Default | Notes |
 |-------|------|---------|-------|
 | `cmd` | string, **repeatable** | — | The command and its arguments. At least one required. Examples: `?cmd=sh`, `?cmd=sh&cmd=-c&cmd=ls+-la`. |
-| `tty` | bool | `true` | Interactive shells need a TTY. MVP is TTY-only; `tty=false` returns `400` until non-TTY stdcopy demux lands. |
+| `tty` | bool | `true` | Interactive shells need a TTY; non-interactive commands are better served by `tty=false`. |
 | `user` | string | container default | Runs as this user inside the container. |
 | `workdir` | string | container default | Starts in this working directory. |
 
-**WebSocket protocol (TTY mode):**
+**WebSocket protocol:**
 
-- **Binary messages** both directions.
-- Client → server: stdin bytes (anything you'd normally type into a shell).
-- Server → client: raw output bytes from the TTY, already merged stdout+stderr as Docker wrote them.
+- **Binary messages from the client** → stdin. Write anything you'd normally type into the command.
+- **Text messages from the client** → control frames (JSON). See the "Control frames" subsection below.
+- **Binary messages from the server** → container output. In TTY mode the daemon's output is a raw stream, copied through as-is (ANSI colour codes and all). In non-TTY mode stdout/stderr are multiplexed with Docker's 8-byte frame headers; the handler demuxes them server-side and merges both into one WS stream so callers see clean text either way.
 - On exit: server sends a `CloseNormalClosure` frame with the exit code in the reason text, e.g. `"exit_code=0"` or `"exit_code=42"`.
+
+**Control frames** (client → server, as WebSocket TextMessage, JSON body):
+
+| Type | Payload | Notes |
+|------|---------|-------|
+| `resize` | `{"type":"resize","rows":40,"cols":120}` | Resizes the TTY via Docker's `ExecResize`. No-op in non-TTY mode so clients can send unconditionally. |
+
+Unknown `type` values are silently ignored — clients can send forward-compatible frames without fear of tripping up older servers.
 
 **Authentication.** Same `X-API-KEY` header as the rest of the API. Browsers can't set custom headers on `new WebSocket()` — for now, exec from a server-side process or via a proxy that injects the header.
 
@@ -657,7 +665,7 @@ Pre-existing audit queries (`/audit?operation=container.exec_start`, `operation=
 
 **This bypasses GitOps.** Exec is a debug affordance, never a substitute for compose changes + redeploy. Anything observable-and-persistent — image tags, replica counts, config — belongs in git. Exec exists so you can answer *why* the pod behaved the way it did, not to change state in place. The audit trail makes that answerable after the fact.
 
-**Errors:** `400 Bad Request` for missing `cmd` or `tty=false`; `404 Not Found` for missing / foreign-stack container; `500 Internal Server Error` if `ExecCreate` or `ExecAttach` fails (the `exec_end` audit row still gets written with `outcome: failure`); `503 Service Unavailable` when Docker introspection isn't configured.
+**Errors:** `400 Bad Request` for missing `cmd`; `404 Not Found` for missing / foreign-stack container; `500 Internal Server Error` if `ExecCreate` or `ExecAttach` fails (the `exec_end` audit row still gets written with `outcome: failure`); `503 Service Unavailable` when Docker introspection isn't configured.
 
 **Example (websocat):**
 ```bash
