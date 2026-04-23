@@ -41,6 +41,20 @@ type Deployment struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
+// StackSecret is a per-stack key/value pair stored encrypted at rest and
+// injected into managed containers at deploy time (follow-up PR for the
+// injection half). Value is plaintext in the Go type; the SQLite column
+// holds ciphertext whenever at-rest encryption is enabled. The API only
+// ever returns the Name — Value leaves the process only through the
+// deploy path.
+type StackSecret struct {
+	StackID   string    `json:"stack_id"`
+	Name      string    `json:"name"`
+	Value     string    `json:"-"` // never serialised back to clients
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // ManagedContainer tracks containers that Accelero manages.
 type ManagedContainer struct {
 	ID            string    `json:"id"`
@@ -139,4 +153,10 @@ const (
 	AuditOpVolumeRead         = "volume.read"
 	AuditOpVolumeWrite        = "volume.write"
 	AuditOpAdminEncrypt       = "admin.encrypt-existing"
+
+	// Per-stack secrets CRUD. Values never appear in audit metadata —
+	// only the name and outcome do. See handler.StackSecretsSet /
+	// handler.StackSecretsDelete.
+	AuditOpStackSecretSet    = "stack.secret.set"
+	AuditOpStackSecretDelete = "stack.secret.delete"
 )
