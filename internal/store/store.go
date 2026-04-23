@@ -36,6 +36,11 @@ type Store interface {
 	ListAuditEntries(filter AuditFilter) ([]*AuditEntry, error)
 	CleanupOldAuditEntries(maxAge time.Duration) (int, error)
 
+	// ListStacksNeedingEncryption returns IDs of stacks whose
+	// repo_token or docker_password is still in pre-encryption
+	// plaintext form. Empty slice means nothing to migrate.
+	ListStacksNeedingEncryption() ([]string, error)
+
 	// Lifecycle
 	Ping(ctx context.Context) error
 	Close() error
