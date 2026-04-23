@@ -34,6 +34,21 @@ Accelero is configured through environment variables. Only `API_KEY` is required
 
 Docker resource cleanup (stopped containers, dangling images, unused volumes/networks) runs every 24 hours, scoped to resources labeled `managed-by=accelero`.
 
+## Rate limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RATE_LIMIT_RPS` | `0` *(disabled)* | Sustained refill rate (tokens/second) for a per-API-key token bucket. Applied after authentication, so probes (`/health`, `/readyz`, `/metrics`) are unaffected. |
+| `RATE_LIMIT_BURST` | `max(2*RPS, 10)` when RPS set | Bucket capacity — how many requests a quiescent caller may send at once. Clamped to `>=1`. |
+
+When a caller exhausts their bucket, Accelero responds with `429 Too Many Requests`, a `Retry-After` header (seconds, `>=1`), and a JSON body:
+
+```json
+{"error": "rate limit exceeded", "retry_after": "1s"}
+```
+
+The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
+
 ## At-rest encryption
 
 | Variable | Default | Description |

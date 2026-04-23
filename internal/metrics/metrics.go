@@ -57,6 +57,15 @@ var (
 		},
 		[]string{"method", "path", "status"},
 	)
+
+	rateLimitedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "accelero",
+			Name:      "rate_limited_requests_total",
+			Help:      "HTTP requests rejected with 429 Too Many Requests by the per-API-key rate limiter, labelled by path template.",
+		},
+		[]string{"path"},
+	)
 )
 
 // ---------------------------------------------------------------------------
@@ -117,6 +126,7 @@ func init() {
 		driftDetectedTotal,
 		reconcileCyclesTotal,
 		httpRequestsTotal,
+		rateLimitedTotal,
 		deploymentDuration,
 		httpRequestDuration,
 		stacksGauge,
@@ -158,6 +168,13 @@ func RecordReconcileCycle(stack string) {
 func RecordHTTPRequest(method, path string, status int, durationSeconds float64) {
 	httpRequestsTotal.WithLabelValues(method, path, statusClass(status)).Inc()
 	httpRequestDuration.WithLabelValues(method, path).Observe(durationSeconds)
+}
+
+// IncRateLimited records a request rejected by the rate limiter. Path is
+// the mux route template (e.g. "/api/v1/stacks/{id}") so high-cardinality
+// stack IDs don't explode the label set.
+func IncRateLimited(path string) {
+	rateLimitedTotal.WithLabelValues(path).Inc()
 }
 
 // SetStackCounts replaces the stacks gauge snapshot.  The caller should
