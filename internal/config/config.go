@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -46,6 +47,16 @@ type Config struct {
 	// wrong — so it's off by default. Set ALLOW_VOLUME_WRITES=true
 	// to enable. Every write is still audited.
 	AllowVolumeWrites bool
+
+	// RateLimitRPS / RateLimitBurst configure the per-API-key token
+	// bucket applied after authentication. RateLimitRPS<=0 disables
+	// the limiter entirely (the default — existing deployments keep
+	// their current behaviour until an operator opts in). RateLimitBurst
+	// defaults to max(2*RateLimitRPS, 10) when the operator sets RPS
+	// but not burst, giving legitimate bursty clients roughly a
+	// two-second allowance.
+	RateLimitRPS   float64
+	RateLimitBurst int
 
 	// StacksDataDir is where cloned gitops repos are kept per stack:
 	//   <StacksDataDir>/<stack_id>/repo/
@@ -100,6 +111,12 @@ func Load() (*Config, error) {
 	cfg.WorkerCount = calculateWorkers()
 	cfg.QueueSize = calculateQueueSize(cfg.WorkerCount)
 
+	cfg.RateLimitRPS = parseFloatOrDefault("RATE_LIMIT_RPS", 0)
+	cfg.RateLimitBurst = parseIntOrDefault("RATE_LIMIT_BURST", 0)
+	if cfg.RateLimitRPS > 0 && cfg.RateLimitBurst <= 0 {
+		cfg.RateLimitBurst = int(math.Max(cfg.RateLimitRPS*2, 10))
+	}
+
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY environment variable must be set")
 	}
@@ -152,6 +169,24 @@ func parseDurationOrDefault(key string, fallback time.Duration) time.Duration {
 	if s := os.Getenv(key); s != "" {
 		if d, err := time.ParseDuration(s); err == nil {
 			return d
+		}
+	}
+	return fallback
+}
+
+func parseFloatOrDefault(key string, fallback float64) float64 {
+	if s := os.Getenv(key); s != "" {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	}
+	return fallback
+}
+
+func parseIntOrDefault(key string, fallback int) int {
+	if s := os.Getenv(key); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			return n
 		}
 	}
 	return fallback
