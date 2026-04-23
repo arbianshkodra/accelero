@@ -136,7 +136,8 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 
 **Secrets at rest (inside Accelero):**
 - [x] Encrypt `repo_token` and `docker_password` in SQLite with AES-256-GCM, versioned ciphertext (`v1:<nonce>:<ct>`), master key from `ACCELERO_ENCRYPTION_KEY` (base64-encoded 32 bytes). Legacy plaintext rows read transparently. User-password encryption will ride on the identity work above.
-- [ ] Additional master key sources: file path, KMS (AWS KMS, GCP KMS, HashiCorp Vault Transit).
+- [x] File-path master key source — `ACCELERO_ENCRYPTION_KEY_FILE` points at a file whose contents are the base64-encoded key. Docker/K8s-secret friendly; trailing whitespace trimmed; empty/missing file is a startup error. Setting both the file and the inline env var is rejected.
+- [ ] KMS master key sources (AWS KMS, GCP KMS, HashiCorp Vault Transit).
 - [ ] Automatic key rotation: new writes use the current key; old reads transparently re-encrypt on next write.
 - [x] Online migration path from existing plaintext rows — `POST /api/v1/admin/encrypt-existing` re-saves any row still in plaintext so the cipher kicks in on write. Idempotent; 400 if the server has no key attached.
 
