@@ -3,12 +3,34 @@ package secrets
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// writeKeyFile is a tiny test helper that drops `contents` at a fresh
+// path inside t.TempDir() and returns the path. Keeps the table-driven
+// file-source tests below readable.
+func writeKeyFile(t *testing.T, name, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0600))
+	return path
+}
+
+// randomKeyB64 returns a fresh base64-encoded 32-byte key — matches
+// the format operators actually paste into env vars.
+func randomKeyB64(t *testing.T) string {
+	t.Helper()
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	return base64.StdEncoding.EncodeToString(key)
+}
 
 // newTestCipher constructs a Cipher with a fresh random key for a
 // single test. Avoids any chance of cross-test state or accidental
@@ -192,6 +214,97 @@ func TestLoadCipherFromEnv_WrongKeySizeFails(t *testing.T) {
 	_, err := LoadCipherFromEnv()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "32 bytes")
+}
+
+// ---------------------------------------------------------------------------
+// ACCELERO_ENCRYPTION_KEY_FILE — file source
+// ---------------------------------------------------------------------------
+
+func TestLoadCipherFromEnv_FileSource_Valid(t *testing.T) {
+	// Operator mounts a secret file (Docker secret, K8s projected
+	// volume). We read it and build a cipher, identical to the env
+	// path.
+	path := writeKeyFile(t, "key", randomKeyB64(t))
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, path)
+
+	c, err := LoadCipherFromEnv()
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	assert.True(t, c.Enabled())
+}
+
+func TestLoadCipherFromEnv_FileSource_TrimsTrailingNewline(t *testing.T) {
+	// `echo "xxx" > key` and most K8s / Docker secret mounts produce
+	// a trailing newline. Reject that and operators spend an
+	// afternoon debugging. Trim it silently — the key material can't
+	// legitimately contain surrounding whitespace anyway.
+	raw := randomKeyB64(t)
+	path := writeKeyFile(t, "key", raw+"\n")
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, path)
+
+	c, err := LoadCipherFromEnv()
+	require.NoError(t, err)
+	require.NotNil(t, c)
+}
+
+func TestLoadCipherFromEnv_FileSource_MissingFile(t *testing.T) {
+	// If the path doesn't exist, fail loudly. Likely cause is the
+	// secret volume not mounting — silently starting in plaintext
+	// mode would be worse than crash-looping.
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, filepath.Join(t.TempDir(), "does-not-exist"))
+	_, err := LoadCipherFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), envKeyFileName)
+}
+
+func TestLoadCipherFromEnv_FileSource_EmptyFile(t *testing.T) {
+	// Empty file (or whitespace-only) is almost certainly a broken
+	// secret mount — not a deliberate "disable encryption". Fail.
+	path := writeKeyFile(t, "key", "\n\n  \n")
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, path)
+
+	_, err := LoadCipherFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "file is empty")
+}
+
+func TestLoadCipherFromEnv_FileSource_Malformed(t *testing.T) {
+	path := writeKeyFile(t, "key", "not-valid-base64!@#")
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, path)
+
+	_, err := LoadCipherFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), envKeyFileName)
+	assert.Contains(t, err.Error(), "base64")
+}
+
+func TestLoadCipherFromEnv_FileSource_WrongSize(t *testing.T) {
+	// Valid base64, wrong size — still must fail rather than pad or truncate.
+	path := writeKeyFile(t, "key", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+	t.Setenv(envKeyName, "")
+	t.Setenv(envKeyFileName, path)
+
+	_, err := LoadCipherFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "32 bytes")
+}
+
+func TestLoadCipherFromEnv_BothSources_Rejected(t *testing.T) {
+	// Explicit error on ambiguity. Silently preferring one over the
+	// other would mean an operator who thought they rotated the key
+	// (via file) is actually still using the env value.
+	t.Setenv(envKeyName, randomKeyB64(t))
+	t.Setenv(envKeyFileName, writeKeyFile(t, "key", randomKeyB64(t)))
+
+	_, err := LoadCipherFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), envKeyName)
+	assert.Contains(t, err.Error(), envKeyFileName)
 }
 
 func min(a, b int) int {
