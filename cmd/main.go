@@ -146,8 +146,21 @@ func main() {
 		},
 	}
 
+	// Compose rate limiting onto auth so only authenticated requests
+	// count against the bucket (and we can key per API key). A zero
+	// RateLimitRPS yields an identity middleware — no allocations per
+	// request, no behaviour change for existing deployments.
+	rateLimit := middleware.NewRateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst)
+	if cfg.RateLimitRPS > 0 {
+		logrus.Infof("Rate limiting enabled: %.2f req/s per API key, burst %d",
+			cfg.RateLimitRPS, cfg.RateLimitBurst)
+	}
+	authChain := func(next http.Handler) http.Handler {
+		return middleware.APIKeyAuth(rateLimit(next))
+	}
+
 	// Register all routes — handler applies auth middleware where needed.
-	h.RegisterRoutes(r, middleware.APIKeyAuth)
+	h.RegisterRoutes(r, authChain)
 
 	// Start the stack-gauge refresher; inexpensive enough to run every 15s.
 	wg.Add(1)

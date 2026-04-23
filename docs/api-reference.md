@@ -998,4 +998,5 @@ All errors follow this format:
 | `404` | Resource not found |
 | `409` | Conflict (duplicate name, deployment in progress) |
 | `415` | Wrong Content-Type (must be `application/json`) |
+| `429` | Rate limit exceeded. Response carries `Retry-After: <seconds>` header and a `{"error": "rate limit exceeded", "retry_after": "1s"}` body. Only emitted when `RATE_LIMIT_RPS>0` is configured — see [configuration](./configuration.md#rate-limiting). |
 | `500` | Internal server error |
