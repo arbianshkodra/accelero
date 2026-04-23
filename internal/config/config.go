@@ -58,6 +58,13 @@ type Config struct {
 	RateLimitRPS   float64
 	RateLimitBurst int
 
+	// WebhookSecret is the shared secret used to verify HMAC-SHA256
+	// signatures on the legacy /webhook endpoint. Callers sign the raw
+	// request body with this secret and pass the hex digest as
+	// X-Hub-Signature-256: sha256=<hex>. Empty = no signature check,
+	// /webhook continues to require an API key as before.
+	WebhookSecret string
+
 	// StacksDataDir is where cloned gitops repos are kept per stack:
 	//   <StacksDataDir>/<stack_id>/repo/
 	// Unlike the old /tmp-based clone, this dir is NOT deleted after a
@@ -116,6 +123,8 @@ func Load() (*Config, error) {
 	if cfg.RateLimitRPS > 0 && cfg.RateLimitBurst <= 0 {
 		cfg.RateLimitBurst = int(math.Max(cfg.RateLimitRPS*2, 10))
 	}
+
+	cfg.WebhookSecret = os.Getenv("WEBHOOK_SECRET")
 
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY environment variable must be set")

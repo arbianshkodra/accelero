@@ -150,6 +150,11 @@ func main() {
 		},
 	}
 
+	if cfg.WebhookSecret != "" {
+		h.WebhookAuth = middleware.NewWebhookSignature(cfg.WebhookSecret)
+		logrus.Info("Webhook HMAC-SHA256 signature verification enabled (WEBHOOK_SECRET set)")
+	}
+
 	// Compose rate limiting onto auth so only authenticated requests
 	// count against the bucket (and we can key per API key). A zero
 	// RateLimitRPS yields an identity middleware — no allocations per

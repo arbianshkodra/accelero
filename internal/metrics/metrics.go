@@ -66,6 +66,15 @@ var (
 		},
 		[]string{"path"},
 	)
+
+	webhookSignatureRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "accelero",
+			Name:      "webhook_signature_rejected_total",
+			Help:      "Webhook requests rejected because their HMAC signature failed verification, labelled by reason (missing/malformed header, hmac mismatch).",
+		},
+		[]string{"reason"},
+	)
 )
 
 // ---------------------------------------------------------------------------
@@ -127,6 +136,7 @@ func init() {
 		reconcileCyclesTotal,
 		httpRequestsTotal,
 		rateLimitedTotal,
+		webhookSignatureRejectedTotal,
 		deploymentDuration,
 		httpRequestDuration,
 		stacksGauge,
@@ -175,6 +185,13 @@ func RecordHTTPRequest(method, path string, status int, durationSeconds float64)
 // stack IDs don't explode the label set.
 func IncRateLimited(path string) {
 	rateLimitedTotal.WithLabelValues(path).Inc()
+}
+
+// IncWebhookSignatureRejected records a webhook that failed HMAC
+// verification. Reason is a short, closed-set tag ("missing_or_malformed_header",
+// "hmac_mismatch", etc.) so the label set stays bounded.
+func IncWebhookSignatureRejected(reason string) {
+	webhookSignatureRejectedTotal.WithLabelValues(reason).Inc()
 }
 
 // SetStackCounts replaces the stacks gauge snapshot.  The caller should

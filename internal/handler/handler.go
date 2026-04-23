@@ -104,6 +104,14 @@ type Handler struct {
 	// through a pass-through cipher.
 	EncryptionEnabled bool
 
+	// WebhookAuth, when non-nil, replaces the default API-key auth on
+	// the root-level POST /webhook route. Main wires this to the
+	// HMAC-SHA256 signature middleware when WEBHOOK_SECRET is set, so
+	// external senders (GitHub, CI) can sign payloads instead of
+	// smuggling the API key into their webhook config. /api/v1/webhook
+	// always requires the API key regardless.
+	WebhookAuth mux.MiddlewareFunc
+
 	// DockerPing is called by /readyz to verify Docker daemon connectivity.
 	// nil disables the Docker check — useful in tests, or in the unlikely
 	// deployment where Accelero proxies to another host and wouldn't want
@@ -195,11 +203,25 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
-	// Authenticated root-level routes
-	auth := r.PathPrefix("").Subrouter()
-	auth.Use(authMiddleware)
-	auth.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
-	auth.HandleFunc("/status", h.Status).Methods("GET")
+	// /webhook has its own auth chain. If WebhookAuth is non-nil
+	// (WEBHOOK_SECRET is set), HMAC-SHA256 verification replaces the
+	// API key check — external senders like GitHub won't know the
+	// internal API key, but they can sign payloads with a shared
+	// secret. Absent the override we fall back to the old API-key
+	// behaviour so existing deployments keep working.
+	webhookAuth := authMiddleware
+	if h.WebhookAuth != nil {
+		webhookAuth = h.WebhookAuth
+	}
+	webhookRouter := r.PathPrefix("").Subrouter()
+	webhookRouter.Use(webhookAuth)
+	webhookRouter.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
+
+	// /status stays behind API key auth — it's an operator surface,
+	// not a webhook target.
+	statusRouter := r.PathPrefix("").Subrouter()
+	statusRouter.Use(authMiddleware)
+	statusRouter.HandleFunc("/status", h.Status).Methods("GET")
 }
 
 // --------------------------------------------------------------------------
