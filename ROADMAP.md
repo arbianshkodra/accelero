@@ -91,7 +91,6 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] `GET /stacks/{id}/containers/{cid}` — inspect container details (state, config, networks, mounts; env redacted by key)
 - [x] `GET /stacks/{id}/containers/{cid}/logs` — one-shot tail with `tail` / `since` / `timestamps`; follow via WebSocket is a separate ticket below
 - [x] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket follow; stdout+stderr demuxed server-side, 30s ping, normal-closure on daemon EOF, X-API-KEY auth on upgrade
-- [ ] `GET /stacks/{id}/containers/{cid}/logs/stream` — WebSocket for live logs
 - [x] `GET /stacks/{id}/containers/{cid}/stats` — CPU%, memory used/limit/%, per-iface network rx/tx, block I/O totals, PIDs (snapshot).
 - [x] `GET /stacks/{id}/containers/{cid}/stats/stream` — WebSocket follow: one ContainerStatsSample per daemon tick (~1s). Same ping/close semantics as logs/stream.
 - [x] `GET /stacks/{id}/events` — SSE stream of Docker events filtered to this stack's managed resources (accelero-service / accelero-replica surfaced). Stack-wide view is the common one; a daemon-wide `/events` variant across all stacks can come later if needed.
@@ -136,10 +135,10 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 **Secrets — guiding principle:** the interpolation `.env` in a GitOps repo is for declarative config only (tags, registries, ports, flags) and is committed to git. Actual secrets must never land there. The items below give secrets a first-class home that does not require committing anything sensitive.
 
 **Secrets at rest (inside Accelero):**
-- [ ] Encrypt the sensitive fields already stored in SQLite: `repo_token`, `docker_password`, user passwords. Per-field AEAD (e.g. XChaCha20-Poly1305) keyed by a master key.
-- [ ] Master key sources: env var (simple setups), file path, or KMS (AWS KMS, GCP KMS, HashiCorp Vault Transit).
+- [x] Encrypt `repo_token` and `docker_password` in SQLite with AES-256-GCM, versioned ciphertext (`v1:<nonce>:<ct>`), master key from `ACCELERO_ENCRYPTION_KEY` (base64-encoded 32 bytes). Legacy plaintext rows read transparently. User-password encryption will ride on the identity work above.
+- [ ] Additional master key sources: file path, KMS (AWS KMS, GCP KMS, HashiCorp Vault Transit).
 - [ ] Automatic key rotation: new writes use the current key; old reads transparently re-encrypt on next write.
-- [ ] Online migration path from existing plaintext rows (one-shot admin endpoint that re-encrypts in place).
+- [x] Online migration path from existing plaintext rows — `POST /api/v1/admin/encrypt-existing` re-saves any row still in plaintext so the cipher kicks in on write. Idempotent; 400 if the server has no key attached.
 
 **Per-stack secrets API:**
 - [ ] `POST /api/v1/stacks/{id}/secrets` — submit secret key/value pairs encrypted at rest; listed via the API without exposing values (write-only fields).

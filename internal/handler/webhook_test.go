@@ -21,6 +21,13 @@ type mockStore struct {
 	stacks       []*store.Stack
 	deployments  []*store.Deployment
 	auditEntries []*store.AuditEntry
+
+	// plaintextStackIDs lets encryption-migration tests simulate
+	// "these rows are still plaintext" without modelling the cipher.
+	// UpdateStack removes the ID from the set to simulate the row
+	// becoming ciphertext.
+	plaintextStackIDs map[string]bool
+	updateCalls       []string
 }
 
 // newHandler wires a Handler with the three test doubles we need. Kept
@@ -50,9 +57,15 @@ func (m *mockStore) GetStackByName(name string) (*store.Stack, error) {
 	}
 	return nil, nil
 }
-func (m *mockStore) ListStacks() ([]*store.Stack, error)                          { return m.stacks, nil }
-func (m *mockStore) UpdateStack(s *store.Stack) error                             { return nil }
-func (m *mockStore) DeleteStack(id string) error                                  { return nil }
+func (m *mockStore) ListStacks() ([]*store.Stack, error) { return m.stacks, nil }
+func (m *mockStore) UpdateStack(s *store.Stack) error {
+	m.updateCalls = append(m.updateCalls, s.ID)
+	if m.plaintextStackIDs != nil {
+		delete(m.plaintextStackIDs, s.ID)
+	}
+	return nil
+}
+func (m *mockStore) DeleteStack(id string) error { return nil }
 func (m *mockStore) CreateDeployment(d *store.Deployment) error                   { m.deployments = append(m.deployments, d); return nil }
 func (m *mockStore) GetDeployment(id string) (*store.Deployment, error)           { return nil, nil }
 func (m *mockStore) ListDeployments(stackID string, limit int) ([]*store.Deployment, error) {
@@ -72,6 +85,13 @@ func (m *mockStore) ListAuditEntries(_ store.AuditFilter) ([]*store.AuditEntry, 
 	return m.auditEntries, nil
 }
 func (m *mockStore) CleanupOldAuditEntries(_ time.Duration) (int, error) { return 0, nil }
+func (m *mockStore) ListStacksNeedingEncryption() ([]string, error) {
+	ids := make([]string, 0, len(m.plaintextStackIDs))
+	for id := range m.plaintextStackIDs {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
 func (m *mockStore) Ping(ctx context.Context) error { return nil }
 func (m *mockStore) Close() error                   { return nil }
 
@@ -650,4 +670,110 @@ func TestListAuditEntries_BadSinceRejected(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+// ---------------------------------------------------------------------------
+// Admin: encrypt-existing (at-rest encryption migration)
+// ---------------------------------------------------------------------------
+
+func TestEncryptExistingStacks_DisabledReturns400(t *testing.T) {
+	// Endpoint is a no-op when the server has no cipher attached.
+	// Returning 200 with "migrated 0" would be a lie — the rows are
+	// still plaintext. 400 forces the operator to set the key first.
+	h := &Handler{
+		Store:             &mockStore{},
+		Deployer:          &mockDeployer{},
+		EncryptionEnabled: false,
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/encrypt-existing", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "encryption is disabled")
+}
+
+func TestEncryptExistingStacks_MigratesPlaintextRows(t *testing.T) {
+	now := time.Now()
+	ms := &mockStore{
+		stacks: []*store.Stack{
+			{ID: "s1", Name: "one", Status: "active", CreatedAt: now, UpdatedAt: now},
+			{ID: "s2", Name: "two", Status: "active", CreatedAt: now, UpdatedAt: now},
+			{ID: "s3", Name: "three", Status: "active", CreatedAt: now, UpdatedAt: now}, // already encrypted
+		},
+		plaintextStackIDs: map[string]bool{"s1": true, "s2": true},
+	}
+	rec := &captureRecorder{}
+	h := &Handler{
+		Store:             ms,
+		Deployer:          &mockDeployer{},
+		Audit:             rec,
+		EncryptionEnabled: true,
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/encrypt-existing", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "ok", body["status"])
+	assert.InDelta(t, 2.0, body["stacks_migrated"], 0)
+	assert.NotContains(t, body, "stacks_failed")
+
+	// Re-save went through UpdateStack for exactly the plaintext rows.
+	// Ordering isn't guaranteed (map iteration), so compare as sets.
+	assert.ElementsMatch(t, []string{"s1", "s2"}, ms.updateCalls)
+
+	// Audit row captures the success and the migrated count.
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOpAdminEncrypt, got.Operation)
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+	assert.Equal(t, "2", got.Metadata["stacks_migrated"])
+	assert.Equal(t, "0", got.Metadata["stacks_failed"])
+}
+
+func TestEncryptExistingStacks_Idempotent(t *testing.T) {
+	// Nothing to migrate → zero work, no failures, audit row with 0/0.
+	// Matches what a second call after a successful migration looks like.
+	ms := &mockStore{plaintextStackIDs: map[string]bool{}}
+	rec := &captureRecorder{}
+	h := &Handler{
+		Store:             ms,
+		Deployer:          &mockDeployer{},
+		Audit:             rec,
+		EncryptionEnabled: true,
+	}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/encrypt-existing", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.InDelta(t, 0.0, body["stacks_migrated"], 0)
+	assert.Empty(t, ms.updateCalls)
+
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+	assert.Equal(t, "0", got.Metadata["stacks_migrated"])
 }

@@ -1,11 +1,15 @@
 package store
 
 import (
+	"crypto/rand"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/secrets"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestStore creates a temporary SQLite store for a single test.
@@ -912,4 +916,133 @@ func TestAudit_LimitCap(t *testing.T) {
 	got, err = s.ListAuditEntries(AuditFilter{Limit: 99999})
 	assert.NoError(t, err)
 	assert.LessOrEqual(t, len(got), maxAuditListLimit)
+}
+
+// ---------------------------------------------------------------------------
+// At-rest encryption
+// ---------------------------------------------------------------------------
+
+func TestEncryption_RepoTokenAndDockerPasswordAreCiphertextInDB(t *testing.T) {
+	// The critical guarantee: an attacker with read access to the DB
+	// file sees opaque ciphertext, not the tokens. Read the raw column
+	// bytes back via a direct SQL query and assert the v1: prefix.
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Attach a cipher. Separate from NewSQLiteStore so existing
+	// call sites (including this test helper) don't need to change.
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	in := &Stack{
+		ID:             "sid",
+		Name:           "encrypted-stack",
+		RepoURL:        "https://example/repo",
+		RepoUsername:   "bot",
+		RepoToken:      "gh_p_super_secret_token",
+		ComposePath:    "docker-compose.yaml",
+		Status:         StackStatusActive,
+		DockerUsername: "registry-user",
+		DockerPassword: "registry-secret",
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	require.NoError(t, s.CreateStack(in))
+
+	// Raw column read — bypass the scan path that decrypts.
+	var rawToken, rawDockerPw string
+	require.NoError(t, s.db.QueryRow(
+		`SELECT repo_token, docker_password FROM stacks WHERE id = ?`, in.ID,
+	).Scan(&rawToken, &rawDockerPw))
+
+	assert.True(t, strings.HasPrefix(rawToken, "v1:"),
+		"repo_token in the DB must be ciphertext; got %q", rawToken)
+	assert.True(t, strings.HasPrefix(rawDockerPw, "v1:"),
+		"docker_password in the DB must be ciphertext; got %q", rawDockerPw)
+	assert.NotContains(t, rawToken, "super_secret",
+		"the plaintext token must not appear anywhere in the encrypted column")
+
+	// Read-through the normal API must return plaintext.
+	out, err := s.GetStack(in.ID)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, "gh_p_super_secret_token", out.RepoToken)
+	assert.Equal(t, "registry-secret", out.DockerPassword)
+}
+
+func TestEncryption_LegacyPlaintextRowsStillReadable(t *testing.T) {
+	// Upgrade path: existing deployments have plaintext rows written
+	// by older accelero versions. After enabling encryption, reads
+	// must still succeed (returning the plaintext as-is), so users
+	// don't experience a wall of broken reads at upgrade time.
+	s := newTestStore(t)
+	defer s.Close()
+
+	// First write a row WITHOUT a cipher — simulates a row from an
+	// older accelero version.
+	in := &Stack{
+		ID:           "legacy",
+		Name:         "old-stack",
+		RepoURL:      "https://example/repo",
+		RepoUsername: "bot",
+		RepoToken:    "legacy-token-not-encrypted",
+		ComposePath:  "docker-compose.yaml",
+		Status:       StackStatusActive,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	require.NoError(t, s.CreateStack(in))
+
+	// Now attach a cipher (simulating the upgrade) and re-read.
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = 0xAB
+	}
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	out, err := s.GetStack("legacy")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, "legacy-token-not-encrypted", out.RepoToken,
+		"plaintext row must pass through unchanged after cipher attached")
+}
+
+func TestEncryption_CiphertextRowWithoutKeyFailsRead(t *testing.T) {
+	// If a ciphertext row exists but the server starts without the
+	// key (misconfigured upgrade), the read must fail loudly rather
+	// than return raw ciphertext as a token.
+	s := newTestStore(t)
+	defer s.Close()
+
+	// Write an encrypted row.
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	require.NoError(t, s.CreateStack(&Stack{
+		ID: "x", Name: "x",
+		RepoURL:     "url",
+		ComposePath: "c.yaml",
+		RepoToken:   "secret",
+		Status:      StackStatusActive,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}))
+
+	// Now detach the cipher (as if the server was restarted without
+	// the key set) and read.
+	s.SetCipher(nil)
+
+	_, err = s.GetStack("x")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decrypt")
 }
