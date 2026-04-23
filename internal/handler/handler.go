@@ -98,6 +98,12 @@ type Handler struct {
 	// well-placed bug wiping volume data) is acceptable.
 	AllowVolumeWrites bool
 
+	// EncryptionEnabled reports whether at-rest encryption is active
+	// (cipher wired in cmd/main.go). The admin migration endpoint
+	// requires this to be true — there's no point re-saving rows
+	// through a pass-through cipher.
+	EncryptionEnabled bool
+
 	// DockerPing is called by /readyz to verify Docker daemon connectivity.
 	// nil disables the Docker check — useful in tests, or in the unlikely
 	// deployment where Accelero proxies to another host and wouldn't want
@@ -182,6 +188,10 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 
 	// Audit log — read-only; append-only at the store layer.
 	api.HandleFunc("/audit", h.ListAuditEntries).Methods("GET")
+
+	// Admin: one-shot migration that re-encrypts any plaintext
+	// secrets in place. No-op when encryption is disabled.
+	api.HandleFunc("/admin/encrypt-existing", h.EncryptExistingStacks).Methods("POST")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -635,6 +645,70 @@ func driftToAction(d reconciler.DriftItem) PreviewAction {
 // --------------------------------------------------------------------------
 // Audit log endpoint
 // --------------------------------------------------------------------------
+
+// EncryptExistingStacks is a one-shot migration that re-saves any
+// stack whose sensitive fields are still stored as pre-encryption
+// plaintext. The re-save goes through UpdateStack, which always
+// encrypts on write when a cipher is attached — no special code
+// path needed here.
+//
+// Requires ACCELERO_ENCRYPTION_KEY to be set; without it the re-save
+// would be a no-op and the endpoint would lie about what it did.
+// Idempotent: running again after everything is encrypted finds zero
+// plaintext rows.
+//
+// Audited as admin.encrypt-existing with the migrated count in metadata.
+func (h *Handler) EncryptExistingStacks(w http.ResponseWriter, r *http.Request) {
+	if !h.EncryptionEnabled {
+		writeError(w, "encryption is disabled on this server (set ACCELERO_ENCRYPTION_KEY to enable)", http.StatusBadRequest)
+		return
+	}
+
+	ids, err := h.Store.ListStacksNeedingEncryption()
+	if err != nil {
+		writeError(w, "failed to list stacks needing migration", http.StatusInternalServerError)
+		return
+	}
+
+	migrated := 0
+	var failed []string
+	for _, id := range ids {
+		stack, err := h.Store.GetStack(id)
+		if err != nil || stack == nil {
+			failed = append(failed, id)
+			continue
+		}
+		// UpdateStack re-encrypts via the cipher on write. That's the
+		// whole migration — no special logic here.
+		if err := h.Store.UpdateStack(stack); err != nil {
+			logctx.FromContext(r.Context()).WithError(err).
+				Warnf("admin migrate: re-save of stack %s failed", id)
+			failed = append(failed, id)
+			continue
+		}
+		migrated++
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpAdminEncrypt)
+	entry.ResourceType = "admin"
+	entry.Metadata = map[string]string{
+		"stacks_migrated": strconv.Itoa(migrated),
+		"stacks_failed":   strconv.Itoa(len(failed)),
+	}
+	if len(failed) > 0 {
+		entry.Outcome = store.AuditOutcomeFailure
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	body := map[string]interface{}{
+		"status":          "ok",
+		"stacks_migrated": migrated,
+	}
+	if len(failed) > 0 {
+		body["stacks_failed"] = failed
+	}
+	writeJSON(w, body, http.StatusOK)
+}
 
 // ListAuditEntries returns audit rows newest-first. Immutable by design —
 // there's no write/update/delete endpoint here; the store's schema only
