@@ -155,6 +155,22 @@ func (s *SQLiteStore) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_audit_stack_ts ON audit_entries(stack_id, timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit_entries(actor, timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_audit_operation_ts ON audit_entries(operation, timestamp DESC);
+
+	-- Per-stack secrets. value is ciphertext (v1: prefix) when the
+	-- cipher is attached, plaintext otherwise, identical to how
+	-- repo_token and docker_password are handled on the stacks table.
+	-- Composite PK means "set twice with the same name = upsert".
+	-- FK cascade deletes a stack's secrets along with it; there is no
+	-- reason to outlive the parent row.
+	CREATE TABLE IF NOT EXISTS stack_secrets (
+		stack_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		value TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (stack_id, name),
+		FOREIGN KEY (stack_id) REFERENCES stacks(id) ON DELETE CASCADE
+	);
 	`
 	_, err := s.db.Exec(schema)
 	return err
@@ -242,6 +258,16 @@ func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 }
 
 func (s *SQLiteStore) DeleteStack(id string) error {
+	// modernc.org/sqlite doesn't honour _foreign_keys=ON in the DSN,
+	// so the FK cascade from stack_secrets doesn't fire automatically.
+	// Historical rows (deployments, managed_containers) get left as
+	// orphans — not a security issue since they carry no credential
+	// material. Secrets are the exception: those rows hold data that
+	// should disappear when the parent stack does, even if a future
+	// key rotation would turn them into unreadable ciphertext.
+	if _, err := s.db.Exec(`DELETE FROM stack_secrets WHERE stack_id = ?`, id); err != nil {
+		return fmt.Errorf("delete stack_secrets for %s: %w", id, err)
+	}
 	_, err := s.db.Exec(`DELETE FROM stacks WHERE id = ?`, id)
 	return err
 }
@@ -382,6 +408,83 @@ func (s *SQLiteStore) RemoveContainer(containerID string) error {
 func (s *SQLiteStore) RemoveContainersByStack(stackID string) error {
 	_, err := s.db.Exec(`DELETE FROM managed_containers WHERE stack_id = ?`, stackID)
 	return err
+}
+
+// --- Per-stack secrets ---
+
+// UpsertStackSecret writes a secret, creating or updating by
+// (stack_id, name). The value is encrypted before hitting the DB when a
+// cipher is attached. created_at is preserved across updates so callers
+// can see "when was this first set" vs "when was it last rotated".
+func (s *SQLiteStore) UpsertStackSecret(sec *StackSecret) error {
+	encValue, err := s.encryptField(sec.Value)
+	if err != nil {
+		return fmt.Errorf("encrypt stack_secret value: %w", err)
+	}
+	now := time.Now()
+	if sec.CreatedAt.IsZero() {
+		sec.CreatedAt = now
+	}
+	sec.UpdatedAt = now
+
+	// SQLite's ON CONFLICT ... DO UPDATE handles the upsert. We pass
+	// the same encValue on both paths and use excluded.updated_at so
+	// the column moves forward even if the value text happens to
+	// collide (re-encrypting the same plaintext produces different
+	// ciphertext thanks to the random nonce, so the row will actually
+	// change).
+	_, err = s.db.Exec(`
+		INSERT INTO stack_secrets (stack_id, name, value, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (stack_id, name) DO UPDATE SET
+			value = excluded.value,
+			updated_at = excluded.updated_at`,
+		sec.StackID, sec.Name, encValue, sec.CreatedAt, sec.UpdatedAt)
+	return err
+}
+
+// ListStackSecrets returns every secret for a stack with its plaintext
+// value decrypted. Callers MUST NOT expose Value through unauthenticated
+// surfaces — the handler redacts it in API responses; the deploy path
+// materialises it into a tmpfs env_file.
+func (s *SQLiteStore) ListStackSecrets(stackID string) ([]*StackSecret, error) {
+	rows, err := s.db.Query(`
+		SELECT stack_id, name, value, created_at, updated_at
+		FROM stack_secrets
+		WHERE stack_id = ?
+		ORDER BY name ASC`,
+		stackID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*StackSecret
+	for rows.Next() {
+		var sec StackSecret
+		if err := rows.Scan(&sec.StackID, &sec.Name, &sec.Value, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		plain, err := s.decryptField(sec.Value)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt stack_secret value for %s/%s: %w", sec.StackID, sec.Name, err)
+		}
+		sec.Value = plain
+		out = append(out, &sec)
+	}
+	return out, rows.Err()
+}
+
+// DeleteStackSecret removes a single (stack_id, name) row. Returns
+// (false, nil) when the row did not exist so the handler can map to
+// 404 without a second lookup.
+func (s *SQLiteStore) DeleteStackSecret(stackID, name string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM stack_secrets WHERE stack_id = ? AND name = ?`, stackID, name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // --- Audit log ---

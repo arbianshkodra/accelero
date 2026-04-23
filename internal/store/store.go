@@ -28,6 +28,15 @@ type Store interface {
 	RemoveContainer(containerID string) error
 	RemoveContainersByStack(stackID string) error
 
+	// Per-stack secrets. Upsert is the only mutation path — operators
+	// only ever "set this key"; the store handles the first-write vs
+	// rewrite distinction internally. List returns all rows *including*
+	// values: the handler layer decides what the API exposes. Delete on
+	// an absent name returns (false, nil) so the handler can map to 404.
+	UpsertStackSecret(s *StackSecret) error
+	ListStackSecrets(stackID string) ([]*StackSecret, error)
+	DeleteStackSecret(stackID, name string) (bool, error)
+
 	// Audit log — append-only; no update or delete API. Retention is
 	// time-based and goes through CleanupOldAuditEntries, which is the
 	// only path that removes rows. Prune decisions stay with the app

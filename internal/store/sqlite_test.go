@@ -1046,3 +1046,153 @@ func TestEncryption_CiphertextRowWithoutKeyFailsRead(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decrypt")
 }
+
+// ---------------------------------------------------------------------------
+// Per-stack secrets
+// ---------------------------------------------------------------------------
+
+// seedStack creates a minimal stack so the FK constraint on
+// stack_secrets can be satisfied. Returns the stack ID for use in
+// follow-up assertions.
+func seedStack(t *testing.T, s *SQLiteStore, id string) string {
+	t.Helper()
+	require.NoError(t, s.CreateStack(makeStack(id, id+"-name")))
+	return id
+}
+
+func TestStackSecret_UpsertAndList(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{
+		StackID: stackID, Name: "DATABASE_URL", Value: "postgres://a",
+	}))
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{
+		StackID: stackID, Name: "API_KEY", Value: "k-1",
+	}))
+
+	got, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	// ORDER BY name ASC — deterministic ordering matters for the API.
+	assert.Equal(t, "API_KEY", got[0].Name)
+	assert.Equal(t, "k-1", got[0].Value)
+	assert.Equal(t, "DATABASE_URL", got[1].Name)
+	assert.Equal(t, "postgres://a", got[1].Value)
+	assert.False(t, got[0].CreatedAt.IsZero())
+	assert.False(t, got[0].UpdatedAt.IsZero())
+}
+
+func TestStackSecret_UpsertUpdatesValueAndBumpsUpdatedAt(t *testing.T) {
+	// Setting the same key twice must overwrite the value and move
+	// updated_at forward, while leaving created_at alone so callers
+	// can tell "freshly created" from "rotated".
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{
+		StackID: stackID, Name: "K", Value: "v1",
+	}))
+	first, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	createdAt := first[0].CreatedAt
+
+	// Enough delay for SQLite's default datetime resolution to move.
+	time.Sleep(1100 * time.Millisecond)
+
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{
+		StackID: stackID, Name: "K", Value: "v2",
+	}))
+	second, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+
+	assert.Equal(t, "v2", second[0].Value, "upsert must overwrite value")
+	assert.True(t, second[0].UpdatedAt.After(createdAt), "updated_at must move forward; got %s vs %s",
+		second[0].UpdatedAt, createdAt)
+	assert.True(t, second[0].CreatedAt.Equal(createdAt) || second[0].CreatedAt.Before(second[0].UpdatedAt),
+		"created_at must not move on update")
+}
+
+func TestStackSecret_DeleteMissingReportsFalse(t *testing.T) {
+	// Delete-missing has to be distinguishable from a genuine error so
+	// the handler can 404 correctly without a separate lookup.
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	ok, err := s.DeleteStackSecret(stackID, "nope")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestStackSecret_DeleteExistingReportsTrueAndRemoves(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{StackID: stackID, Name: "K", Value: "v"}))
+	ok, err := s.DeleteStackSecret(stackID, "K")
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	list, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	assert.Empty(t, list)
+}
+
+func TestStackSecret_CascadesOnStackDelete(t *testing.T) {
+	// ON DELETE CASCADE is the whole point of the FK; if it silently
+	// stops working a stack delete would leave orphan ciphertext rows
+	// around, eventually unreadable after key rotation.
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{StackID: stackID, Name: "A", Value: "a"}))
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{StackID: stackID, Name: "B", Value: "b"}))
+
+	require.NoError(t, s.DeleteStack(stackID))
+
+	list, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	assert.Empty(t, list, "secrets must not survive their parent stack")
+}
+
+func TestStackSecret_EncryptedInDB(t *testing.T) {
+	// Raw-SQL guarantee: with a cipher attached, the value column is
+	// opaque ciphertext (v1: prefix) and the plaintext never appears.
+	s := newTestStore(t)
+	defer s.Close()
+
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	stackID := seedStack(t, s, "s1")
+	require.NoError(t, s.UpsertStackSecret(&StackSecret{
+		StackID: stackID, Name: "DATABASE_URL", Value: "postgres://superSecretValue",
+	}))
+
+	var raw string
+	require.NoError(t, s.db.QueryRow(
+		`SELECT value FROM stack_secrets WHERE stack_id = ? AND name = ?`,
+		stackID, "DATABASE_URL",
+	).Scan(&raw))
+	assert.True(t, strings.HasPrefix(raw, "v1:"),
+		"stack_secret value must be stored as ciphertext; got %q", raw)
+	assert.NotContains(t, raw, "superSecretValue",
+		"plaintext must never appear in the encrypted column")
+
+	// Normal API round-trips to plaintext.
+	list, err := s.ListStackSecrets(stackID)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "postgres://superSecretValue", list[0].Value)
+}

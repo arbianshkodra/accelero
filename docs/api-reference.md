@@ -335,6 +335,8 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `drift.detected` | `system:reconciler` | One per reconcile cycle with drift (not per drift item — kept compact). Metadata: `drift_count`, per-type counts (`drift_type_missing`, `drift_type_image_mismatch`, etc.). |
 | `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
 | `admin.encrypt-existing` | `api-key` | Re-saves pre-encryption plaintext rows through the cipher. Metadata: `stacks_migrated`, `stacks_failed`. Outcome is `failure` if any row failed. |
+| `stack.secret.set` | `api-key` | Upsert of a per-stack secret. Metadata: `rewrote_existing`. **Value is never included.** |
+| `stack.secret.delete` | `api-key` | Delete of a per-stack secret. Always recorded — failures carry `error_message: "not found"` when the caller tried to delete a non-existent key. |
 
 **Retention.** Entries older than `AUDIT_MAX_AGE` (default 90 days) are pruned on the same cadence as the deployment-history cleanup (`STATUS_CLEANUP_INTERVAL`, default hourly). Set `AUDIT_MAX_AGE=0` to disable retention — useful when a compliance regime requires indefinite preservation.
 
@@ -800,6 +802,79 @@ Runs the same drift check as `/drift` and translates each drift item into the ac
 | `inspect` | _unknown_ | Future drift type not yet mapped; deploy will still attempt to converge |
 
 **Errors:** `404 Not Found` if the stack doesn't exist; `503 Service Unavailable` if the reconciler is not wired (indicates a misconfigured server).
+
+---
+
+## Per-Stack Secrets
+
+Encrypted-at-rest key/value pairs scoped to a single stack. Values are stored as `v1:<nonce>:<ciphertext>` when `ACCELERO_ENCRYPTION_KEY` (or `ACCELERO_ENCRYPTION_KEY_FILE`) is configured, otherwise as plaintext — identical to how `repo_token` and `docker_password` are handled on the stack record itself. This PR ships storage + CRUD only; deploy-time injection into managed containers is a follow-up.
+
+The value leaves Accelero only through the (forthcoming) deploy injection path. **The list endpoint never returns values** — that's by design, not a UI affordance, so a leaked API key can't be used to exfiltrate secrets.
+
+Secrets cascade-delete with their parent stack.
+
+### Set a Secret
+`POST /api/v1/stacks/{id}/secrets`
+
+Upserts a secret. Same key twice = rotation.
+
+**Request body:**
+```json
+{"name": "DATABASE_URL", "value": "postgres://user:pass@db/app"}
+```
+
+**Constraints:**
+
+| Field | Rule |
+|-------|------|
+| `name` | Required. Must match `^[A-Z_][A-Z0-9_]*$` (uppercase letters, digits, underscores; no leading digit). ≤128 characters. Matches POSIX env-var grammar because secrets are materialised into container env vars at deploy time. |
+| `value` | Required, non-empty. ≤64 KiB (comfortably above a PEM cert or a 2 KB service-account JSON). Empty value is rejected with a hint to use DELETE instead. |
+
+**Response:**
+- `201 Created` on first write of a given name
+- `200 OK` on rewrite (rotation)
+
+```json
+{"name": "DATABASE_URL", "created": true}
+```
+
+Audited as `stack.secret.set` with metadata `{"rewrote_existing": "true|false"}`. **The value never appears in audit metadata or in any response.**
+
+**Errors:** `400` on malformed name / empty value / invalid JSON; `404` if the stack doesn't exist; `413` on an over-cap value.
+
+### List Secrets
+`GET /api/v1/stacks/{id}/secrets`
+
+Returns every secret's name and timestamps in ASCII order by name.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "name": "API_KEY",
+    "stack_id": "s1",
+    "created_at": "2026-04-23T21:08:15.210849Z",
+    "updated_at": "2026-04-23T21:08:15.210849Z"
+  },
+  {
+    "name": "DATABASE_URL",
+    "stack_id": "s1",
+    "created_at": "2026-04-23T21:08:15.194481Z",
+    "updated_at": "2026-04-23T21:08:15.202883Z"
+  }
+]
+```
+
+No `value` field is ever present in the response shape.
+
+### Delete a Secret
+`DELETE /api/v1/stacks/{id}/secrets/{name}`
+
+**Response:**
+- `204 No Content` on success
+- `404 Not Found` if the named secret doesn't exist
+
+Both outcomes are audited as `stack.secret.delete`. Failures record `outcome: "failure"` with `error_message: "not found"` — the trail captures "someone tried to delete X" even when X was already gone, which is useful during incidents (e.g. a cleanup script running twice).
 
 ---
 
