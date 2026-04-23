@@ -10,12 +10,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arbianshkodra/accelero/internal/secrets"
 	_ "modernc.org/sqlite"
 )
 
 // SQLiteStore implements Store using SQLite.
 type SQLiteStore struct {
 	db *sql.DB
+
+	// cipher optionally encrypts sensitive fields (repo_token,
+	// docker_password) at rest. Nil means "encryption disabled" —
+	// the store writes and reads plaintext exactly as older versions
+	// did. Wired from cmd/main.go based on ACCELERO_ENCRYPTION_KEY.
+	cipher *secrets.Cipher
 }
 
 // NewSQLiteStore opens (or creates) a SQLite database and runs migrations.
@@ -39,6 +46,31 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	}
 
 	return s, nil
+}
+
+// SetCipher attaches (or detaches) the at-rest encryption cipher.
+// Passing nil disables encryption. Setter rather than constructor
+// parameter so the many existing NewSQLiteStore call sites (tests
+// included) don't have to change; production wires it once in
+// cmd/main.go right after NewSQLiteStore.
+func (s *SQLiteStore) SetCipher(c *secrets.Cipher) {
+	s.cipher = c
+}
+
+// encryptField wraps secrets.Encrypt — safe to call on a store with
+// nil cipher (returns input unchanged). Kept here rather than forcing
+// every call site to branch on s.cipher.
+func (s *SQLiteStore) encryptField(plaintext string) (string, error) {
+	return s.cipher.Encrypt(plaintext)
+}
+
+// decryptField is the read-side counterpart. Returns input unchanged
+// if the stored value is plaintext (legacy rows) OR if the cipher is
+// disabled AND the value doesn't look like ciphertext. If the stored
+// value looks like ciphertext (v1: prefix) but encryption is disabled,
+// errors — the store must not return raw ciphertext as a credential.
+func (s *SQLiteStore) decryptField(stored string) (string, error) {
+	return s.cipher.Decrypt(stored)
 }
 
 func (s *SQLiteStore) migrate() error {
@@ -131,15 +163,27 @@ func (s *SQLiteStore) migrate() error {
 // --- Stack operations ---
 
 func (s *SQLiteStore) CreateStack(stack *Stack) error {
-	_, err := s.db.Exec(`
+	// Encrypt the two sensitive fields before they hit SQLite. The
+	// caller's Stack struct is mutated so field values keep round-
+	// tripping as plaintext Go strings — only the DB column sees
+	// ciphertext.
+	encToken, err := s.encryptField(stack.RepoToken)
+	if err != nil {
+		return fmt.Errorf("encrypt repo_token: %w", err)
+	}
+	encDockerPw, err := s.encryptField(stack.DockerPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt docker_password: %w", err)
+	}
+	_, err = s.db.Exec(`
 		INSERT INTO stacks (id, name, repo_url, repo_username, repo_token, repo_branch,
 			compose_path, service_filter, auto_deploy, reconcile_interval_seconds, status,
 			docker_username, docker_password, docker_registry, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		stack.ID, stack.Name, stack.RepoURL, stack.RepoUsername, stack.RepoToken,
+		stack.ID, stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval, stack.Status,
-		stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry,
+		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
 		stack.CreatedAt, stack.UpdatedAt,
 	)
 	return err
@@ -173,17 +217,25 @@ func (s *SQLiteStore) ListStacks() ([]*Stack, error) {
 
 func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 	stack.UpdatedAt = time.Now()
-	_, err := s.db.Exec(`
+	encToken, err := s.encryptField(stack.RepoToken)
+	if err != nil {
+		return fmt.Errorf("encrypt repo_token: %w", err)
+	}
+	encDockerPw, err := s.encryptField(stack.DockerPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt docker_password: %w", err)
+	}
+	_, err = s.db.Exec(`
 		UPDATE stacks SET name=?, repo_url=?, repo_username=?, repo_token=?, repo_branch=?,
 			compose_path=?, service_filter=?, auto_deploy=?, reconcile_interval_seconds=?,
 			status=?, last_deployed_at=?, last_reconciled_at=?, git_commit=?,
 			docker_username=?, docker_password=?, docker_registry=?, updated_at=?
 		WHERE id=?`,
-		stack.Name, stack.RepoURL, stack.RepoUsername, stack.RepoToken,
+		stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval,
 		stack.Status, stack.LastDeployedAt, stack.LastReconciledAt, stack.GitCommit,
-		stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry,
+		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
 		stack.UpdatedAt, stack.ID,
 	)
 	return err
@@ -192,6 +244,34 @@ func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 func (s *SQLiteStore) DeleteStack(id string) error {
 	_, err := s.db.Exec(`DELETE FROM stacks WHERE id = ?`, id)
 	return err
+}
+
+// ListStacksNeedingEncryption returns IDs of stacks whose sensitive
+// columns are still in pre-encryption plaintext form (no v1: prefix).
+// Empty-string values (no token, no password) don't need encryption
+// and are excluded. Used by the admin migration endpoint — callers
+// then call UpdateStack on each to re-save with encryption.
+func (s *SQLiteStore) ListStacksNeedingEncryption() ([]string, error) {
+	const prefix = secrets.CipherVersionV1 + ":"
+	rows, err := s.db.Query(`
+		SELECT id FROM stacks
+		WHERE (repo_token != '' AND repo_token NOT LIKE ?)
+		   OR (docker_password != '' AND docker_password NOT LIKE ?)`,
+		prefix+"%", prefix+"%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // --- Deployment operations ---
@@ -490,6 +570,17 @@ func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 	}
 	if lastReconciled.Valid {
 		st.LastReconciledAt = &lastReconciled.Time
+	}
+
+	// Decrypt the two fields we encrypted on write. Legacy (plaintext)
+	// rows written by older accelero versions pass through unchanged;
+	// ciphertext that fails to decrypt fails the whole read so callers
+	// never get garbage credentials.
+	if st.RepoToken, err = s.decryptField(st.RepoToken); err != nil {
+		return nil, fmt.Errorf("decrypt repo_token for stack %s: %w", st.ID, err)
+	}
+	if st.DockerPassword, err = s.decryptField(st.DockerPassword); err != nil {
+		return nil, fmt.Errorf("decrypt docker_password for stack %s: %w", st.ID, err)
 	}
 	return st, nil
 }

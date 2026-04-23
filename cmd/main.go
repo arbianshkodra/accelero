@@ -17,6 +17,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
+	"github.com/arbianshkodra/accelero/internal/secrets"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/stack"
 	"github.com/arbianshkodra/accelero/internal/store"
@@ -49,6 +50,24 @@ func main() {
 	}
 	defer db.Close()
 	logrus.Info("Database initialized")
+
+	// 2b. Load the at-rest encryption cipher.  Missing env var is
+	// explicitly allowed (dev + backward-compat) — we just warn. A
+	// malformed env var is a fatal misconfiguration: the operator
+	// asked for encryption and we shouldn't silently fall back to
+	// plaintext.
+	cipher, err := secrets.LoadCipherFromEnv()
+	if err != nil {
+		logrus.Fatalf("Secrets error: %v", err)
+	}
+	if cipher.Enabled() {
+		db.SetCipher(cipher)
+		logrus.Info("At-rest encryption enabled (ACCELERO_ENCRYPTION_KEY set)")
+	} else {
+		logrus.Warn("At-rest encryption DISABLED — repo tokens and Docker passwords stored as plaintext. " +
+			"Set ACCELERO_ENCRYPTION_KEY (base64-encoded 32 bytes) to enable. " +
+			"Generate one with: openssl rand -base64 32")
+	}
 
 	// 3. Create Docker client and verify the daemon. API version negotiation
 	// is now enabled by default on the Moby client (it used to require an
@@ -120,6 +139,7 @@ func main() {
 		Docker:            cli,
 		VolumeBrowser:     volumepkg.NewDockerBrowser(cli, ""),
 		AllowVolumeWrites: cfg.AllowVolumeWrites,
+		EncryptionEnabled: cipher.Enabled(),
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
