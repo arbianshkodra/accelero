@@ -138,4 +138,5 @@ const (
 	AuditOpVolumeBrowse       = "volume.browse"
 	AuditOpVolumeRead         = "volume.read"
 	AuditOpVolumeWrite        = "volume.write"
+	AuditOpAdminEncrypt       = "admin.encrypt-existing"
 )

@@ -114,6 +114,7 @@ Optional:
 - `STATUS_CLEANUP_INTERVAL`: Deployment record cleanup interval (default: 1h) — shared with audit cleanup
 - `STATUS_MAX_AGE`: Max deployment record age (default: 24h)
 - `AUDIT_MAX_AGE`: Max audit entry age before cleanup (default: 90 days). Set to `0` to disable retention (useful for compliance contexts that require indefinite retention)
+- `ACCELERO_ENCRYPTION_KEY`: Base64-encoded 32-byte master key. When set, `repo_token` and `docker_password` are encrypted at rest in SQLite with AES-256-GCM (versioned ciphertext format `v1:<nonce>:<ct>`). Legacy plaintext rows are read transparently; migrate them via `POST /api/v1/admin/encrypt-existing`. Unset = plaintext (dev default, logged as a warning).
 
 Legacy (backward-compatible, auto-creates "default" stack):
 - `REPO_URL`, `REPO_USERNAME`, `REPO_TOKEN`, `REPO_BRANCH`, `COMPOSE_PATH`
@@ -154,6 +155,9 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `POST /api/v1/volumes/{name}/files?path=<p>&mode=<oct>` — write file bytes into a managed volume (emergency patch affordance). Gated behind `ALLOW_VOLUME_WRITES=true`; 403 otherwise. 10MB body cap, parent dirs auto-created, `..` rejected. Audited as `volume.write`.
 - `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
 - All three accept `?stack=<name>` to narrow to one stack.
+
+**Admin:**
+- `POST /api/v1/admin/encrypt-existing` — one-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still in pre-encryption plaintext. Requires `ACCELERO_ENCRYPTION_KEY`; returns 400 when encryption is disabled. Idempotent (second call returns `stacks_migrated: 0`). Audited as `admin.encrypt-existing`.
 
 **Audit log (append-only):**
 - `GET /api/v1/audit` — filters: stack (id or name), actor, operation, since (Go duration), limit (≤1000). Newest first. Immutable at the store layer — no write/update/delete path.
@@ -196,6 +200,8 @@ Legacy (backward-compatible, auto-creates "default" stack):
 
 ### Testing Strategy
 
-- `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer
+- `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer; also covers the `/admin/encrypt-existing` endpoint (disabled-state 400, happy path, idempotency)
 - `service/service_test.go`: Tests ParseDuration and EnvVars unmarshaling
 - `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName
+- `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`
+- `store/sqlite_test.go`: `TestEncryption_*` verifies DB columns actually hold `v1:` ciphertext (raw SQL) and that legacy plaintext rows stay readable after attaching a cipher
