@@ -810,6 +810,8 @@ Runs the same drift check as `/drift` and translates each drift item into the ac
 
 Legacy endpoint for backward compatibility. Triggers a deployment for the stack specified in the payload, or the "default" stack if none is specified.
 
+**Authentication.** By default `/webhook` requires an API key (`X-API-KEY` header). When `WEBHOOK_SECRET` is set on the server, the API-key check is **replaced** by HMAC-SHA256 signature verification — callers sign the raw body and pass the hex digest as `X-Hub-Signature-256: sha256=<hex>` (the GitHub webhook format; Gitea, Gogs, and most CI systems emit the same header). This lets external senders authenticate without knowing the API key. Rejected signatures return `401` with `{"error":"invalid webhook signature"}` and bump `accelero_webhook_signature_rejected_total`. `POST /api/v1/webhook` always requires the API key regardless.
+
 **Request body:**
 ```json
 {"stack": "my-app"}
@@ -817,7 +819,20 @@ Legacy endpoint for backward compatibility. Triggers a deployment for the stack 
 
 If `stack` is omitted, Accelero looks for a stack named "default", then falls back to the first available stack.
 
+**Signing example (GitHub-compatible):**
+
+```bash
+BODY='{"stack":"default"}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')"
+curl -X POST https://accelero.example.com/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -d "$BODY"
+```
+
 **Response:** `202 Accepted`
+
+**Errors:** `401` on missing/malformed `X-Hub-Signature-256` or HMAC mismatch; `413` if the request body exceeds 1 MiB (signature verification requires buffering the whole body).
 
 ---
 
