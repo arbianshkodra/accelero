@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -28,6 +29,10 @@ type mockStore struct {
 	// becoming ciphertext.
 	plaintextStackIDs map[string]bool
 	updateCalls       []string
+
+	// secrets is keyed by (stack_id, name). Separate from the stacks
+	// slice so tests can seed both independently.
+	secrets map[string]map[string]*store.StackSecret
 }
 
 // newHandler wires a Handler with the three test doubles we need. Kept
@@ -85,6 +90,55 @@ func (m *mockStore) ListAuditEntries(_ store.AuditFilter) ([]*store.AuditEntry, 
 	return m.auditEntries, nil
 }
 func (m *mockStore) CleanupOldAuditEntries(_ time.Duration) (int, error) { return 0, nil }
+
+// --- Per-stack secrets ---
+
+func (m *mockStore) UpsertStackSecret(s *store.StackSecret) error {
+	if m.secrets == nil {
+		m.secrets = map[string]map[string]*store.StackSecret{}
+	}
+	if _, ok := m.secrets[s.StackID]; !ok {
+		m.secrets[s.StackID] = map[string]*store.StackSecret{}
+	}
+	now := time.Now()
+	if existing, ok := m.secrets[s.StackID][s.Name]; ok {
+		// Preserve CreatedAt on update — matches the real store.
+		s.CreatedAt = existing.CreatedAt
+	} else {
+		s.CreatedAt = now
+	}
+	s.UpdatedAt = now
+	m.secrets[s.StackID][s.Name] = &store.StackSecret{
+		StackID:   s.StackID,
+		Name:      s.Name,
+		Value:     s.Value,
+		CreatedAt: s.CreatedAt,
+		UpdatedAt: s.UpdatedAt,
+	}
+	return nil
+}
+
+func (m *mockStore) ListStackSecrets(stackID string) ([]*store.StackSecret, error) {
+	bucket := m.secrets[stackID]
+	out := make([]*store.StackSecret, 0, len(bucket))
+	for _, s := range bucket {
+		out = append(out, s)
+	}
+	// Match the real store's ORDER BY name ASC so handler tests can
+	// assert deterministic responses.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *mockStore) DeleteStackSecret(stackID, name string) (bool, error) {
+	bucket := m.secrets[stackID]
+	if _, ok := bucket[name]; !ok {
+		return false, nil
+	}
+	delete(bucket, name)
+	return true, nil
+}
+
 func (m *mockStore) ListStacksNeedingEncryption() ([]string, error) {
 	ids := make([]string, 0, len(m.plaintextStackIDs))
 	for id := range m.plaintextStackIDs {
@@ -776,4 +830,186 @@ func TestEncryptExistingStacks_Idempotent(t *testing.T) {
 	got := rec.entries[0]
 	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
 	assert.Equal(t, "0", got.Metadata["stacks_migrated"])
+}
+
+// ---------------------------------------------------------------------------
+// Per-stack secrets
+// ---------------------------------------------------------------------------
+
+// secretsRouter builds a minimal handler + router pre-seeded with a
+// stack so the secret-endpoint tests below can focus on their own
+// assertions rather than setup boilerplate.
+func secretsRouter(t *testing.T) (*Handler, *mockStore, *captureRecorder, *mux.Router) {
+	t.Helper()
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "app", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	return h, ms, rec, router
+}
+
+func postSecret(t *testing.T, router http.Handler, stack, name, value string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"name": name, "value": value})
+	req := httptest.NewRequest("POST", "/api/v1/stacks/"+stack+"/secrets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestSetStackSecret_FirstWriteReturns201(t *testing.T) {
+	_, ms, rec, router := secretsRouter(t)
+
+	rr := postSecret(t, router, "app", "DATABASE_URL", "postgres://a")
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "DATABASE_URL", body["name"])
+	assert.Equal(t, true, body["created"])
+
+	// Store has the row with plaintext value (encryption is a store
+	// concern; the mock doesn't simulate it).
+	secs, _ := ms.ListStackSecrets("s1")
+	require.Len(t, secs, 1)
+	assert.Equal(t, "postgres://a", secs[0].Value)
+
+	// Audit row carries the name only, never the value.
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOpStackSecretSet, got.Operation)
+	assert.Equal(t, "DATABASE_URL", got.ResourceID)
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+	assert.Equal(t, "false", got.Metadata["rewrote_existing"])
+	for _, v := range got.Metadata {
+		assert.NotContains(t, v, "postgres://a", "value must never appear in audit metadata")
+	}
+}
+
+func TestSetStackSecret_RewriteReturns200(t *testing.T) {
+	// Setting the same key twice is the "rotate" flow — upsert rather
+	// than 409. Status code flips from 201 (first) to 200 (update)
+	// so clients can tell the difference; audit metadata records it
+	// too.
+	_, _, rec, router := secretsRouter(t)
+
+	require.Equal(t, http.StatusCreated, postSecret(t, router, "app", "K", "v1").Code)
+
+	rr := postSecret(t, router, "app", "K", "v2")
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, false, body["created"])
+
+	require.Len(t, rec.entries, 2)
+	assert.Equal(t, "true", rec.entries[1].Metadata["rewrote_existing"])
+}
+
+func TestSetStackSecret_RejectsInvalidNames(t *testing.T) {
+	// Enforce the env-var regex at the API boundary. This matters
+	// because secrets are going to be materialised into container env
+	// vars at deploy time — accepting "lower" or "with-dash" now would
+	// surface as a confusing deploy error later.
+	_, _, _, router := secretsRouter(t)
+
+	cases := []string{
+		"lowercase",    // not uppercase
+		"MIXEDCase",    // not uppercase
+		"9LEADING",     // leading digit
+		"WITH-DASH",    // dash not allowed
+		"SPACE CHAR",   // space not allowed
+		"",             // empty
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			rr := postSecret(t, router, "app", name, "v")
+			assert.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+		})
+	}
+}
+
+func TestSetStackSecret_RejectsEmptyValue(t *testing.T) {
+	// Empty value is ambiguous — route the caller to DELETE explicitly.
+	_, _, _, router := secretsRouter(t)
+	rr := postSecret(t, router, "app", "K", "")
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "DELETE")
+}
+
+func TestSetStackSecret_UnknownStack404(t *testing.T) {
+	_, _, _, router := secretsRouter(t)
+	rr := postSecret(t, router, "does-not-exist", "K", "v")
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestListStackSecrets_ValuesRedacted(t *testing.T) {
+	// The whole point of this endpoint: values never leave the process
+	// via the API. If a future JSON refactor accidentally exposes them,
+	// this test fails.
+	_, ms, _, router := secretsRouter(t)
+
+	require.NoError(t, ms.UpsertStackSecret(&store.StackSecret{StackID: "s1", Name: "DATABASE_URL", Value: "postgres://SUPER_SECRET"}))
+	require.NoError(t, ms.UpsertStackSecret(&store.StackSecret{StackID: "s1", Name: "API_KEY", Value: "KEY_SUPER_SECRET"}))
+
+	req := httptest.NewRequest("GET", "/api/v1/stacks/app/secrets", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	body := rr.Body.String()
+	assert.NotContains(t, body, "SUPER_SECRET", "values must never appear in list response")
+	assert.NotContains(t, body, "KEY_SUPER_SECRET")
+
+	var got []map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2)
+	// Deterministic order: ASC by name.
+	assert.Equal(t, "API_KEY", got[0]["name"])
+	assert.Equal(t, "DATABASE_URL", got[1]["name"])
+	// No "value" key in the JSON at all.
+	_, hasValue := got[0]["value"]
+	assert.False(t, hasValue, "no value field in list response")
+}
+
+func TestDeleteStackSecret_Success(t *testing.T) {
+	_, ms, rec, router := secretsRouter(t)
+	require.NoError(t, ms.UpsertStackSecret(&store.StackSecret{StackID: "s1", Name: "K", Value: "v"}))
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/app/secrets/K", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusNoContent, rr.Code)
+
+	list, _ := ms.ListStackSecrets("s1")
+	assert.Empty(t, list)
+
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOpStackSecretDelete, got.Operation)
+	assert.Equal(t, "K", got.ResourceID)
+	assert.Equal(t, store.AuditOutcomeSuccess, got.Outcome)
+}
+
+func TestDeleteStackSecret_Missing404AndAuditedAsFailure(t *testing.T) {
+	// The audit trail must record "someone tried to delete X" even
+	// when X was already gone — that's a useful signal during an
+	// incident (e.g. scripted cleanup running twice).
+	_, _, rec, router := secretsRouter(t)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/app/secrets/NOPE", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOutcomeFailure, got.Outcome)
+	assert.Equal(t, "not found", got.ErrorMessage)
 }
