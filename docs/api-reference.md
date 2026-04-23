@@ -334,6 +334,7 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `deploy.complete` / `deploy.failed` / `deploy.rolled_back` | `system:deployer` | Emitted at deployer-finish time. Metadata: `trigger`, `duration_seconds`, `changes` (on success), `git_commit`. |
 | `drift.detected` | `system:reconciler` | One per reconcile cycle with drift (not per drift item — kept compact). Metadata: `drift_count`, per-type counts (`drift_type_missing`, `drift_type_image_mismatch`, etc.). |
 | `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
+| `admin.encrypt-existing` | `api-key` | Re-saves pre-encryption plaintext rows through the cipher. Metadata: `stacks_migrated`, `stacks_failed`. Outcome is `failure` if any row failed. |
 
 **Retention.** Entries older than `AUDIT_MAX_AGE` (default 90 days) are pruned on the same cadence as the deployment-history cleanup (`STATUS_CLEANUP_INTERVAL`, default hourly). Set `AUDIT_MAX_AGE=0` to disable retention — useful when a compliance regime requires indefinite preservation.
 
@@ -817,6 +818,56 @@ Legacy endpoint for backward compatibility. Triggers a deployment for the stack 
 If `stack` is omitted, Accelero looks for a stack named "default", then falls back to the first available stack.
 
 **Response:** `202 Accepted`
+
+---
+
+## Admin
+
+### Encrypt Existing Stack Secrets
+`POST /api/v1/admin/encrypt-existing`
+
+One-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still stored as pre-encryption plaintext. New stacks are encrypted on write automatically whenever `ACCELERO_ENCRYPTION_KEY` is set; this endpoint exists for upgrades from versions that stored those fields in plaintext.
+
+**Requires `ACCELERO_ENCRYPTION_KEY`.** Without a master key the re-save would be a no-op and the endpoint returns `400` instead of silently doing nothing.
+
+**Idempotent.** Rows already stored as ciphertext (prefix `v1:`) are skipped; running the call a second time returns `stacks_migrated: 0`.
+
+**Response:** `200 OK`
+```json
+{
+  "status": "ok",
+  "stacks_migrated": 2
+}
+```
+
+If any row fails to migrate (e.g. transient store error), the failed IDs are returned and the audit entry's outcome is `failure`:
+```json
+{
+  "status": "ok",
+  "stacks_migrated": 1,
+  "stacks_failed": ["4bdf...e83"]
+}
+```
+
+**Errors:** `400 Bad Request` when the server has no encryption key attached.
+
+Audited as `admin.encrypt-existing` with `stacks_migrated` and `stacks_failed` counts in metadata.
+
+---
+
+### At-rest encryption — how it works
+
+When `ACCELERO_ENCRYPTION_KEY` is set (a base64-encoded 32-byte key — generate one with `openssl rand -base64 32`), Accelero transparently encrypts `repo_token` and `docker_password` before writing to SQLite and decrypts them when scanning back. The scheme is AES-256-GCM with a random 12-byte nonce per write and a versioned ciphertext format:
+
+```
+v1:<base64-nonce>:<base64-ciphertext>
+```
+
+The `v1:` prefix is the only flag we look at to decide whether a stored value is encrypted; anything else is treated as legacy plaintext and passed through to the caller. This makes rolling upgrades safe: stop the server, set the key, start, call `/admin/encrypt-existing`.
+
+**Fail-closed.** Reading a `v1:` row on a server that has no key attached returns an error rather than handing back the raw ciphertext. Restart with the key, or recover from a backup that predates the encryption.
+
+**Key rotation is not yet automatic.** See the [roadmap](https://github.com/arbianshkodra/accelero/blob/main/ROADMAP.md#phase-4--security--multi-tenancy).
 
 ---
 

@@ -34,6 +34,14 @@ Accelero is configured through environment variables. Only `API_KEY` is required
 
 Docker resource cleanup (stopped containers, dangling images, unused volumes/networks) runs every 24 hours, scoped to resources labeled `managed-by=accelero`.
 
+## At-rest encryption
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ACCELERO_ENCRYPTION_KEY` | *(unset — encryption disabled)* | Base64-encoded 32-byte master key. When set, `repo_token` and `docker_password` are encrypted before being written to SQLite (AES-256-GCM) and decrypted on read. Generate with `openssl rand -base64 32`. |
+
+Without a key, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
+
 ## Legacy Single-Stack Variables
 
 These variables are supported for backward compatibility. If set, Accelero creates a "default" stack from them on first startup. For new deployments, use the REST API to create stacks instead.
