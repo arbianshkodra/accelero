@@ -165,7 +165,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 
 **Transport & network security:**
 - [ ] Native TLS support (cert files or Let's Encrypt)
-- [ ] Rate limiting on API endpoints (token bucket, per-key)
+- [x] Rate limiting on API endpoints — per-API-key token bucket, applied after authentication. Configurable via `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST`; disabled by default. Rejected requests are 429 with `Retry-After` + JSON body, counted in `accelero_rate_limited_requests_total` by route template.
 - [ ] CSRF protection for session-based UI
 - [ ] Content Security Policy headers
 
