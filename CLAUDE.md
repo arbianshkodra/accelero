@@ -115,6 +115,8 @@ Optional:
 - `STATUS_MAX_AGE`: Max deployment record age (default: 24h)
 - `AUDIT_MAX_AGE`: Max audit entry age before cleanup (default: 90 days). Set to `0` to disable retention (useful for compliance contexts that require indefinite retention)
 - `ACCELERO_ENCRYPTION_KEY`: Base64-encoded 32-byte master key. When set, `repo_token` and `docker_password` are encrypted at rest in SQLite with AES-256-GCM (versioned ciphertext format `v1:<nonce>:<ct>`). Legacy plaintext rows are read transparently; migrate them via `POST /api/v1/admin/encrypt-existing`. Unset = plaintext (dev default, logged as a warning).
+- `RATE_LIMIT_RPS`: Sustained refill rate (tokens/second) for the per-API-key token bucket. Default `0` disables rate limiting entirely. Set to e.g. `10` to allow 10 req/s with the burst below.
+- `RATE_LIMIT_BURST`: Bucket capacity — how many requests a quiescent caller can send at once before throttling kicks in. Defaults to `max(2*RATE_LIMIT_RPS, 10)` when RPS is set but burst isn't. Ignored when `RATE_LIMIT_RPS<=0`.
 
 Legacy (backward-compatible, auto-creates "default" stack):
 - `REPO_URL`, `REPO_USERNAME`, `REPO_TOKEN`, `REPO_BRANCH`, `COMPOSE_PATH`
@@ -205,3 +207,4 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName
 - `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`
 - `store/sqlite_test.go`: `TestEncryption_*` verifies DB columns actually hold `v1:` ciphertext (raw SQL) and that legacy plaintext rows stay readable after attaching a cipher
+- `middleware/ratelimit_test.go`: disabled → identity middleware; burst-then-block with 429 + `Retry-After`; per-key isolation; refill over time (via injected clock); missing API key passes through
