@@ -53,9 +53,12 @@ The rejection is counted in the `accelero_rate_limited_requests_total` Prometheu
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ACCELERO_ENCRYPTION_KEY` | *(unset — encryption disabled)* | Base64-encoded 32-byte master key. When set, `repo_token` and `docker_password` are encrypted before being written to SQLite (AES-256-GCM) and decrypted on read. Generate with `openssl rand -base64 32`. |
+| `ACCELERO_ENCRYPTION_KEY` | *(unset — encryption disabled)* | Base64-encoded 32-byte master key, **inline**. When set, `repo_token` and `docker_password` are encrypted before being written to SQLite (AES-256-GCM) and decrypted on read. Generate with `openssl rand -base64 32`. |
+| `ACCELERO_ENCRYPTION_KEY_FILE` | *(unset)* | **Path** to a file whose contents are the base64-encoded 32-byte key. Preferred in production — env vars leak through `docker inspect`, `ps`, systemd unit files, and shell history, while a file mounted as a Docker/K8s secret doesn't. Trailing whitespace/newlines are trimmed. Empty file = startup error (likely a broken secret mount). |
 
-Without a key, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
+Setting both variables is a fatal configuration error — the two sources are mutually exclusive so a key rotation via the file can't silently be ignored.
+
+Without either, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
 
 ## Legacy Single-Stack Variables
 

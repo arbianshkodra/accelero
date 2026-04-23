@@ -857,7 +857,7 @@ Audited as `admin.encrypt-existing` with `stacks_migrated` and `stacks_failed` c
 
 ### At-rest encryption — how it works
 
-When `ACCELERO_ENCRYPTION_KEY` is set (a base64-encoded 32-byte key — generate one with `openssl rand -base64 32`), Accelero transparently encrypts `repo_token` and `docker_password` before writing to SQLite and decrypts them when scanning back. The scheme is AES-256-GCM with a random 12-byte nonce per write and a versioned ciphertext format:
+When a master key is configured — either inline via `ACCELERO_ENCRYPTION_KEY` (base64-encoded 32 bytes) or as a file path via `ACCELERO_ENCRYPTION_KEY_FILE` (contents = same base64) — Accelero transparently encrypts `repo_token` and `docker_password` before writing to SQLite and decrypts them when scanning back. Generate a key with `openssl rand -base64 32`. Prefer the file source in production; env vars leak through `docker inspect`, `ps`, systemd unit files, and shell history, while a file mounted as a Docker/K8s secret does not. Setting both sources is a fatal configuration error. The scheme is AES-256-GCM with a random 12-byte nonce per write and a versioned ciphertext format:
 
 ```
 v1:<base64-nonce>:<base64-ciphertext>
