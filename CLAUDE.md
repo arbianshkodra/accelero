@@ -118,6 +118,7 @@ Optional:
 - `ACCELERO_ENCRYPTION_KEY_FILE`: Path to a file containing the base64-encoded 32-byte key. Preferred over the inline env var in production — env vars leak through `docker inspect`, `ps`, systemd unit files, and shell history; a file mounted as a Docker/K8s secret doesn't. Trailing whitespace/newlines are trimmed. Empty file = fatal error (likely a broken secret mount, not a deliberate "disable"). Setting both this and `ACCELERO_ENCRYPTION_KEY` is a fatal configuration error.
 - `RATE_LIMIT_RPS`: Sustained refill rate (tokens/second) for the per-API-key token bucket. Default `0` disables rate limiting entirely. Set to e.g. `10` to allow 10 req/s with the burst below.
 - `RATE_LIMIT_BURST`: Bucket capacity — how many requests a quiescent caller can send at once before throttling kicks in. Defaults to `max(2*RATE_LIMIT_RPS, 10)` when RPS is set but burst isn't. Ignored when `RATE_LIMIT_RPS<=0`.
+- `WEBHOOK_SECRET`: Shared HMAC-SHA256 secret for the legacy `POST /webhook` endpoint. When set, callers must sign the raw request body and send the hex digest as `X-Hub-Signature-256: sha256=<hex>` (GitHub webhook format). Replaces the API-key check on `/webhook` only; `POST /api/v1/webhook` still requires an API key. Unset = legacy API-key behavior.
 
 Legacy (backward-compatible, auto-creates "default" stack):
 - `REPO_URL`, `REPO_USERNAME`, `REPO_TOKEN`, `REPO_BRANCH`, `COMPOSE_PATH`
@@ -209,3 +210,4 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`
 - `store/sqlite_test.go`: `TestEncryption_*` verifies DB columns actually hold `v1:` ciphertext (raw SQL) and that legacy plaintext rows stay readable after attaching a cipher
 - `middleware/ratelimit_test.go`: disabled → identity middleware; burst-then-block with 429 + `Retry-After`; per-key isolation; refill over time (via injected clock); missing API key passes through
+- `middleware/webhook_signature_test.go`: empty secret → identity middleware; valid HMAC passes and body is restored for the handler; missing/malformed/wrong-algo/wrong-length/tampered/wrong-secret all 401; empty body with empty-body signature passes; oversized body returns 413

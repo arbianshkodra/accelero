@@ -49,6 +49,23 @@ When a caller exhausts their bucket, Accelero responds with `429 Too Many Reques
 
 The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
 
+## Webhook signature verification
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBHOOK_SECRET` | *(unset — API-key auth on `/webhook`)* | Shared HMAC-SHA256 secret for the root-level `POST /webhook` endpoint. When set, callers must sign the raw request body and pass the hex digest as `X-Hub-Signature-256: sha256=<hex>` — the GitHub webhook format. Replaces the API-key check for `/webhook` so external senders (GitHub, Gitea, Gogs, CI) can authenticate without smuggling the API key into their webhook config. |
+
+`POST /api/v1/webhook` still requires the API key regardless — that route stays a private operator surface. Rejected signatures bump `accelero_webhook_signature_rejected_total{reason}` and return `401 Unauthorized` with a generic `{"error":"invalid webhook signature"}` body (no reason detail leaks to the caller). The middleware caps request bodies at 1 MiB; larger bodies return `413 Request Entity Too Large`.
+
+**Known limitation:** HMAC alone does not prevent replay. An attacker who captures a valid webhook payload can re-POST it later. Replay protection (timestamp in body + window check, or nonce tracking) is left to the caller or an upstream proxy for now.
+
+Compute a signature with `openssl`:
+
+```bash
+BODY='{"stack":"default"}'
+printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET"
+```
+
 ## At-rest encryption
 
 | Variable | Default | Description |
