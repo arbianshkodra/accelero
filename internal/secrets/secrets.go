@@ -16,12 +16,18 @@
 //     later. Storing as text means we don't have to modify column types
 //     in the schema.
 //
-//   - Master key sources: env var ACCELERO_ENCRYPTION_KEY, base64-
-//     encoded 32 bytes. Absent → store falls back to plaintext reads
-//     and writes, with a loud warning at startup (see cmd/main.go).
-//     This keeps existing deployments working through an upgrade while
-//     telling the operator they aren't getting encryption until they
-//     set the key.
+//   - Master key sources, in precedence order:
+//       1. ACCELERO_ENCRYPTION_KEY_FILE — path to a file containing
+//          the base64-encoded 32-byte key. Preferred in production:
+//          env vars leak through `docker inspect`, process listings,
+//          systemd unit files, and shell history; a file mounted as a
+//          Docker/K8s secret does not.
+//       2. ACCELERO_ENCRYPTION_KEY — the base64 key inline. Fine for
+//          local development.
+//     Setting both is a configuration error (ambiguous). Setting
+//     neither disables encryption — existing deployments keep working
+//     through an upgrade but get a loud warning at startup telling
+//     the operator they aren't getting encryption until they set a key.
 //
 //   - Future key rotation is handled by the v1 prefix: v2 ciphertext
 //     can be produced by a newer cipher, and the decrypt path picks
@@ -40,10 +46,13 @@ import (
 	"strings"
 )
 
-// envKeyName is the environment variable the master key is read from.
-// Exposed so cmd/main.go can reference it from startup logs and the
-// deprecation warning stays in sync with the docs.
-const envKeyName = "ACCELERO_ENCRYPTION_KEY"
+// envKeyName / envKeyFileName are the two places we look for the master
+// key. Exposed so cmd/main.go can keep startup log messages in sync
+// with the docs. File source wins over inline source; see LoadCipherFromEnv.
+const (
+	envKeyName     = "ACCELERO_ENCRYPTION_KEY"
+	envKeyFileName = "ACCELERO_ENCRYPTION_KEY_FILE"
+)
 
 // CipherVersionV1 is the only format version currently emitted or
 // accepted. Bump (and implement the new branch in Decrypt) when a
@@ -92,19 +101,63 @@ func NewCipher(key []byte) (*Cipher, error) {
 	return &Cipher{aead: aead}, nil
 }
 
-// LoadCipherFromEnv reads ACCELERO_ENCRYPTION_KEY (base64-encoded 32
-// bytes) and returns a Cipher, or (nil, nil) if the variable is
-// unset — matches NewCipher's "encryption disabled" signal. A set-but-
-// malformed key is a startup error: the operator asked for encryption
-// and we should fail loudly rather than silently fall back to plaintext.
+// LoadCipherFromEnv builds a Cipher from the environment. Precedence:
+//
+//   - Both ACCELERO_ENCRYPTION_KEY and ACCELERO_ENCRYPTION_KEY_FILE set:
+//     error — the configuration is ambiguous and the operator should
+//     pick one.
+//   - Only ACCELERO_ENCRYPTION_KEY_FILE set: read that file, trim
+//     whitespace, base64-decode. Empty file or unreadable path is an
+//     error (the operator intended to provide a key and didn't).
+//   - Only ACCELERO_ENCRYPTION_KEY set: base64-decode the inline value.
+//   - Neither set: (nil, nil) — matches NewCipher's "encryption
+//     disabled" signal.
+//
+// Any set-but-malformed value is a startup error rather than a silent
+// fallback to plaintext: the operator asked for encryption and we
+// should fail loudly.
 func LoadCipherFromEnv() (*Cipher, error) {
-	raw := strings.TrimSpace(os.Getenv(envKeyName))
-	if raw == "" {
+	inline := strings.TrimSpace(os.Getenv(envKeyName))
+	filePath := strings.TrimSpace(os.Getenv(envKeyFileName))
+
+	if inline != "" && filePath != "" {
+		return nil, fmt.Errorf("set only one of %s or %s, not both", envKeyName, envKeyFileName)
+	}
+
+	if filePath != "" {
+		return loadCipherFromFile(filePath)
+	}
+
+	if inline == "" {
 		return nil, nil
+	}
+
+	key, err := base64.StdEncoding.DecodeString(inline)
+	if err != nil {
+		return nil, fmt.Errorf("%s: base64 decode: %w", envKeyName, err)
+	}
+	return NewCipher(key)
+}
+
+// loadCipherFromFile reads the key from the path given by
+// ACCELERO_ENCRYPTION_KEY_FILE. File content is trimmed of surrounding
+// whitespace so that common producers (Docker secrets, `echo "..." >
+// /path`, K8s projected volumes with trailing newlines) work without
+// the operator having to fight quoting. An empty file is an error
+// rather than "disabled": the operator pointed us at a file, so a
+// missing value means the mount is broken, not that encryption is off.
+func loadCipherFromFile(path string) (*Cipher, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s=%q: %w", envKeyFileName, path, err)
+	}
+	raw := strings.TrimSpace(string(data))
+	if raw == "" {
+		return nil, fmt.Errorf("%s=%q: file is empty (expected base64-encoded 32-byte key)", envKeyFileName, path)
 	}
 	key, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%s: base64 decode: %w", envKeyName, err)
+		return nil, fmt.Errorf("%s=%q: base64 decode: %w", envKeyFileName, path, err)
 	}
 	return NewCipher(key)
 }

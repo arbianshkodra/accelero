@@ -62,10 +62,14 @@ func main() {
 	}
 	if cipher.Enabled() {
 		db.SetCipher(cipher)
-		logrus.Info("At-rest encryption enabled (ACCELERO_ENCRYPTION_KEY set)")
+		source := "ACCELERO_ENCRYPTION_KEY"
+		if os.Getenv("ACCELERO_ENCRYPTION_KEY_FILE") != "" {
+			source = "ACCELERO_ENCRYPTION_KEY_FILE"
+		}
+		logrus.Infof("At-rest encryption enabled (%s)", source)
 	} else {
 		logrus.Warn("At-rest encryption DISABLED — repo tokens and Docker passwords stored as plaintext. " +
-			"Set ACCELERO_ENCRYPTION_KEY (base64-encoded 32 bytes) to enable. " +
+			"Set ACCELERO_ENCRYPTION_KEY (base64 inline) or ACCELERO_ENCRYPTION_KEY_FILE (path to base64 file) to enable. " +
 			"Generate one with: openssl rand -base64 32")
 	}
 
