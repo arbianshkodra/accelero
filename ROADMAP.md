@@ -172,7 +172,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 
 **Registry management:**
 - [ ] Multi-registry support with encrypted credentials at rest
-- [ ] Registry-specific webhook signature verification (Docker Hub, GHCR, Harbor, generic HMAC)
+- [x] Generic HMAC-SHA256 webhook signature verification via `WEBHOOK_SECRET` and `X-Hub-Signature-256` (GitHub / Gitea / Gogs / CI format). Replaces the API-key check on `/webhook` so external senders can authenticate without smuggling the API key; rejections bump `accelero_webhook_signature_rejected_total`; body capped at 1 MiB. Registry-specific wire formats (Docker Hub, Harbor, ECR) are still open.
 - [ ] ECR/GCR/ACR IAM-based authentication
 - [ ] Browse registry tags (for UI dropdown / approval workflows)
 
