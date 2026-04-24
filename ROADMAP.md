@@ -142,9 +142,9 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 - [x] Online migration path from existing plaintext rows — `POST /api/v1/admin/encrypt-existing` re-saves any row still in plaintext so the cipher kicks in on write. Idempotent; 400 if the server has no key attached.
 
 **Per-stack secrets API:**
-- [ ] `POST /api/v1/stacks/{id}/secrets` — submit secret key/value pairs encrypted at rest; listed via the API without exposing values (write-only fields).
+- [x] `POST/GET/DELETE /api/v1/stacks/{id}/secrets` — upsert / list (names + timestamps only; values redacted) / delete. Name matches POSIX env-var grammar (`[A-Z_][A-Z0-9_]*`). Values encrypted at rest via the existing cipher; raw DB column holds `v1:<nonce>:<ct>`. Secrets cascade-delete with their parent stack.
 - [ ] Secrets injected into containers at deploy time via a host-side `env_file:` that Accelero materialises under `/run/accelero/<stack>/secrets.env` (tmpfs, short-lived, readable only by the managed container).
-- [ ] Audit log entry for every secret create/update/delete, with the actor and the key name (never the value).
+- [x] Audit log entry for every secret set/delete, with the actor and the key name (never the value). Delete-missing is audited as a failure so the trail captures attempted cleanup.
 
 **External secret backends:**
 - [ ] HashiCorp Vault (KV v2 + dynamic secrets) — short-lived token or AppRole auth.
