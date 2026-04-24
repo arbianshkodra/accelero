@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -174,6 +175,13 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/deployments", h.ListDeployments).Methods("GET")
 	api.HandleFunc("/stacks/{id}/drift", h.CheckDrift).Methods("GET")
 	api.HandleFunc("/stacks/{id}/preview", h.PreviewDeploy).Methods("POST")
+
+	// Per-stack secrets — encrypted at rest via the existing cipher.
+	// List returns names/timestamps only; values never leave via the
+	// API (they're injected into containers at deploy time, follow-up PR).
+	api.HandleFunc("/stacks/{id}/secrets", h.SetStackSecret).Methods("POST")
+	api.HandleFunc("/stacks/{id}/secrets", h.ListStackSecrets).Methods("GET")
+	api.HandleFunc("/stacks/{id}/secrets/{name}", h.DeleteStackSecret).Methods("DELETE")
 
 	// Read-only container introspection (Phase 3).
 	api.HandleFunc("/stacks/{id}/containers", h.ListStackContainers).Methods("GET")
@@ -730,6 +738,183 @@ func (h *Handler) EncryptExistingStacks(w http.ResponseWriter, r *http.Request) 
 		body["stacks_failed"] = failed
 	}
 	writeJSON(w, body, http.StatusOK)
+}
+
+// --------------------------------------------------------------------------
+// Per-stack secrets
+// --------------------------------------------------------------------------
+
+// secretNameRe matches legal POSIX-style environment-variable names.
+// Secrets get materialised into container env vars at deploy time, so
+// we enforce the constraint at the store boundary rather than at the
+// deploy path — fail fast, and make the API predictable.
+var secretNameRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+
+const (
+	maxSecretNameLen  = 128
+	maxSecretValueLen = 64 * 1024 // 64 KiB — comfortably larger than a PEM
+)
+
+// SetStackSecret accepts {"name": "...", "value": "..."} and upserts a
+// per-stack secret. 201 on first write of a key, 200 on rewrite, 400 on
+// a name that doesn't match [A-Z_][A-Z0-9_]* or exceeds the length cap.
+// The value is encrypted at rest when a cipher is attached; the audit
+// entry records the name but never the value.
+func (h *Handler) SetStackSecret(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+
+	var input struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if input.Name == "" {
+		writeError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if len(input.Name) > maxSecretNameLen {
+		writeError(w, fmt.Sprintf("name exceeds %d characters", maxSecretNameLen), http.StatusBadRequest)
+		return
+	}
+	if !secretNameRe.MatchString(input.Name) {
+		writeError(w, "name must match [A-Z_][A-Z0-9_]* (uppercase letters, digits, underscores; no leading digit)", http.StatusBadRequest)
+		return
+	}
+	if input.Value == "" {
+		// Storing "" is ambiguous — the operator probably meant to
+		// delete. Route them to DELETE explicitly instead of
+		// silently dropping the row.
+		writeError(w, "value must not be empty; use DELETE to remove a secret", http.StatusBadRequest)
+		return
+	}
+	if len(input.Value) > maxSecretValueLen {
+		writeError(w, fmt.Sprintf("value exceeds %d bytes", maxSecretValueLen), http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Detect first-write vs rewrite so the response code is informative
+	// (201 vs 200). Cheap: we already have the stack ID and the store
+	// query is indexed on (stack_id, name).
+	existing, err := h.Store.ListStackSecrets(stack.ID)
+	if err != nil {
+		writeError(w, "failed to read stack secrets", http.StatusInternalServerError)
+		return
+	}
+	wasPresent := false
+	for _, s := range existing {
+		if s.Name == input.Name {
+			wasPresent = true
+			break
+		}
+	}
+
+	if err := h.Store.UpsertStackSecret(&store.StackSecret{
+		StackID: stack.ID,
+		Name:    input.Name,
+		Value:   input.Value,
+	}); err != nil {
+		writeError(w, "failed to store stack secret", http.StatusInternalServerError)
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpStackSecretSet)
+	entry.ResourceType = "stack_secret"
+	entry.ResourceID = input.Name
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Metadata = map[string]string{"rewrote_existing": strconv.FormatBool(wasPresent)}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	status := http.StatusCreated
+	if wasPresent {
+		status = http.StatusOK
+	}
+	writeJSON(w, map[string]interface{}{
+		"name":    input.Name,
+		"created": !wasPresent,
+	}, status)
+}
+
+// ListStackSecrets returns every secret for a stack with name + timestamps.
+// Values are DELIBERATELY omitted — they leave the process only through
+// the deploy path. Ordering matches the store (ASC by name) so clients
+// can paginate/diff without extra sort logic.
+func (h *Handler) ListStackSecrets(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	secs, err := h.Store.ListStackSecrets(stack.ID)
+	if err != nil {
+		writeError(w, "failed to list stack secrets", http.StatusInternalServerError)
+		return
+	}
+
+	// Map to a response shape that excludes the value. Doing this at
+	// the handler boundary — rather than trusting the `json:"-"` tag
+	// on StackSecret.Value alone — means the guarantee survives a
+	// future JSON-encoding refactor that re-exports the field.
+	type item struct {
+		Name      string    `json:"name"`
+		StackID   string    `json:"stack_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	out := make([]item, 0, len(secs))
+	for _, s := range secs {
+		out = append(out, item{
+			Name:      s.Name,
+			StackID:   s.StackID,
+			CreatedAt: s.CreatedAt,
+			UpdatedAt: s.UpdatedAt,
+		})
+	}
+	writeJSON(w, out, http.StatusOK)
+}
+
+// DeleteStackSecret removes a single secret. 204 on success, 404 when
+// the named secret doesn't exist. Audited regardless of outcome so the
+// trail captures "someone tried to delete X" even if X was already gone.
+func (h *Handler) DeleteStackSecret(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	name := mux.Vars(r)["name"]
+	if name == "" {
+		writeError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	removed, err := h.Store.DeleteStackSecret(stack.ID, name)
+	if err != nil {
+		writeError(w, "failed to delete stack secret", http.StatusInternalServerError)
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpStackSecretDelete)
+	entry.ResourceType = "stack_secret"
+	entry.ResourceID = name
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	if !removed {
+		entry.Outcome = store.AuditOutcomeFailure
+		entry.ErrorMessage = "not found"
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	if !removed {
+		writeError(w, "secret not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ListAuditEntries returns audit rows newest-first. Immutable by design —
