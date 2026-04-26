@@ -191,7 +191,27 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	deployment.Status = store.DeploymentInProgress
 	_ = d.store.UpdateDeployment(deployment)
 
-	deployErr := d.executeDeploy(ctx, stack, deployment)
+	// Snapshot per-stack secrets ONCE, at the start of the deploy.
+	// Every service in this rollout gets the same set; an operator
+	// rotation that happens mid-deploy will be picked up by the next
+	// reconcile cycle as drift, and the followup deploy will apply
+	// the new values.
+	stackSecrets, err := d.store.ListStackSecrets(stack.ID)
+	if err != nil {
+		_ = d.store.UpdateDeployment(deployment)
+		return nil, fmt.Errorf("failed to load stack secrets: %w", err)
+	}
+	secretsHash := store.HashStackSecrets(stackSecrets)
+
+	// "Secrets changed since last successful deploy" forces every
+	// service to recreate its containers, even when the image and
+	// health checks would otherwise let the deployer skip the
+	// rollout. Docker can't update env on a running container; without
+	// this signal, a `POST /secrets` followed by `POST /deploy` would
+	// return 200 but the new values would never reach a container.
+	secretsChanged := secretsHash != stack.SecretsHash
+
+	deployErr := d.executeDeploy(ctx, stack, deployment, stackSecrets, secretsChanged)
 
 	now := time.Now()
 	deployment.CompletedAt = &now
@@ -204,6 +224,13 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	} else {
 		deployment.Status = store.DeploymentCompleted
 		stack.Status = store.StackStatusActive
+		// Only on success: persist the hash of the secret set we
+		// just deployed. The reconciler compares this against the
+		// hash of the *current* secret set on every cycle; a mismatch
+		// means rotation has happened since the last successful
+		// deploy. Failed deploys leave SecretsHash untouched so drift
+		// keeps firing until a deploy actually applies the new set.
+		stack.SecretsHash = secretsHash
 	}
 
 	if err := d.store.UpdateDeployment(deployment); err != nil {
@@ -268,7 +295,7 @@ func deployOpForStatus(status string) string {
 // Core deployment pipeline
 // --------------------------------------------------------------------------
 
-func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deployment *store.Deployment) error {
+func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deployment *store.Deployment, stackSecrets []*store.StackSecret, secretsChanged bool) error {
 	log := logctx.FromContext(ctx)
 
 	// 1. Clone repository (shallow, depth=1) into the stable per-stack dir.
@@ -357,7 +384,7 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 
 		mu := d.lockService(svcName)
 		mu.Lock()
-		deployErr := d.deployService(ctx, stack, svcName, repoDir, svc)
+		deployErr := d.deployService(ctx, stack, svcName, repoDir, svc, stackSecrets, secretsChanged)
 		mu.Unlock()
 
 		if deployErr != nil {
@@ -698,18 +725,17 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 // Service deployment
 // --------------------------------------------------------------------------
 
-func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
+func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService, stackSecrets []*store.StackSecret, secretsChanged bool) error {
 	log := logctx.FromContext(ctx).WithField("service", serviceName)
 
-	// Load per-stack secrets once per service deploy and pass the
-	// decoded values down to every replica create call. A store query
-	// per container would be wasteful and — more importantly — could
-	// return inconsistent values mid-rollout if an operator rotated a
-	// secret between replicas.
-	stackSecrets, err := d.store.ListStackSecrets(stack.ID)
-	if err != nil {
-		return fmt.Errorf("failed to load stack secrets: %w", err)
-	}
+	// stackSecrets is snapshotted once at the top of Deploy and
+	// shared across every service in the rollout, so all replicas
+	// see the same values even if an operator rotates mid-deploy.
+	// (The next reconcile picks up that rotation as drift.)
+	//
+	// secretsChanged: when true, every existing container needs to
+	// be recreated even if the image and health are fine — the only
+	// way to deliver new env values is a fresh ContainerCreate.
 
 	replicas := svc.DesiredReplicas()
 
@@ -744,9 +770,16 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 
 	// Partition existing containers: keep = on target image AND healthy, can
 	// stay; replace = wrong image, stopped, or unhealthy, must be torn down.
+	// When the per-stack secrets changed since last deploy, every container
+	// must be recreated so the new env values land — Docker has no in-place
+	// env update.
 	var keep []container.Summary
 	var replace []container.Summary
 	for _, c := range existing {
+		if secretsChanged {
+			replace = append(replace, c)
+			continue
+		}
 		if c.Image != svc.Image {
 			replace = append(replace, c)
 			continue
