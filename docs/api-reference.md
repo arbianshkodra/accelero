@@ -820,10 +820,24 @@ At deploy time, every secret for the stack is merged into the `Env` slice on eac
 Rotation flow:
 
 1. `POST /api/v1/stacks/{id}/secrets` with the new value (returns 200 on rewrite).
-2. Trigger a deploy (`POST /api/v1/stacks/{id}/deploy`, or wait for the auto-deploy reconcile loop).
-3. The new value takes effect on the next container create. Existing containers continue running with the old value until they're recreated — there is no in-place env update on running containers (Docker doesn't support it).
+2. Wait for the reconciler (`auto_deploy: true` redeploys automatically) or trigger one manually with `POST /api/v1/stacks/{id}/deploy`.
+3. **The deploy recreates every replica** so the new env values land — Docker can't update env on a running container, so a normal "image hasn't changed" skip is overridden when secrets have changed.
 
 Values never appear in deploy logs; only an injection count (`Injected N per-stack secret(s)`) is logged at debug level.
+
+### Rotation drift
+
+After a successful deploy, Accelero persists the SHA-256 of the secret set on the stack record. On every reconcile cycle, the current set is hashed and compared. A mismatch surfaces in the drift report as:
+
+```json
+{
+  "service_name": "(secrets)",
+  "type": "secrets_changed",
+  "message": "stack secrets have been rotated since the last successful deploy; a redeploy will inject the new values"
+}
+```
+
+In `/api/v1/stacks/{id}/preview` this maps to action `recreate`. With `auto_deploy: true` on the stack, the reconciler triggers a redeploy that clears the drift; with auto-deploy off, the operator triggers the deploy manually. The hash is updated only on a *successful* deploy — failures leave it untouched, so drift keeps firing until a deploy actually applies the new set.
 
 ### Set a Secret
 `POST /api/v1/stacks/{id}/secrets`

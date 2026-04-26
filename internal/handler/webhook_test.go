@@ -519,6 +519,14 @@ func TestDriftToAction(t *testing.T) {
 			wantAction: "remove",
 		},
 		{
+			name: "secrets_changed -> recreate",
+			// A redeploy must recreate every replica with the new
+			// env — Docker can't update env on a running container,
+			// so any other action would be misleading in /preview.
+			drift:      reconciler.DriftItem{Type: "secrets_changed", ServiceName: "(secrets)"},
+			wantAction: "recreate",
+		},
+		{
 			name:       "missing_external -> error",
 			drift:      reconciler.DriftItem{Type: "missing_external", ServiceName: "(volume)"},
 			wantAction: "error",
