@@ -160,11 +160,12 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `GET /api/v1/networks` — networks labelled managed-by=accelero. **Pre-existing networks from older accelero versions are unlabelled** and won't appear until the stack is recreated (Docker won't add labels to live networks).
 - All three accept `?stack=<name>` to narrow to one stack.
 
-**Per-stack secrets (storage + CRUD; injection at deploy time is a follow-up):**
+**Per-stack secrets:**
 - `POST /api/v1/stacks/{id}/secrets` — upsert a secret `{name, value}`. Name must match `[A-Z_][A-Z0-9_]*` (≤128 chars), value is non-empty (≤64 KiB). Returns 201 on first write, 200 on rewrite (rotation). Value is encrypted at rest via the existing cipher. Audited as `stack.secret.set` with metadata `rewrote_existing`.
 - `GET /api/v1/stacks/{id}/secrets` — list names + `created_at` / `updated_at`. Values are DELIBERATELY redacted; the list endpoint NEVER returns values.
 - `DELETE /api/v1/stacks/{id}/secrets/{name}` — 204 on success, 404 if absent. Audited as `stack.secret.delete` in both outcomes (operators want the trail to include failed deletes during incidents).
 - Secrets cascade-delete with their parent stack (explicit cleanup in `DeleteStack`; modernc.org/sqlite doesn't honour `_foreign_keys=ON` in the DSN so we don't rely on the FK).
+- **Deploy-time injection:** secrets are merged into each managed container's `Env` slice at create time. Secrets shadow compose-file env on key collision (operator intent beats compose default), and overrides happen *in place* in the env slice — order is stable across unrelated changes. Rotation = `POST /secrets` then trigger a deploy: the new value takes effect on the next container create. Values never appear in deploy logs (only a `Injected N per-stack secret(s)` debug line).
 
 **Admin:**
 - `POST /api/v1/admin/encrypt-existing` — one-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still in pre-encryption plaintext. Requires `ACCELERO_ENCRYPTION_KEY`; returns 400 when encryption is disabled. Idempotent (second call returns `stacks_migrated: 0`). Audited as `admin.encrypt-existing`.
@@ -219,3 +220,4 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `middleware/webhook_signature_test.go`: empty secret → identity middleware; valid HMAC passes and body is restored for the handler; missing/malformed/wrong-algo/wrong-length/tampered/wrong-secret all 401; empty body with empty-body signature passes; oversized body returns 413
 - `store/sqlite_test.go`: `TestStackSecret_*` covers upsert first-write / rewrite updated_at bump / delete-missing false / delete-existing true / cascade-on-stack-delete / encrypted-in-DB
 - `handler/webhook_test.go` (secrets subsection): 201 first-write / 200 rewrite; invalid-name regex enforcement; empty-value rejected with DELETE hint; unknown stack 404; list redacts values (no `value` field in JSON); delete-success audited as success; delete-missing audited as failure with `not found`
+- `stack/secrets_test.go`: `mergeSecretsIntoEnv` — no-secrets passthrough; appends new keys preserving compose order; secret overrides compose value *in place*; bare-key compose entries (`HOME`) get replaced with explicit values when a matching secret exists; source slice is not mutated; empty-value secret still overrides

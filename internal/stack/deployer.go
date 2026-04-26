@@ -701,6 +701,16 @@ func (d *Deployer) captureServiceState(ctx context.Context, serviceName string) 
 func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, serviceName, repoDir string, svc service.ComposeService) error {
 	log := logctx.FromContext(ctx).WithField("service", serviceName)
 
+	// Load per-stack secrets once per service deploy and pass the
+	// decoded values down to every replica create call. A store query
+	// per container would be wasteful and — more importantly — could
+	// return inconsistent values mid-rollout if an operator rotated a
+	// secret between replicas.
+	stackSecrets, err := d.store.ListStackSecrets(stack.ID)
+	if err != nil {
+		return fmt.Errorf("failed to load stack secrets: %w", err)
+	}
+
 	replicas := svc.DesiredReplicas()
 
 	// Reject replicas > 1 alongside static published host ports: N containers
@@ -792,7 +802,7 @@ func (d *Deployer) deployService(ctx context.Context, stack *store.Stack, servic
 		replicaIndex := len(keep) + i
 		instanceName := fmt.Sprintf("%s_%d_%d", serviceName, replicaIndex, time.Now().UnixNano())
 		containerID, err := d.createAndStartContainer(
-			ctx, instanceName, repoDir, svc, serviceName, stack.Name, replicaIndex,
+			ctx, instanceName, repoDir, svc, serviceName, stack.Name, replicaIndex, stackSecrets,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create replica %d for %s: %w", replicaIndex, serviceName, err)
@@ -951,6 +961,7 @@ func (d *Deployer) createAndStartContainer(
 	svc service.ComposeService,
 	serviceName, stackName string,
 	replicaIndex int,
+	stackSecrets []*store.StackSecret,
 ) (string, error) {
 	log := logctx.FromContext(ctx).WithFields(logrus.Fields{
 		"container": name,
@@ -965,6 +976,16 @@ func (d *Deployer) createAndStartContainer(
 		return "", fmt.Errorf("failed to load env files: %w", err)
 	}
 	envVars = append(envVars, svc.Environment...)
+
+	// Layer per-stack secrets on top. Secrets shadow compose env on
+	// key collision (operator intent beats compose default) and their
+	// *values* never get logged — only names would, and we don't
+	// even log those here to keep the audit trail the single source
+	// of truth for "which secrets were in play during this deploy".
+	if n := len(stackSecrets); n > 0 {
+		envVars = mergeSecretsIntoEnv(envVars, stackSecrets)
+		log.Debugf("Injected %d per-stack secret(s) into container env", n)
+	}
 
 	// Labels: merge user labels with accelero management labels.
 	labels := make(map[string]string)
