@@ -666,6 +666,10 @@ func driftToAction(d reconciler.DriftItem) PreviewAction {
 		a.Action = "remove"
 	case "missing_external":
 		a.Action = "error" // external volume isn't Accelero's to create
+	case "secrets_changed":
+		// Docker can't update env on a running container; the next
+		// deploy will recreate every replica with the new secret set.
+		a.Action = "recreate"
 	default:
 		a.Action = "inspect" // unknown drift type — surface for human review
 	}
