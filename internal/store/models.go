@@ -25,6 +25,15 @@ type Stack struct {
 	DockerUsername string `json:"-"`
 	DockerPassword string `json:"-"`
 	DockerRegistry string `json:"docker_registry,omitempty"`
+
+	// SecretsHash is the SHA-256 digest of the per-stack secrets that
+	// were active at the most recent successful deploy. The reconciler
+	// compares it against the hash of the *current* secret set to
+	// detect "secrets rotated since last deploy" drift. Updated by the
+	// deployer on success only — failed deploys leave it untouched so
+	// the next reconcile keeps reporting drift until a deploy actually
+	// applies the new values.
+	SecretsHash string `json:"-"`
 }
 
 // Deployment represents a single deployment attempt for a stack.

@@ -584,6 +584,28 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 		}
 	}
 
+	// ---- 4. Per-stack secrets drift -------------------------------------
+	// SecretsHash is updated only on a successful deploy; a mismatch
+	// here means an operator has rotated/added/removed secrets since
+	// then. The fix (a redeploy) re-injects the new values into every
+	// managed container — values can't be updated in place, so a
+	// container recreate is required.
+	currentSecrets, err := r.store.ListStackSecrets(stack.ID)
+	if err != nil {
+		// Don't fail the entire drift check over a secrets read; surface
+		// it as a warning. Other drift checks remain useful.
+		logctx.FromContext(ctx).WithError(err).Warn("could not list stack secrets for drift check")
+	} else {
+		currentHash := store.HashStackSecrets(currentSecrets)
+		if currentHash != stack.SecretsHash {
+			report.Drifts = append(report.Drifts, DriftItem{
+				ServiceName: "(secrets)",
+				Type:        "secrets_changed",
+				Message:     "stack secrets have been rotated since the last successful deploy; a redeploy will inject the new values",
+			})
+		}
+	}
+
 	report.HasDrift = len(report.Drifts) > 0
 	return report, nil
 }
