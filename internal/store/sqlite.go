@@ -156,6 +156,13 @@ func (s *SQLiteStore) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_audit_actor_ts ON audit_entries(actor, timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_audit_operation_ts ON audit_entries(operation, timestamp DESC);
 
+	-- Note: new columns on the stacks table are added below via
+	-- applyColumnMigrations, NOT here. SQLite doesn't support
+	-- "ALTER TABLE ... ADD COLUMN IF NOT EXISTS", and we want CREATE
+	-- TABLE IF NOT EXISTS to stay strictly idempotent for fresh
+	-- installs. The pattern below also keeps fresh installs and
+	-- upgrades running through the same code path.
+
 	-- Per-stack secrets. value is ciphertext (v1: prefix) when the
 	-- cipher is attached, plaintext otherwise, identical to how
 	-- repo_token and docker_password are handled on the stacks table.
@@ -172,8 +179,52 @@ func (s *SQLiteStore) migrate() error {
 		FOREIGN KEY (stack_id) REFERENCES stacks(id) ON DELETE CASCADE
 	);
 	`
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	return s.applyColumnMigrations()
+}
+
+// applyColumnMigrations adds new columns to existing tables. SQLite
+// has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so each addition
+// is gated by a pragma_table_info lookup. Idempotent — running on a
+// fresh DB still works because the columns are absent until the first
+// pass adds them, and present (so skipped) on every pass after.
+//
+// Adding a column to the END of a table is safe even though scanStack
+// uses `SELECT *`: SQLite's ALTER TABLE ADD COLUMN appends to the
+// existing column order, and the matching scanStack adjustment lands
+// in the same commit as the migration entry below.
+func (s *SQLiteStore) applyColumnMigrations() error {
+	type addCol struct {
+		table, col, def string
+	}
+	cols := []addCol{
+		{"stacks", "secrets_hash", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, c := range cols {
+		present, err := s.columnExists(c.table, c.col)
+		if err != nil {
+			return fmt.Errorf("inspect %s columns: %w", c.table, err)
+		}
+		if present {
+			continue
+		}
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, c.table, c.col, c.def)
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s.%s: %w", c.table, c.col, err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) columnExists(table, column string) (bool, error) {
+	rows, err := s.db.Query(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, table, column)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	return rows.Next(), nil
 }
 
 // --- Stack operations ---
@@ -194,13 +245,13 @@ func (s *SQLiteStore) CreateStack(stack *Stack) error {
 	_, err = s.db.Exec(`
 		INSERT INTO stacks (id, name, repo_url, repo_username, repo_token, repo_branch,
 			compose_path, service_filter, auto_deploy, reconcile_interval_seconds, status,
-			docker_username, docker_password, docker_registry, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			docker_username, docker_password, docker_registry, created_at, updated_at, secrets_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stack.ID, stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval, stack.Status,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
-		stack.CreatedAt, stack.UpdatedAt,
+		stack.CreatedAt, stack.UpdatedAt, stack.SecretsHash,
 	)
 	return err
 }
@@ -245,14 +296,14 @@ func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 		UPDATE stacks SET name=?, repo_url=?, repo_username=?, repo_token=?, repo_branch=?,
 			compose_path=?, service_filter=?, auto_deploy=?, reconcile_interval_seconds=?,
 			status=?, last_deployed_at=?, last_reconciled_at=?, git_commit=?,
-			docker_username=?, docker_password=?, docker_registry=?, updated_at=?
+			docker_username=?, docker_password=?, docker_registry=?, updated_at=?, secrets_hash=?
 		WHERE id=?`,
 		stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval,
 		stack.Status, stack.LastDeployedAt, stack.LastReconciledAt, stack.GitCommit,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
-		stack.UpdatedAt, stack.ID,
+		stack.UpdatedAt, stack.SecretsHash, stack.ID,
 	)
 	return err
 }
@@ -659,6 +710,10 @@ func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 		&lastDeployed, &lastReconciled, &st.GitCommit,
 		&st.DockerUsername, &st.DockerPassword, &st.DockerRegistry,
 		&st.CreatedAt, &st.UpdatedAt,
+		// secrets_hash is the latest column added via
+		// applyColumnMigrations — appended by SQLite at the end of the
+		// table, so it lands here at the end of the scan.
+		&st.SecretsHash,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
