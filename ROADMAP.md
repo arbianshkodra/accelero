@@ -143,7 +143,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 
 **Per-stack secrets API:**
 - [x] `POST/GET/DELETE /api/v1/stacks/{id}/secrets` — upsert / list (names + timestamps only; values redacted) / delete. Name matches POSIX env-var grammar (`[A-Z_][A-Z0-9_]*`). Values encrypted at rest via the existing cipher; raw DB column holds `v1:<nonce>:<ct>`. Secrets cascade-delete with their parent stack.
-- [ ] Secrets injected into containers at deploy time via a host-side `env_file:` that Accelero materialises under `/run/accelero/<stack>/secrets.env` (tmpfs, short-lived, readable only by the managed container).
+- [x] Secrets injected into managed containers at deploy time. Implementation merges the stack's secrets into each container's `Env` slice at create time (rather than the originally-planned tmpfs `env_file` mount — same effective security boundary, simpler surface, no host-fs interaction). Secrets shadow compose-file env on key collision; override happens in place to keep env order stable across rotations. Values never logged.
 - [x] Audit log entry for every secret set/delete, with the actor and the key name (never the value). Delete-missing is audited as a failure so the trail captures attempted cleanup.
 
 **External secret backends:**

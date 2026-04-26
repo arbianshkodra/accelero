@@ -807,11 +807,23 @@ Runs the same drift check as `/drift` and translates each drift item into the ac
 
 ## Per-Stack Secrets
 
-Encrypted-at-rest key/value pairs scoped to a single stack. Values are stored as `v1:<nonce>:<ciphertext>` when `ACCELERO_ENCRYPTION_KEY` (or `ACCELERO_ENCRYPTION_KEY_FILE`) is configured, otherwise as plaintext — identical to how `repo_token` and `docker_password` are handled on the stack record itself. This PR ships storage + CRUD only; deploy-time injection into managed containers is a follow-up.
+Encrypted-at-rest key/value pairs scoped to a single stack. Values are stored as `v1:<nonce>:<ciphertext>` when `ACCELERO_ENCRYPTION_KEY` (or `ACCELERO_ENCRYPTION_KEY_FILE`) is configured, otherwise as plaintext — identical to how `repo_token` and `docker_password` are handled on the stack record itself.
 
-The value leaves Accelero only through the (forthcoming) deploy injection path. **The list endpoint never returns values** — that's by design, not a UI affordance, so a leaked API key can't be used to exfiltrate secrets.
+The value leaves Accelero only through the deploy injection path described below. **The list endpoint never returns values** — that's by design, not a UI affordance, so a leaked API key can't be used to exfiltrate secrets.
 
 Secrets cascade-delete with their parent stack.
+
+### Deploy-time injection
+
+At deploy time, every secret for the stack is merged into the `Env` slice on each managed container. Secrets **shadow compose-file env on key collision** — operator intent beats compose default. The override happens in place in the env list, so the final order is stable across unrelated secret changes (easier to diff via `docker inspect`).
+
+Rotation flow:
+
+1. `POST /api/v1/stacks/{id}/secrets` with the new value (returns 200 on rewrite).
+2. Trigger a deploy (`POST /api/v1/stacks/{id}/deploy`, or wait for the auto-deploy reconcile loop).
+3. The new value takes effect on the next container create. Existing containers continue running with the old value until they're recreated — there is no in-place env update on running containers (Docker doesn't support it).
+
+Values never appear in deploy logs; only an injection count (`Injected N per-stack secret(s)`) is logged at debug level.
 
 ### Set a Secret
 `POST /api/v1/stacks/{id}/secrets`
