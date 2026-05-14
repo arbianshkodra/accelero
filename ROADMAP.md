@@ -172,7 +172,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 - [ ] Content Security Policy headers
 
 **Registry management:**
-- [ ] Multi-registry support with encrypted credentials at rest
+- [x] Multi-registry support with encrypted credentials at rest. `POST/GET/DELETE /api/v1/stacks/{id}/registries`; passwords encrypted via the existing cipher (same `v1:<nonce>:<ct>` format as `repo_token`); list endpoint redacts passwords. Deployer picks the credential by matching the image reference's registry hostname; Hub aliases (`docker.io` / `index.docker.io` / `registry-1.docker.io` / `registry.hub.docker.com`) are treated as equivalent. Legacy single-credential fields on the stack record remain supported and are tried as a fallback. No matching credential = anonymous pull.
 - [x] Generic HMAC-SHA256 webhook signature verification via `WEBHOOK_SECRET` and `X-Hub-Signature-256` (GitHub / Gitea / Gogs / CI format). Replaces the API-key check on `/webhook` so external senders can authenticate without smuggling the API key; rejections bump `accelero_webhook_signature_rejected_total`; body capped at 1 MiB. Registry-specific wire formats (Docker Hub, Harbor, ECR) are still open.
 - [ ] ECR/GCR/ACR IAM-based authentication
 - [ ] Browse registry tags (for UI dropdown / approval workflows)
