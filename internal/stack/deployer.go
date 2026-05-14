@@ -896,9 +896,15 @@ func (d *Deployer) stopAndRemove(ctx context.Context, log *logrus.Entry, id stri
 func (d *Deployer) resolveImage(ctx context.Context, svc service.ComposeService, stack *store.Stack, log *logrus.Entry) error {
 	policy := strings.ToLower(strings.TrimSpace(svc.PullPolicy))
 
+	// Pull-time auth: prefer a per-stack credential whose registry
+	// matches the image's registry, fall back to the legacy single
+	// credential on the stack record. Empty username = anonymous
+	// pull, which matches Docker's behaviour for public images.
+	username, password, server := d.pickAuthForImage(ctx, stack, svc.Image)
+
 	switch policy {
 	case "", "always":
-		if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
+		if err := d.pullImage(ctx, svc.Image, username, password, server); err != nil {
 			return fmt.Errorf("image pull failed: %w", err)
 		}
 		return nil
@@ -912,7 +918,7 @@ func (d *Deployer) resolveImage(ctx context.Context, svc service.ComposeService,
 			log.WithField("image", svc.Image).Info("pull_policy=missing and image is local — skipping pull")
 			return nil
 		}
-		if err := d.pullImage(ctx, svc.Image, stack.DockerUsername, stack.DockerPassword, stack.DockerRegistry); err != nil {
+		if err := d.pullImage(ctx, svc.Image, username, password, server); err != nil {
 			return fmt.Errorf("image pull failed: %w", err)
 		}
 		return nil
@@ -934,6 +940,34 @@ func (d *Deployer) resolveImage(ctx context.Context, svc service.ComposeService,
 	default:
 		return fmt.Errorf("unknown pull_policy %q (expected always, missing, if_not_present, never, or build)", svc.PullPolicy)
 	}
+}
+
+// pickAuthForImage assembles the credential list for `stack` and asks
+// the matcher to pick the right one for `imageRef`. A failed lookup of
+// the per-stack table is logged but doesn't abort — the legacy single
+// credential and anonymous pull are both valid fallbacks, and we'd
+// rather degrade to "no auth" than refuse to deploy entirely if the
+// store is briefly unhappy.
+func (d *Deployer) pickAuthForImage(ctx context.Context, stack *store.Stack, imageRef string) (username, password, server string) {
+	var list []*store.StackRegistry
+	regs, err := d.store.ListStackRegistries(stack.ID)
+	if err != nil {
+		logctx.FromContext(ctx).
+			WithError(err).
+			Warn("could not list stack registries; falling back to legacy credentials")
+	} else {
+		list = regs
+	}
+
+	var legacy *store.StackRegistry
+	if stack.DockerRegistry != "" || stack.DockerUsername != "" {
+		legacy = &store.StackRegistry{
+			Server:   stack.DockerRegistry,
+			Username: stack.DockerUsername,
+			Password: stack.DockerPassword,
+		}
+	}
+	return pickRegistryAuth(imageRef, list, legacy)
 }
 
 // imageIsLocal returns true when the Docker daemon already has the given
