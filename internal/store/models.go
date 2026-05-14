@@ -50,6 +50,26 @@ type Deployment struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
+// StackRegistry is a per-stack Docker registry credential. Stacks pull
+// images from one or more registries; the deployer picks credentials at
+// pull time by matching the registry hostname embedded in the image
+// reference. Password is plaintext in the Go type but stored encrypted
+// at rest (same pattern as repo_token / docker_password / stack_secret
+// values).
+//
+// The legacy single-registry fields on Stack (DockerUsername /
+// DockerPassword / DockerRegistry) remain supported and are merged into
+// the credential list at pull time, so existing deployments keep
+// working without migration.
+type StackRegistry struct {
+	StackID   string    `json:"stack_id"`
+	Server    string    `json:"server"`
+	Username  string    `json:"username"`
+	Password  string    `json:"-"` // never serialised
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // StackSecret is a per-stack key/value pair stored encrypted at rest and
 // injected into managed containers at deploy time (follow-up PR for the
 // injection half). Value is plaintext in the Go type; the SQLite column
@@ -168,4 +188,9 @@ const (
 	// handler.StackSecretsDelete.
 	AuditOpStackSecretSet    = "stack.secret.set"
 	AuditOpStackSecretDelete = "stack.secret.delete"
+
+	// Per-stack Docker registry credentials. Passwords never appear
+	// in audit metadata.
+	AuditOpStackRegistrySet    = "stack.registry.set"
+	AuditOpStackRegistryDelete = "stack.registry.delete"
 )

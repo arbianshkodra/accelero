@@ -33,6 +33,9 @@ type mockStore struct {
 	// secrets is keyed by (stack_id, name). Separate from the stacks
 	// slice so tests can seed both independently.
 	secrets map[string]map[string]*store.StackSecret
+
+	// registries mirrors the secrets layout but keyed by (stack_id, server).
+	registries map[string]map[string]*store.StackRegistry
 }
 
 // newHandler wires a Handler with the three test doubles we need. Kept
@@ -136,6 +139,52 @@ func (m *mockStore) DeleteStackSecret(stackID, name string) (bool, error) {
 		return false, nil
 	}
 	delete(bucket, name)
+	return true, nil
+}
+
+// --- Per-stack registry credentials ---
+
+func (m *mockStore) UpsertStackRegistry(r *store.StackRegistry) error {
+	if m.registries == nil {
+		m.registries = map[string]map[string]*store.StackRegistry{}
+	}
+	if _, ok := m.registries[r.StackID]; !ok {
+		m.registries[r.StackID] = map[string]*store.StackRegistry{}
+	}
+	now := time.Now()
+	if existing, ok := m.registries[r.StackID][r.Server]; ok {
+		r.CreatedAt = existing.CreatedAt
+	} else {
+		r.CreatedAt = now
+	}
+	r.UpdatedAt = now
+	m.registries[r.StackID][r.Server] = &store.StackRegistry{
+		StackID:   r.StackID,
+		Server:    r.Server,
+		Username:  r.Username,
+		Password:  r.Password,
+		CreatedAt: r.CreatedAt,
+		UpdatedAt: r.UpdatedAt,
+	}
+	return nil
+}
+
+func (m *mockStore) ListStackRegistries(stackID string) ([]*store.StackRegistry, error) {
+	bucket := m.registries[stackID]
+	out := make([]*store.StackRegistry, 0, len(bucket))
+	for _, r := range bucket {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Server < out[j].Server })
+	return out, nil
+}
+
+func (m *mockStore) DeleteStackRegistry(stackID, server string) (bool, error) {
+	bucket := m.registries[stackID]
+	if _, ok := bucket[server]; !ok {
+		return false, nil
+	}
+	delete(bucket, server)
 	return true, nil
 }
 
@@ -1020,4 +1069,158 @@ func TestDeleteStackSecret_Missing404AndAuditedAsFailure(t *testing.T) {
 	got := rec.entries[0]
 	assert.Equal(t, store.AuditOutcomeFailure, got.Outcome)
 	assert.Equal(t, "not found", got.ErrorMessage)
+}
+
+// ---------------------------------------------------------------------------
+// Per-stack registry credentials
+// ---------------------------------------------------------------------------
+
+func registriesRouter(t *testing.T) (*Handler, *mockStore, *captureRecorder, *mux.Router) {
+	t.Helper()
+	now := time.Now()
+	ms := &mockStore{stacks: []*store.Stack{
+		{ID: "s1", Name: "app", Status: "active", CreatedAt: now, UpdatedAt: now},
+	}}
+	rec := &captureRecorder{}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	return h, ms, rec, router
+}
+
+func postRegistry(t *testing.T, router http.Handler, stack, server, user, pw string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"server": server, "username": user, "password": pw})
+	req := httptest.NewRequest("POST", "/api/v1/stacks/"+stack+"/registries", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestSetStackRegistry_FirstWriteReturns201(t *testing.T) {
+	_, ms, rec, router := registriesRouter(t)
+
+	rr := postRegistry(t, router, "app", "ghcr.io", "ghuser", "ghpw")
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "ghcr.io", body["server"])
+	assert.Equal(t, "ghuser", body["username"])
+	assert.Equal(t, true, body["created"])
+	// Body must NOT echo the password.
+	_, hasPw := body["password"]
+	assert.False(t, hasPw)
+
+	regs, _ := ms.ListStackRegistries("s1")
+	require.Len(t, regs, 1)
+	assert.Equal(t, "ghpw", regs[0].Password)
+
+	require.Len(t, rec.entries, 1)
+	got := rec.entries[0]
+	assert.Equal(t, store.AuditOpStackRegistrySet, got.Operation)
+	assert.Equal(t, "ghcr.io", got.ResourceID)
+	assert.Equal(t, "false", got.Metadata["rewrote_existing"])
+	assert.Equal(t, "ghuser", got.Metadata["username"])
+	for _, v := range got.Metadata {
+		assert.NotContains(t, v, "ghpw", "password must never appear in audit metadata")
+	}
+}
+
+func TestSetStackRegistry_RewriteReturns200(t *testing.T) {
+	_, _, rec, router := registriesRouter(t)
+	require.Equal(t, http.StatusCreated, postRegistry(t, router, "app", "ghcr.io", "u1", "p1").Code)
+
+	rr := postRegistry(t, router, "app", "ghcr.io", "u2", "p2")
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, false, body["created"])
+
+	require.Len(t, rec.entries, 2)
+	assert.Equal(t, "true", rec.entries[1].Metadata["rewrote_existing"])
+}
+
+func TestSetStackRegistry_RejectsBadInputs(t *testing.T) {
+	_, _, _, router := registriesRouter(t)
+
+	cases := []struct {
+		name             string
+		server, u, p     string
+		wantStatus       int
+		wantContainsBody string
+	}{
+		{"empty server", "", "u", "p", http.StatusBadRequest, "server is required"},
+		{"http URL", "http://ghcr.io", "u", "p", http.StatusBadRequest, "drop the http"},
+		{"https URL", "https://ghcr.io", "u", "p", http.StatusBadRequest, "drop the http"},
+		{"slash in server", "ghcr.io/path", "u", "p", http.StatusBadRequest, "no slashes"},
+		{"empty username", "ghcr.io", "", "p", http.StatusBadRequest, "username is required"},
+		{"empty password", "ghcr.io", "u", "", http.StatusBadRequest, "password is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := postRegistry(t, router, "app", tc.server, tc.u, tc.p)
+			assert.Equal(t, tc.wantStatus, rr.Code, rr.Body.String())
+			assert.Contains(t, rr.Body.String(), tc.wantContainsBody)
+		})
+	}
+}
+
+func TestListStackRegistries_PasswordsRedacted(t *testing.T) {
+	_, ms, _, router := registriesRouter(t)
+
+	require.NoError(t, ms.UpsertStackRegistry(&store.StackRegistry{StackID: "s1", Server: "ghcr.io", Username: "ghuser", Password: "REGISTRY_VERY_SECRET"}))
+	require.NoError(t, ms.UpsertStackRegistry(&store.StackRegistry{StackID: "s1", Server: "docker.io", Username: "dh", Password: "DH_VERY_SECRET"}))
+
+	req := httptest.NewRequest("GET", "/api/v1/stacks/app/registries", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	body := rr.Body.String()
+	assert.NotContains(t, body, "REGISTRY_VERY_SECRET")
+	assert.NotContains(t, body, "DH_VERY_SECRET")
+
+	var got []map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 2)
+	// ASC by server.
+	assert.Equal(t, "docker.io", got[0]["server"])
+	assert.Equal(t, "ghcr.io", got[1]["server"])
+	// Username present, password absent.
+	assert.Equal(t, "dh", got[0]["username"])
+	_, hasPw := got[0]["password"]
+	assert.False(t, hasPw)
+}
+
+func TestDeleteStackRegistry_Success(t *testing.T) {
+	_, ms, rec, router := registriesRouter(t)
+	require.NoError(t, ms.UpsertStackRegistry(&store.StackRegistry{StackID: "s1", Server: "ghcr.io", Username: "u", Password: "p"}))
+
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/app/registries/ghcr.io", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusNoContent, rr.Code)
+
+	list, _ := ms.ListStackRegistries("s1")
+	assert.Empty(t, list)
+
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOpStackRegistryDelete, rec.entries[0].Operation)
+	assert.Equal(t, store.AuditOutcomeSuccess, rec.entries[0].Outcome)
+}
+
+func TestDeleteStackRegistry_MissingAuditedAsFailure(t *testing.T) {
+	_, _, rec, router := registriesRouter(t)
+	req := httptest.NewRequest("DELETE", "/api/v1/stacks/app/registries/ghcr.io", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
+	assert.Equal(t, "not found", rec.entries[0].ErrorMessage)
 }
