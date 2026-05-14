@@ -178,6 +178,22 @@ func (s *SQLiteStore) migrate() error {
 		PRIMARY KEY (stack_id, name),
 		FOREIGN KEY (stack_id) REFERENCES stacks(id) ON DELETE CASCADE
 	);
+
+	-- Per-stack Docker registry credentials. password column matches
+	-- stack_secrets.value: encrypted (v1: prefix) when a cipher is
+	-- attached, plaintext otherwise. PK is (stack_id, server) so
+	-- "POST /registries" with the same server overwrites — matches
+	-- the stack_secrets upsert flow.
+	CREATE TABLE IF NOT EXISTS stack_registries (
+		stack_id TEXT NOT NULL,
+		server TEXT NOT NULL,
+		username TEXT NOT NULL,
+		password TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (stack_id, server),
+		FOREIGN KEY (stack_id) REFERENCES stacks(id) ON DELETE CASCADE
+	);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -318,6 +334,9 @@ func (s *SQLiteStore) DeleteStack(id string) error {
 	// key rotation would turn them into unreadable ciphertext.
 	if _, err := s.db.Exec(`DELETE FROM stack_secrets WHERE stack_id = ?`, id); err != nil {
 		return fmt.Errorf("delete stack_secrets for %s: %w", id, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM stack_registries WHERE stack_id = ?`, id); err != nil {
+		return fmt.Errorf("delete stack_registries for %s: %w", id, err)
 	}
 	_, err := s.db.Exec(`DELETE FROM stacks WHERE id = ?`, id)
 	return err
@@ -531,6 +550,77 @@ func (s *SQLiteStore) ListStackSecrets(stackID string) ([]*StackSecret, error) {
 // 404 without a second lookup.
 func (s *SQLiteStore) DeleteStackSecret(stackID, name string) (bool, error) {
 	res, err := s.db.Exec(`DELETE FROM stack_secrets WHERE stack_id = ? AND name = ?`, stackID, name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// --- Per-stack registry credentials ---
+
+// UpsertStackRegistry writes a credential, creating or updating by
+// (stack_id, server). Password is encrypted before hitting the DB
+// when a cipher is attached. Like UpsertStackSecret, created_at is
+// preserved across updates.
+func (s *SQLiteStore) UpsertStackRegistry(r *StackRegistry) error {
+	encPassword, err := s.encryptField(r.Password)
+	if err != nil {
+		return fmt.Errorf("encrypt stack_registry password: %w", err)
+	}
+	now := time.Now()
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = now
+	}
+	r.UpdatedAt = now
+
+	_, err = s.db.Exec(`
+		INSERT INTO stack_registries (stack_id, server, username, password, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (stack_id, server) DO UPDATE SET
+			username = excluded.username,
+			password = excluded.password,
+			updated_at = excluded.updated_at`,
+		r.StackID, r.Server, r.Username, encPassword, r.CreatedAt, r.UpdatedAt)
+	return err
+}
+
+// ListStackRegistries returns every registry credential for a stack
+// with its plaintext password decrypted. The handler layer is
+// responsible for redacting the password in API responses; the deploy
+// path uses it to authenticate image pulls.
+func (s *SQLiteStore) ListStackRegistries(stackID string) ([]*StackRegistry, error) {
+	rows, err := s.db.Query(`
+		SELECT stack_id, server, username, password, created_at, updated_at
+		FROM stack_registries
+		WHERE stack_id = ?
+		ORDER BY server ASC`,
+		stackID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*StackRegistry
+	for rows.Next() {
+		var r StackRegistry
+		if err := rows.Scan(&r.StackID, &r.Server, &r.Username, &r.Password, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		plain, err := s.decryptField(r.Password)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt stack_registry password for %s/%s: %w", r.StackID, r.Server, err)
+		}
+		r.Password = plain
+		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteStackRegistry removes a single (stack_id, server) row.
+// Returns (false, nil) when the row did not exist.
+func (s *SQLiteStore) DeleteStackRegistry(stackID, server string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM stack_registries WHERE stack_id = ? AND server = ?`, stackID, server)
 	if err != nil {
 		return false, err
 	}

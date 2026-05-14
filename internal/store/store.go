@@ -37,6 +37,13 @@ type Store interface {
 	ListStackSecrets(stackID string) ([]*StackSecret, error)
 	DeleteStackSecret(stackID, name string) (bool, error)
 
+	// Per-stack Docker registry credentials. Same upsert / list (with
+	// passwords) / delete shape as stack secrets. Passwords are
+	// encrypted at rest when a cipher is attached.
+	UpsertStackRegistry(r *StackRegistry) error
+	ListStackRegistries(stackID string) ([]*StackRegistry, error)
+	DeleteStackRegistry(stackID, server string) (bool, error)
+
 	// Audit log — append-only; no update or delete API. Retention is
 	// time-based and goes through CleanupOldAuditEntries, which is the
 	// only path that removes rows. Prune decisions stay with the app
