@@ -183,6 +183,12 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/secrets", h.ListStackSecrets).Methods("GET")
 	api.HandleFunc("/stacks/{id}/secrets/{name}", h.DeleteStackSecret).Methods("DELETE")
 
+	// Per-stack registry credentials — encrypted at rest. Same
+	// upsert/list (passwords redacted)/delete shape as secrets.
+	api.HandleFunc("/stacks/{id}/registries", h.SetStackRegistry).Methods("POST")
+	api.HandleFunc("/stacks/{id}/registries", h.ListStackRegistries).Methods("GET")
+	api.HandleFunc("/stacks/{id}/registries/{server}", h.DeleteStackRegistry).Methods("DELETE")
+
 	// Read-only container introspection (Phase 3).
 	api.HandleFunc("/stacks/{id}/containers", h.ListStackContainers).Methods("GET")
 	api.HandleFunc("/stacks/{id}/containers/{cid}", h.GetStackContainer).Methods("GET")
@@ -742,6 +748,180 @@ func (h *Handler) EncryptExistingStacks(w http.ResponseWriter, r *http.Request) 
 		body["stacks_failed"] = failed
 	}
 	writeJSON(w, body, http.StatusOK)
+}
+
+// --------------------------------------------------------------------------
+// Per-stack registry credentials
+// --------------------------------------------------------------------------
+
+const maxRegistryServerLen = 253 // RFC-1035 max hostname length
+
+// SetStackRegistry upserts a per-stack Docker registry credential.
+// 201 on first write of a server, 200 on rewrite (rotation). Audited
+// as `stack.registry.set`; password is never included in audit
+// metadata or in any response.
+func (h *Handler) SetStackRegistry(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+
+	var input struct {
+		Server   string `json:"server"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	server := strings.TrimSpace(input.Server)
+	if server == "" {
+		writeError(w, "server is required", http.StatusBadRequest)
+		return
+	}
+	if len(server) > maxRegistryServerLen {
+		writeError(w, fmt.Sprintf("server exceeds %d characters", maxRegistryServerLen), http.StatusBadRequest)
+		return
+	}
+	// Reject scheme prefixes — operators sometimes copy a URL by
+	// mistake. Docker's auth header expects a bare host[:port].
+	if strings.HasPrefix(server, "http://") || strings.HasPrefix(server, "https://") {
+		writeError(w, "server must be a bare host[:port], not a URL (drop the http(s):// prefix)", http.StatusBadRequest)
+		return
+	}
+	if strings.ContainsAny(server, " /") {
+		writeError(w, "server must be a bare host[:port] (no spaces, no slashes)", http.StatusBadRequest)
+		return
+	}
+	if input.Username == "" {
+		writeError(w, "username is required (use DELETE to remove a credential)", http.StatusBadRequest)
+		return
+	}
+	if input.Password == "" {
+		writeError(w, "password is required", http.StatusBadRequest)
+		return
+	}
+
+	// 201 vs 200 distinction matches the secrets API.
+	existing, err := h.Store.ListStackRegistries(stack.ID)
+	if err != nil {
+		writeError(w, "failed to read stack registries", http.StatusInternalServerError)
+		return
+	}
+	wasPresent := false
+	for _, e := range existing {
+		if e.Server == server {
+			wasPresent = true
+			break
+		}
+	}
+
+	if err := h.Store.UpsertStackRegistry(&store.StackRegistry{
+		StackID:  stack.ID,
+		Server:   server,
+		Username: input.Username,
+		Password: input.Password,
+	}); err != nil {
+		writeError(w, "failed to store stack registry", http.StatusInternalServerError)
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpStackRegistrySet)
+	entry.ResourceType = "stack_registry"
+	entry.ResourceID = server
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Metadata = map[string]string{
+		"rewrote_existing": strconv.FormatBool(wasPresent),
+		"username":         input.Username, // safe — it's not the secret
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	status := http.StatusCreated
+	if wasPresent {
+		status = http.StatusOK
+	}
+	writeJSON(w, map[string]interface{}{
+		"server":   server,
+		"username": input.Username,
+		"created":  !wasPresent,
+	}, status)
+}
+
+// ListStackRegistries returns the configured registries for a stack
+// with usernames + timestamps. Passwords are DELIBERATELY redacted.
+func (h *Handler) ListStackRegistries(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	regs, err := h.Store.ListStackRegistries(stack.ID)
+	if err != nil {
+		writeError(w, "failed to list stack registries", http.StatusInternalServerError)
+		return
+	}
+
+	// Explicit response shape that omits Password — same defensive
+	// pattern as the secrets list endpoint, so a future JSON refactor
+	// can't accidentally re-export the field.
+	type item struct {
+		Server    string    `json:"server"`
+		Username  string    `json:"username"`
+		StackID   string    `json:"stack_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	out := make([]item, 0, len(regs))
+	for _, e := range regs {
+		out = append(out, item{
+			Server:    e.Server,
+			Username:  e.Username,
+			StackID:   e.StackID,
+			CreatedAt: e.CreatedAt,
+			UpdatedAt: e.UpdatedAt,
+		})
+	}
+	writeJSON(w, out, http.StatusOK)
+}
+
+// DeleteStackRegistry removes a single registry credential. 204 on
+// success, 404 when the named server isn't configured. Audited
+// regardless of outcome (failures carry error_message: "not found").
+func (h *Handler) DeleteStackRegistry(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	server := mux.Vars(r)["server"]
+	if server == "" {
+		writeError(w, "server is required", http.StatusBadRequest)
+		return
+	}
+
+	removed, err := h.Store.DeleteStackRegistry(stack.ID, server)
+	if err != nil {
+		writeError(w, "failed to delete stack registry", http.StatusInternalServerError)
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpStackRegistryDelete)
+	entry.ResourceType = "stack_registry"
+	entry.ResourceID = server
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	if !removed {
+		entry.Outcome = store.AuditOutcomeFailure
+		entry.ErrorMessage = "not found"
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	if !removed {
+		writeError(w, "registry not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --------------------------------------------------------------------------

@@ -337,6 +337,8 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `admin.encrypt-existing` | `api-key` | Re-saves pre-encryption plaintext rows through the cipher. Metadata: `stacks_migrated`, `stacks_failed`. Outcome is `failure` if any row failed. |
 | `stack.secret.set` | `api-key` | Upsert of a per-stack secret. Metadata: `rewrote_existing`. **Value is never included.** |
 | `stack.secret.delete` | `api-key` | Delete of a per-stack secret. Always recorded — failures carry `error_message: "not found"` when the caller tried to delete a non-existent key. |
+| `stack.registry.set` | `api-key` | Upsert of a per-stack registry credential. Metadata: `rewrote_existing`, `username`. **Password is never included.** |
+| `stack.registry.delete` | `api-key` | Delete of a per-stack registry credential. Failures carry `error_message: "not found"`. |
 
 **Retention.** Entries older than `AUDIT_MAX_AGE` (default 90 days) are pruned on the same cadence as the deployment-history cleanup (`STATUS_CLEANUP_INTERVAL`, default hourly). Set `AUDIT_MAX_AGE=0` to disable retention — useful when a compliance regime requires indefinite preservation.
 
@@ -802,6 +804,80 @@ Runs the same drift check as `/drift` and translates each drift item into the ac
 | `inspect` | _unknown_ | Future drift type not yet mapped; deploy will still attempt to converge |
 
 **Errors:** `404 Not Found` if the stack doesn't exist; `503 Service Unavailable` if the reconciler is not wired (indicates a misconfigured server).
+
+---
+
+## Per-Stack Registry Credentials
+
+Stacks can declare any number of Docker registry credentials. At image-pull time the deployer extracts the registry hostname from the image reference and picks the matching credential; if none match, the legacy single-credential fields on the stack record are tried; if those don't match either, the pull is anonymous (matches Docker's behaviour for public images).
+
+Hub aliases — `docker.io`, `index.docker.io`, `registry-1.docker.io`, `registry.hub.docker.com` — are treated as equivalent, so a credential saved under any of them authenticates pulls of `nginx:1.27`, `library/nginx`, or `index.docker.io/library/nginx`.
+
+Passwords are encrypted at rest when `ACCELERO_ENCRYPTION_KEY` (or `ACCELERO_ENCRYPTION_KEY_FILE`) is configured. **The API never returns passwords** — they leave Accelero only as part of an image-pull auth header to the daemon.
+
+Credentials cascade-delete with their parent stack.
+
+### Set a Registry Credential
+`POST /api/v1/stacks/{id}/registries`
+
+Upserts a credential. Same key twice = rotation.
+
+**Request body:**
+```json
+{"server": "ghcr.io", "username": "ci-bot", "password": "ghp_..."}
+```
+
+**Constraints:**
+
+| Field | Rule |
+|-------|------|
+| `server` | Required. Bare `host[:port]` (≤253 chars). URL prefixes (`http(s)://`), spaces, and slashes rejected. |
+| `username` | Required. (Use DELETE to remove a credential rather than POSTing an empty username.) |
+| `password` | Required. Encrypted before write. |
+
+**Response:**
+- `201 Created` on first write of a given `server`
+- `200 OK` on rewrite (rotation)
+
+```json
+{"server": "ghcr.io", "username": "ci-bot", "created": true}
+```
+
+The response body NEVER echoes the password. Audited as `stack.registry.set`; metadata records the username and `rewrote_existing` but never the password.
+
+### List Registry Credentials
+`GET /api/v1/stacks/{id}/registries`
+
+**Response:** `200 OK` — ASC by server.
+```json
+[
+  {
+    "server": "docker.io",
+    "username": "hub-bot",
+    "stack_id": "s1",
+    "created_at": "2026-05-14T19:07:58.961915Z",
+    "updated_at": "2026-05-14T19:07:58.961915Z"
+  },
+  {
+    "server": "ghcr.io",
+    "username": "ci-bot",
+    "stack_id": "s1",
+    "created_at": "2026-05-14T19:07:58.954202Z",
+    "updated_at": "2026-05-14T19:07:58.954202Z"
+  }
+]
+```
+
+No `password` field is ever present in the response.
+
+### Delete a Registry Credential
+`DELETE /api/v1/stacks/{id}/registries/{server}`
+
+**Response:**
+- `204 No Content` on success
+- `404 Not Found` if the named server isn't configured
+
+Both outcomes are audited as `stack.registry.delete` — failures carry `outcome: "failure"` with `error_message: "not found"`.
 
 ---
 
