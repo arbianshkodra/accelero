@@ -1163,6 +1163,117 @@ func TestStackSecret_CascadesOnStackDelete(t *testing.T) {
 	assert.Empty(t, list, "secrets must not survive their parent stack")
 }
 
+// ---------------------------------------------------------------------------
+// Per-stack registry credentials
+// ---------------------------------------------------------------------------
+
+func TestStackRegistry_UpsertAndList(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{
+		StackID: stackID, Server: "ghcr.io", Username: "ghuser", Password: "ghpw",
+	}))
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{
+		StackID: stackID, Server: "docker.io", Username: "dh", Password: "dhpw",
+	}))
+
+	got, err := s.ListStackRegistries(stackID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	// ASC by server.
+	assert.Equal(t, "docker.io", got[0].Server)
+	assert.Equal(t, "dhpw", got[0].Password)
+	assert.Equal(t, "ghcr.io", got[1].Server)
+}
+
+func TestStackRegistry_UpsertOverwritesAndPreservesCreatedAt(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{
+		StackID: stackID, Server: "ghcr.io", Username: "u1", Password: "p1",
+	}))
+	first, _ := s.ListStackRegistries(stackID)
+	createdAt := first[0].CreatedAt
+	time.Sleep(1100 * time.Millisecond)
+
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{
+		StackID: stackID, Server: "ghcr.io", Username: "u2", Password: "p2",
+	}))
+	second, _ := s.ListStackRegistries(stackID)
+	require.Len(t, second, 1)
+	assert.Equal(t, "u2", second[0].Username)
+	assert.Equal(t, "p2", second[0].Password)
+	assert.True(t, second[0].UpdatedAt.After(createdAt))
+}
+
+func TestStackRegistry_DeleteMissingFalseExistingTrue(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+
+	ok, err := s.DeleteStackRegistry(stackID, "ghcr.io")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{StackID: stackID, Server: "ghcr.io", Username: "u", Password: "p"}))
+	ok, err = s.DeleteStackRegistry(stackID, "ghcr.io")
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	list, _ := s.ListStackRegistries(stackID)
+	assert.Empty(t, list)
+}
+
+func TestStackRegistry_CascadesOnStackDelete(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+	stackID := seedStack(t, s, "s1")
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{StackID: stackID, Server: "ghcr.io", Username: "u", Password: "p"}))
+
+	require.NoError(t, s.DeleteStack(stackID))
+	list, err := s.ListStackRegistries(stackID)
+	require.NoError(t, err)
+	assert.Empty(t, list)
+}
+
+func TestStackRegistry_PasswordEncryptedInDB(t *testing.T) {
+	// Raw-SQL guarantee: password column holds v1: ciphertext when a
+	// cipher is attached, plaintext literal does not appear anywhere
+	// in the row.
+	s := newTestStore(t)
+	defer s.Close()
+
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	stackID := seedStack(t, s, "s1")
+	require.NoError(t, s.UpsertStackRegistry(&StackRegistry{
+		StackID: stackID, Server: "ghcr.io", Username: "ghuser", Password: "REGISTRY_VERY_SECRET",
+	}))
+
+	var raw string
+	require.NoError(t, s.db.QueryRow(
+		`SELECT password FROM stack_registries WHERE stack_id = ? AND server = ?`,
+		stackID, "ghcr.io",
+	).Scan(&raw))
+	assert.True(t, strings.HasPrefix(raw, "v1:"),
+		"password column must hold ciphertext; got %q", raw)
+	assert.NotContains(t, raw, "REGISTRY_VERY_SECRET")
+
+	list, err := s.ListStackRegistries(stackID)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "REGISTRY_VERY_SECRET", list[0].Password)
+}
+
 func TestStackSecret_EncryptedInDB(t *testing.T) {
 	// Raw-SQL guarantee: with a cipher attached, the value column is
 	// opaque ciphertext (v1: prefix) and the plaintext never appears.
