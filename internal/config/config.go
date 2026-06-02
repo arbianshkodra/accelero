@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -64,6 +65,23 @@ type Config struct {
 	// X-Hub-Signature-256: sha256=<hex>. Empty = no signature check,
 	// /webhook continues to require an API key as before.
 	WebhookSecret string
+
+	// TLSCertFile / TLSKeyFile point at PEM-encoded certificate (or
+	// chain) and private key. Both must be set together; either alone
+	// is a startup error. Unset = plain HTTP (the default — many
+	// deployments terminate TLS at a reverse proxy and don't want
+	// Accelero doing it twice).
+	TLSCertFile string
+	TLSKeyFile  string
+
+	// TLSHSTSMaxAge controls the max-age value of the
+	// Strict-Transport-Security header set on every TLS response.
+	// Defaults to 31536000 (one year, the IETF baseline). Set to 0
+	// to disable the header entirely — useful when Accelero sits
+	// behind a TLS-terminating proxy and the operator wants HSTS
+	// configured at the edge instead. Ignored when TLS is off (HSTS
+	// over plain HTTP is meaningless).
+	TLSHSTSMaxAge int
 
 	// StacksDataDir is where cloned gitops repos are kept per stack:
 	//   <StacksDataDir>/<stack_id>/repo/
@@ -125,6 +143,17 @@ func Load() (*Config, error) {
 	}
 
 	cfg.WebhookSecret = os.Getenv("WEBHOOK_SECRET")
+
+	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
+	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))
+	// One without the other is a misconfiguration: the operator
+	// asked for TLS but didn't finish the wiring. Fail loud rather
+	// than silently fall back to plain HTTP and let the request
+	// listener leak through unencrypted.
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return nil, fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must both be set or both be empty")
+	}
+	cfg.TLSHSTSMaxAge = parseIntOrDefault("TLS_HSTS_MAX_AGE", 31536000)
 
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY environment variable must be set")

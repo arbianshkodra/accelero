@@ -130,6 +130,14 @@ func main() {
 	r := mux.NewRouter()
 	r.Use(middleware.Metrics)
 
+	// HSTS only when we're actually serving TLS. Setting it over plain
+	// HTTP is at best ignored, at worst misleading; gating on the cert
+	// presence keeps the header truthful.
+	tlsEnabled := cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
+	if tlsEnabled && cfg.TLSHSTSMaxAge > 0 {
+		r.Use(middleware.NewHSTS(cfg.TLSHSTSMaxAge))
+	}
+
 	// /metrics is exposed unauthenticated — this is the convention Prometheus
 	// scrapers rely on.  No secrets leak; Accelero metrics describe rates and
 	// durations, never payload contents.
@@ -205,9 +213,16 @@ func main() {
 		}
 	}()
 
-	logrus.Infof("Starting server on :%s", cfg.ServerPort)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logrus.Fatalf("Server error: %v", err)
+	if tlsEnabled {
+		logrus.Infof("Starting HTTPS server on :%s (cert=%s)", cfg.ServerPort, cfg.TLSCertFile)
+		if err := server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			logrus.Fatalf("HTTPS server error: %v", err)
+		}
+	} else {
+		logrus.Infof("Starting HTTP server on :%s (TLS disabled; set TLS_CERT_FILE+TLS_KEY_FILE to enable)", cfg.ServerPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.Fatalf("Server error: %v", err)
+		}
 	}
 
 	// Wait for background goroutines to finish.
