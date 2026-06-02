@@ -49,6 +49,26 @@ When a caller exhausts their bucket, Accelero responds with `429 Too Many Reques
 
 The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
 
+## Native TLS
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TLS_CERT_FILE` | *(unset — plain HTTP)* | Path to a PEM-encoded certificate (or certificate chain). |
+| `TLS_KEY_FILE` | *(unset)* | Path to the matching PEM-encoded private key. |
+| `TLS_HSTS_MAX_AGE` | `31536000` | `Strict-Transport-Security: max-age=<n>` value, in seconds. Set to `0` to disable. |
+
+Both `TLS_CERT_FILE` and `TLS_KEY_FILE` must be set together — only one set is a fatal startup error rather than a silent downgrade. Unset = plain HTTP, the default. Many deployments terminate TLS at a reverse proxy (Caddy, nginx, Traefik) and don't need Accelero doing it twice; this setting exists for the cases that *do* — air-gapped hosts, single-binary deploys, dev environments.
+
+**HSTS** is set on every response only when TLS is on. Accelero deliberately omits the `includeSubDomains` and `preload` directives — they affect every other service sharing the same origin and are effectively un-undoable for `preload`. Configure those at your edge proxy if you want them.
+
+Generate a self-signed certificate for local development:
+
+```bash
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
 ## Webhook signature verification
 
 | Variable | Default | Description |

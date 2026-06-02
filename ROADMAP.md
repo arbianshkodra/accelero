@@ -166,7 +166,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 - [ ] Drift report flags secrets referenced in compose but not resolvable at reconcile time (vs. a noisy deploy failure).
 
 **Transport & network security:**
-- [ ] Native TLS support (cert files or Let's Encrypt)
+- [x] Native TLS support via `TLS_CERT_FILE` + `TLS_KEY_FILE` (PEM-encoded cert/chain + key). Both must be set together — only one is a fatal startup error rather than a silent downgrade. HSTS header (`Strict-Transport-Security: max-age=<TLS_HSTS_MAX_AGE>`) emitted on every response while TLS is on; default 1 year, `0` disables. Accelero deliberately omits `includeSubDomains`/`preload` — those are edge-level decisions. Let's Encrypt / auto-renewal is intentionally out of scope; cert provisioning is a host-level concern. Operators who want it should put Caddy / Traefik / nginx in front and leave TLS_* unset.
 - [x] Rate limiting on API endpoints — per-API-key token bucket, applied after authentication. Configurable via `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST`; disabled by default. Rejected requests are 429 with `Retry-After` + JSON body, counted in `accelero_rate_limited_requests_total` by route template.
 - [ ] CSRF protection for session-based UI
 - [ ] Content Security Policy headers
