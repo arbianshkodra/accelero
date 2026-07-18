@@ -66,6 +66,17 @@ type Config struct {
 	// /webhook continues to require an API key as before.
 	WebhookSecret string
 
+	// RetryMaxAttempts / RetryBaseDelay / RetryMaxDelay configure the
+	// bounded exponential-backoff retry applied to the transient
+	// operations that fail intermittently on flaky networks — image
+	// pulls, git clones, and Docker network creation. RetryMaxAttempts
+	// is the total number of tries including the first; 1 disables
+	// retrying. Backoff starts at RetryBaseDelay, doubles each attempt,
+	// and is capped at RetryMaxDelay (with full jitter applied).
+	RetryMaxAttempts int
+	RetryBaseDelay   time.Duration
+	RetryMaxDelay    time.Duration
+
 	// TLSCertFile / TLSKeyFile point at PEM-encoded certificate (or
 	// chain) and private key. Both must be set together; either alone
 	// is a startup error. Unset = plain HTTP (the default — many
@@ -153,6 +164,16 @@ func Load() (*Config, error) {
 	}
 
 	cfg.WebhookSecret = os.Getenv("WEBHOOK_SECRET")
+
+	// Retry budget for transient deploy-path operations. Clamp attempts
+	// to >=1 so a nonsensical RETRY_MAX_ATTEMPTS=0 can't disable the
+	// operation entirely — it just means "no retry".
+	cfg.RetryMaxAttempts = parseIntOrDefault("RETRY_MAX_ATTEMPTS", 3)
+	if cfg.RetryMaxAttempts < 1 {
+		cfg.RetryMaxAttempts = 1
+	}
+	cfg.RetryBaseDelay = parseDurationOrDefault("RETRY_BASE_DELAY", 1*time.Second)
+	cfg.RetryMaxDelay = parseDurationOrDefault("RETRY_MAX_DELAY", 30*time.Second)
 
 	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))

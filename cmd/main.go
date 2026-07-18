@@ -17,6 +17,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
+	"github.com/arbianshkodra/accelero/internal/retry"
 	"github.com/arbianshkodra/accelero/internal/secrets"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/stack"
@@ -92,8 +93,19 @@ func main() {
 	logrus.Info("Connected to Docker daemon")
 
 	// 4. Create core components.
+	retryPolicy := retry.Policy{
+		MaxAttempts: cfg.RetryMaxAttempts,
+		BaseDelay:   cfg.RetryBaseDelay,
+		MaxDelay:    cfg.RetryMaxDelay,
+	}
 	deployer := stack.NewDeployer(cli, db, cfg.StacksDataDir)
+	deployer.SetRetryPolicy(retryPolicy)
 	rec := reconciler.New(db, cli, deployer)
+	rec.SetRetryPolicy(retryPolicy)
+	if cfg.RetryMaxAttempts > 1 {
+		logrus.Infof("Transient-operation retries enabled: up to %d attempts, backoff %s..%s",
+			cfg.RetryMaxAttempts, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+	}
 
 	// Shared audit recorder — writes to the same SQLite store.
 	auditRecorder := audit.NewStoreRecorder(db)
