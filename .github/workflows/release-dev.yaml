@@ -38,6 +38,22 @@ jobs:
       - name: Build Docker Images
         run: ./scripts/build_docker_images.sh
 
+      # Keep the Docker Hub repository overview in sync with the tailored
+      # .docker/README.md (absolute links so nothing renders broken).
+      # non-fatal: Docker Hub historically requires an account PASSWORD (not a
+      # PAT) to update the description. If DOCKER_HUB_ACCESS_TOKEN is a PAT and
+      # this 401s, add a DOCKER_HUB_PASSWORD secret and point `password` at it —
+      # the release itself still succeeds regardless.
+      - name: Sync overview to Docker Hub
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          repository: arbianshkodra/accelero
+          short-description: ${{ github.event.repository.description }}
+          readme-filepath: ./.docker/README.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
