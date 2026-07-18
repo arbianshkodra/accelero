@@ -69,6 +69,22 @@ openssl req -x509 -nodes -newkey rsa:2048 \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 ```
 
+## Security response headers
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTENT_SECURITY_POLICY` | `default-src 'none'; frame-ancestors 'none'` | Value of the `Content-Security-Policy` header. Set to an explicit empty string to omit the header. |
+
+On every response Accelero always sets three defensive headers — they have no downside for a JSON API:
+
+- `X-Content-Type-Options: nosniff` — stops a browser second-guessing a declared `Content-Type` (e.g. rendering a JSON error as HTML).
+- `X-Frame-Options: DENY` — clickjacking defence, honoured by clients that ignore CSP.
+- `Referrer-Policy: no-referrer` — Accelero URLs carry stack ids/names; don't leak them via the `Referer` header.
+
+The **Content-Security-Policy** header is configurable. The default is locked down (`default-src 'none'`) because Accelero serves no browser UI today — nothing legitimate needs to load. Setting `CONTENT_SECURITY_POLICY=` (explicitly empty) omits the CSP header while keeping the three companions above, which is what you want behind an edge proxy that sets its own policy. Leaving the variable unset keeps the secure default.
+
+Unlike HSTS, these headers are valid over both HTTP and HTTPS, so they are always sent.
+
 ## Webhook signature verification
 
 | Variable | Default | Description |
