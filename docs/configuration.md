@@ -68,6 +68,23 @@ Failures that a retry cannot fix are **not** retried — they fail fast:
 
 Everything else (connection resets, timeouts, upstream 5xx, DNS hiccups) is treated as transient and retried up to the budget.
 
+## Auto-deploy circuit breaker
+
+Where retries handle a transient failure *within* one operation, the circuit breaker handles a stack that keeps failing *across* reconcile cycles (a bad image reference, revoked credentials, a malformed compose). Such a stack is left in `error` status but the reconciler keeps retrying it, so it **self-heals** once the underlying problem is fixed (typically a git push) — the breaker throttles those retries so a persistently-broken stack isn't redeployed every cycle.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive reconcile-triggered deploy failures before a stack's breaker trips open. `0` disables the breaker (stacks retry every cycle). |
+| `CIRCUIT_BREAKER_COOLDOWN` | `10m` | How long the breaker stays open before allowing one half-open trial deploy. Go duration. |
+
+Lifecycle for a failing stack:
+
+1. **Closed** — auto-deploys run normally. Each consecutive failure increments a counter.
+2. **Open** — after `CIRCUIT_BREAKER_THRESHOLD` consecutive failures the breaker trips; auto-deploys are skipped (counted in `accelero_auto_deploys_skipped_total`, one `stack.circuit_breaker.opened` audit entry) until the cooldown elapses.
+3. **Half-open** — after the cooldown, one trial deploy is allowed. Success closes the breaker (stack returns to `active`); failure re-opens it for another cooldown.
+
+**Manual deploys are never gated by the breaker** — an operator triggering `POST /stacks/{id}/deploy` always runs. Trips are exposed as `accelero_circuit_breaker_tripped_total{stack}`.
+
 ## Native TLS
 
 | Variable | Default | Description |

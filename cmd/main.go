@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/audit"
+	"github.com/arbianshkodra/accelero/internal/breaker"
 	"github.com/arbianshkodra/accelero/internal/config"
 	"github.com/arbianshkodra/accelero/internal/handler"
 	"github.com/arbianshkodra/accelero/internal/metrics"
@@ -102,9 +103,14 @@ func main() {
 	deployer.SetRetryPolicy(retryPolicy)
 	rec := reconciler.New(db, cli, deployer)
 	rec.SetRetryPolicy(retryPolicy)
+	rec.SetCircuitBreaker(breaker.New(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown))
 	if cfg.RetryMaxAttempts > 1 {
 		logrus.Infof("Transient-operation retries enabled: up to %d attempts, backoff %s..%s",
 			cfg.RetryMaxAttempts, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+	}
+	if cfg.CircuitBreakerThreshold > 0 {
+		logrus.Infof("Auto-deploy circuit breaker enabled: trips after %d consecutive failures, %s cooldown",
+			cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown)
 	}
 
 	// Shared audit recorder — writes to the same SQLite store.
