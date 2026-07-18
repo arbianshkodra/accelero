@@ -51,7 +51,7 @@ for PLATFORM in "${PLATFORMS[@]}"; do
       "$MAIN_PACKAGE"
 done
 
-cp LICENSE.md dist/
+cp LICENSE dist/
 
 pushd dist > /dev/null
   for PLATFORM in "${PLATFORMS[@]}"; do
@@ -59,14 +59,14 @@ pushd dist > /dev/null
     GOARCH="${PLATFORM#*/}"
     OUTPUT_NAME="${BINARY_NAME}_${GOOS}_${GOARCH}"
     if [[ "$GOOS" == "windows" ]]; then
-      zip "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}.exe" LICENSE.md
+      zip "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}.exe" LICENSE
     else
-      tar -czf "${OUTPUT_NAME}.tar.gz" "${OUTPUT_NAME}" LICENSE.md
+      tar -czf "${OUTPUT_NAME}.tar.gz" "${OUTPUT_NAME}" LICENSE
     fi
   done
 popd > /dev/null
 
-rm -f dist/LICENSE.md
+rm -f dist/LICENSE
 
 pushd dist > /dev/null
   # Use sha256sum on Linux, shasum on macOS
