@@ -138,6 +138,11 @@ func main() {
 		r.Use(middleware.NewHSTS(cfg.TLSHSTSMaxAge))
 	}
 
+	// Defensive response headers (nosniff, frame-options, referrer-policy,
+	// plus a locked-down CSP by default). Valid over both HTTP and HTTPS,
+	// so applied unconditionally — unlike HSTS, which requires real TLS.
+	r.Use(middleware.NewSecurityHeaders(cfg.ContentSecurityPolicy))
+
 	// /metrics is exposed unauthenticated — this is the convention Prometheus
 	// scrapers rely on.  No secrets leak; Accelero metrics describe rates and
 	// durations, never payload contents.
