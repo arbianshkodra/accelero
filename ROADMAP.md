@@ -200,7 +200,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 **Reliability:**
 - [x] Retry with exponential backoff: image pulls, git clones, network operations. Bounded backoff + full jitter via `internal/retry` (`retry.Do` + `retry.Permanent`), wired into both the deploy and reconcile paths. Non-retryable failures (registry auth/not-found, git auth/repo-not-found/bad-branch) fail fast rather than burning the budget. Configurable via `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` (defaults 3 / 1s / 30s; attempts=1 disables).
 - [ ] Configurable retry budget *per operation type* (today one global policy covers pulls/clones/network ops)
-- [ ] Circuit breaker for repeatedly-failing stacks
+- [x] Circuit breaker for repeatedly-failing stacks. The reconciler now also reconciles `error`-status stacks (not just `active`), so a failed deploy self-heals once its repo is fixed; a per-stack breaker (`internal/breaker`) throttles those retries — after `CIRCUIT_BREAKER_THRESHOLD` consecutive failures it trips open, skips auto-deploys for `CIRCUIT_BREAKER_COOLDOWN`, then allows a half-open trial. Manual deploys are never gated. Trips audited (`stack.circuit_breaker.opened`) and metered (`accelero_circuit_breaker_tripped_total`, `accelero_auto_deploys_skipped_total`). Also hardened `runLoop` so a transient DB error at loop start no longer permanently kills a stack's reconcile loop.
 
 **Backup & disaster recovery:**
 - [ ] `POST /admin/backup` — one-shot backup of SQLite

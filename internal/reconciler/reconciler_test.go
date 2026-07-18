@@ -7,8 +7,22 @@ import (
 	"testing"
 
 	"github.com/arbianshkodra/accelero/internal/service"
+	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/stretchr/testify/assert"
 )
+
+// ---------------------------------------------------------------------------
+// shouldReconcile
+// ---------------------------------------------------------------------------
+
+func TestShouldReconcile(t *testing.T) {
+	// Active and error stacks reconcile — error so a failed stack can
+	// self-heal (with circuit-breaker backoff). Paused/deploying do not.
+	assert.True(t, shouldReconcile(store.StackStatusActive))
+	assert.True(t, shouldReconcile(store.StackStatusError))
+	assert.False(t, shouldReconcile(store.StackStatusPaused))
+	assert.False(t, shouldReconcile(store.StackStatusDeploying))
+}
 
 // ---------------------------------------------------------------------------
 // imagesMatch
