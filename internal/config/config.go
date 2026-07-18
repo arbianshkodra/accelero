@@ -77,6 +77,15 @@ type Config struct {
 	RetryBaseDelay   time.Duration
 	RetryMaxDelay    time.Duration
 
+	// CircuitBreakerThreshold / CircuitBreakerCooldown configure the
+	// auto-deploy circuit breaker: after this many consecutive
+	// reconcile-triggered deploy failures, a stack's breaker trips open
+	// and auto-deploys are skipped until the cooldown elapses (then one
+	// half-open trial is allowed). Threshold 0 disables the breaker.
+	// Manual deploys are never gated.
+	CircuitBreakerThreshold int
+	CircuitBreakerCooldown  time.Duration
+
 	// TLSCertFile / TLSKeyFile point at PEM-encoded certificate (or
 	// chain) and private key. Both must be set together; either alone
 	// is a startup error. Unset = plain HTTP (the default — many
@@ -174,6 +183,15 @@ func Load() (*Config, error) {
 	}
 	cfg.RetryBaseDelay = parseDurationOrDefault("RETRY_BASE_DELAY", 1*time.Second)
 	cfg.RetryMaxDelay = parseDurationOrDefault("RETRY_MAX_DELAY", 30*time.Second)
+
+	// Auto-deploy circuit breaker. Default enabled (threshold 5) — a stack
+	// that fails 5 reconcile deploys in a row is almost certainly broken in
+	// a way redeploying won't fix. Clamp to >=0; 0 disables.
+	cfg.CircuitBreakerThreshold = parseIntOrDefault("CIRCUIT_BREAKER_THRESHOLD", 5)
+	if cfg.CircuitBreakerThreshold < 0 {
+		cfg.CircuitBreakerThreshold = 0
+	}
+	cfg.CircuitBreakerCooldown = parseDurationOrDefault("CIRCUIT_BREAKER_COOLDOWN", 10*time.Minute)
 
 	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))
