@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/audit"
+	"github.com/arbianshkodra/accelero/internal/breaker"
 	"github.com/arbianshkodra/accelero/internal/compose"
 	"github.com/arbianshkodra/accelero/internal/gitutil"
 	"github.com/arbianshkodra/accelero/internal/logctx"
@@ -100,6 +101,11 @@ type Reconciler struct {
 	// reconciler's git clone. Defaults to a single attempt (no retry)
 	// until SetRetryPolicy is called (wired from config in main).
 	retryPolicy retry.Policy
+
+	// breaker gates auto-deploys for stacks that keep failing across
+	// reconcile cycles. Defaults to a disabled breaker (never trips)
+	// until SetCircuitBreaker is called from config in main.
+	breaker *breaker.Breaker
 }
 
 // SetRetryPolicy configures the exponential-backoff retry applied to the
@@ -107,6 +113,12 @@ type Reconciler struct {
 // churning every New() call site.
 func (r *Reconciler) SetRetryPolicy(p retry.Policy) {
 	r.retryPolicy = p
+}
+
+// SetCircuitBreaker installs the auto-deploy circuit breaker. Setter rather
+// than constructor param to avoid churning every New() call site.
+func (r *Reconciler) SetCircuitBreaker(b *breaker.Breaker) {
+	r.breaker = b
 }
 
 // SetAudit attaches an audit recorder. Setter rather than constructor
@@ -124,6 +136,21 @@ func (r *Reconciler) recordAudit(ctx context.Context, e store.AuditEntry) {
 	_ = r.audit.Record(ctx, e)
 }
 
+// recordBreakerTripped writes the one-time audit entry for a stack's
+// auto-deploy circuit breaker tripping open.
+func (r *Reconciler) recordBreakerTripped(ctx context.Context, stack *store.Stack) {
+	e := audit.FromSystem("reconciler", store.AuditOpCircuitBreakerOpen)
+	e.ResourceType = "stack"
+	e.ResourceID = stack.ID
+	e.StackID = stack.ID
+	e.StackName = stack.Name
+	e.Outcome = store.AuditOutcomeFailure
+	e.Metadata = map[string]string{
+		"threshold": fmt.Sprintf("%d", r.breaker.Threshold()),
+	}
+	r.recordAudit(ctx, e)
+}
+
 // New creates a Reconciler. Call Start to begin reconciliation loops.
 func New(s store.Store, dockerClient *client.Client, deployer Deployer) *Reconciler {
 	return &Reconciler{
@@ -133,6 +160,8 @@ func New(s store.Store, dockerClient *client.Client, deployer Deployer) *Reconci
 		loops:    make(map[string]*stackLoop),
 		// One attempt = no retry until an operator opts in via config.
 		retryPolicy: retry.Policy{MaxAttempts: 1},
+		// Disabled breaker (threshold 0) until config enables it.
+		breaker: breaker.New(0, 0),
 	}
 }
 
@@ -149,7 +178,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 	}
 
 	for _, stack := range stacks {
-		if stack.ReconcileInterval > 0 && stack.Status == store.StackStatusActive {
+		if stack.ReconcileInterval > 0 && shouldReconcile(stack.Status) {
 			r.startStackLoop(stack)
 		}
 	}
@@ -214,7 +243,7 @@ func (r *Reconciler) RefreshStack(stackID string) {
 	// Enrich subsequent log lines with the resolved stack_name.
 	log = log.WithField("stack_name", stack.Name)
 
-	if stack.ReconcileInterval > 0 && stack.Status == store.StackStatusActive {
+	if stack.ReconcileInterval > 0 && shouldReconcile(stack.Status) {
 		r.startStackLoop(stack)
 		log.WithField("interval_seconds", stack.ReconcileInterval).
 			Info("reconciler: refreshed reconcile loop")
@@ -250,20 +279,20 @@ func (r *Reconciler) startStackLoop(stack *store.Stack) {
 	r.mu.Unlock()
 
 	r.wg.Add(1)
-	go r.runLoop(loopCtx, stack.ID, done)
+	go r.runLoop(loopCtx, stack, done)
 }
 
-// runLoop is the per-stack reconciliation goroutine.
-func (r *Reconciler) runLoop(ctx context.Context, stackID string, done chan struct{}) {
+// runLoop is the per-stack reconciliation goroutine. It takes the freshly
+// read stack from startStackLoop rather than re-reading it: a transient DB
+// error at loop start used to kill the whole goroutine permanently (a stack
+// whose loop dies never reconciles again until restart), which is exactly
+// the kind of failure the reconciler exists to survive. reconcileOnce
+// reloads the stack every tick, so config changes are still picked up.
+func (r *Reconciler) runLoop(ctx context.Context, stack *store.Stack, done chan struct{}) {
 	defer r.wg.Done()
 	defer close(done)
 
-	// Re-read the stack so we get the freshest interval.
-	stack, err := r.store.GetStack(stackID)
-	if err != nil || stack == nil {
-		logrus.Errorf("reconciler: loop for stack %s could not load stack: %v", stackID, err)
-		return
-	}
+	stackID := stack.ID
 
 	// Bake the stack identity into the loop's context so every log line
 	// from this goroutine carries stack_id / stack_name.
@@ -309,8 +338,8 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 		return
 	}
 
-	if stack.Status != store.StackStatusActive {
-		log.Debug("stack is not active, skipping reconcile")
+	if !shouldReconcile(stack.Status) {
+		log.Debugf("stack status %q is not reconcilable, skipping", stack.Status)
 		return
 	}
 
@@ -352,26 +381,49 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 		r.recordAudit(ctx, driftAudit)
 
 		if stack.AutoDeploy {
-			log.Info("auto-deploying to resolve drift")
+			if !r.breaker.Allow(stack.ID) {
+				// Breaker open: this stack keeps failing, so we skip the
+				// auto-deploy until the cooldown elapses (Allow will then
+				// permit one half-open trial). Manual deploys are never
+				// gated by this path.
+				log.Warnf("circuit breaker open for stack %s (%s); skipping auto-deploy until cooldown elapses",
+					stack.Name, r.breaker.State(stack.ID))
+				metrics.IncAutoDeploySkipped(stack.Name)
+			} else {
+				log.Info("auto-deploying to resolve drift")
 
-			autoAudit := audit.FromSystem("reconciler", store.AuditOpDriftAutoDeployed)
-			autoAudit.ResourceType = "stack"
-			autoAudit.ResourceID = stack.ID
-			autoAudit.StackID = stack.ID
-			autoAudit.StackName = stack.Name
-			autoAudit.Outcome = store.AuditOutcomeInProgress
-			autoAudit.Metadata = map[string]string{
-				"trigger":     store.TriggerReconcile,
-				"drift_count": fmt.Sprintf("%d", len(report.Drifts)),
-			}
-			r.recordAudit(ctx, autoAudit)
+				autoAudit := audit.FromSystem("reconciler", store.AuditOpDriftAutoDeployed)
+				autoAudit.ResourceType = "stack"
+				autoAudit.ResourceID = stack.ID
+				autoAudit.StackID = stack.ID
+				autoAudit.StackName = stack.Name
+				autoAudit.Outcome = store.AuditOutcomeInProgress
+				autoAudit.Metadata = map[string]string{
+					"trigger":     store.TriggerReconcile,
+					"drift_count": fmt.Sprintf("%d", len(report.Drifts)),
+				}
+				r.recordAudit(ctx, autoAudit)
 
-			if _, deployErr := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); deployErr != nil {
-				log.WithError(deployErr).Error("auto-deploy failed")
+				if _, deployErr := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); deployErr != nil {
+					log.WithError(deployErr).Error("auto-deploy failed")
+					if r.breaker.RecordFailure(stack.ID) {
+						log.Warnf("circuit breaker opened for stack %s after %d consecutive auto-deploy failures",
+							stack.Name, r.breaker.Threshold())
+						metrics.IncCircuitBreakerTripped(stack.Name)
+						r.recordBreakerTripped(ctx, stack)
+					}
+				} else {
+					// Deploy succeeded — close the breaker (also recovers
+					// from a successful half-open trial).
+					r.breaker.RecordSuccess(stack.ID)
+				}
 			}
 		}
 	} else {
 		log.Debug("no drift")
+		// A drift-free stack is healthy; clear any breaker state so a stack
+		// fixed out-of-band (e.g. a manual deploy) doesn't stay tripped.
+		r.breaker.RecordSuccess(stack.ID)
 	}
 
 	// Persist the reconciliation timestamp regardless of drift.
@@ -380,6 +432,18 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 	if updateErr := r.store.UpdateStack(stack); updateErr != nil {
 		log.WithError(updateErr).Error("failed to update LastReconciledAt")
 	}
+}
+
+// shouldReconcile reports whether a stack's status makes it eligible for a
+// reconcile loop. Active stacks are the steady state. Error stacks are also
+// reconciled — a failed deploy leaves a stack in "error", and continuing to
+// reconcile it lets the stack self-heal once the underlying problem is fixed
+// (typically a git push), with the circuit breaker throttling retries so a
+// persistently-broken stack isn't redeployed every cycle. Paused stacks are
+// deliberately held by an operator, and "deploying" means a deploy is already
+// in flight, so both are left alone.
+func shouldReconcile(status string) bool {
+	return status == store.StackStatusActive || status == store.StackStatusError
 }
 
 // newReconcileID returns a short hex ID used to tag a single reconcile cycle.

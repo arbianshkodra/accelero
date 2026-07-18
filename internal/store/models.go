@@ -170,6 +170,11 @@ const (
 	AuditOpDeployRolledBack  = "deploy.rolled_back"
 	AuditOpDriftDetected     = "drift.detected"
 	AuditOpDriftAutoDeployed = "drift.auto_deployed"
+	// Emitted once (by system:reconciler) when a stack's auto-deploy
+	// circuit breaker trips open after consecutive failures. Only the
+	// initial closed→open trip is audited, not each cooldown re-trip, to
+	// keep the trail readable for a persistently-broken stack.
+	AuditOpCircuitBreakerOpen = "stack.circuit_breaker.opened"
 	// Operator actions that bypass the GitOps flow. Always audited so
 	// the trail captures "someone did something imperative here" even
 	// though the action itself may not change desired state (restart)

@@ -75,6 +75,24 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	circuitBreakerTrippedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "accelero",
+			Name:      "circuit_breaker_tripped_total",
+			Help:      "Times a stack's auto-deploy circuit breaker tripped open after consecutive failures, labelled by stack.",
+		},
+		[]string{"stack"},
+	)
+
+	autoDeploysSkippedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "accelero",
+			Name:      "auto_deploys_skipped_total",
+			Help:      "Auto-deploys skipped because the stack's circuit breaker was open, labelled by stack.",
+		},
+		[]string{"stack"},
+	)
 )
 
 // ---------------------------------------------------------------------------
@@ -137,6 +155,8 @@ func init() {
 		httpRequestsTotal,
 		rateLimitedTotal,
 		webhookSignatureRejectedTotal,
+		circuitBreakerTrippedTotal,
+		autoDeploysSkippedTotal,
 		deploymentDuration,
 		httpRequestDuration,
 		stacksGauge,
@@ -192,6 +212,17 @@ func IncRateLimited(path string) {
 // "hmac_mismatch", etc.) so the label set stays bounded.
 func IncWebhookSignatureRejected(reason string) {
 	webhookSignatureRejectedTotal.WithLabelValues(reason).Inc()
+}
+
+// IncCircuitBreakerTripped records a stack's auto-deploy breaker tripping open.
+func IncCircuitBreakerTripped(stack string) {
+	circuitBreakerTrippedTotal.WithLabelValues(stack).Inc()
+}
+
+// IncAutoDeploySkipped records an auto-deploy skipped because the stack's
+// circuit breaker was open.
+func IncAutoDeploySkipped(stack string) {
+	autoDeploysSkippedTotal.WithLabelValues(stack).Inc()
 }
 
 // SetStackCounts replaces the stacks gauge snapshot.  The caller should
