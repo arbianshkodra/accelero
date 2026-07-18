@@ -139,6 +139,10 @@ If you're upgrading from an older version that used `REPO_URL`, `REPO_USERNAME`,
 
 Full documentation: [accelero.sh/docs](https://accelero.sh/docs)
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test, and open a pull request.
+
 ## License
 
-See [LICENSE.md](LICENSE.md).
+Apache License 2.0 — see [LICENSE](LICENSE).
