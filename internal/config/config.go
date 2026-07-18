@@ -83,6 +83,16 @@ type Config struct {
 	// over plain HTTP is meaningless).
 	TLSHSTSMaxAge int
 
+	// ContentSecurityPolicy is the value of the Content-Security-Policy
+	// header set on every response. Defaults to a locked-down policy
+	// because Accelero serves no browser UI today — nothing legitimate
+	// needs to load. Set CONTENT_SECURITY_POLICY="" (explicitly empty)
+	// to omit the header, e.g. behind an edge proxy that sets its own;
+	// leaving it unset keeps the default. The companion security headers
+	// (X-Content-Type-Options, X-Frame-Options, Referrer-Policy) are
+	// always sent regardless of this value.
+	ContentSecurityPolicy string
+
 	// StacksDataDir is where cloned gitops repos are kept per stack:
 	//   <StacksDataDir>/<stack_id>/repo/
 	// Unlike the old /tmp-based clone, this dir is NOT deleted after a
@@ -154,6 +164,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TLS_CERT_FILE and TLS_KEY_FILE must both be set or both be empty")
 	}
 	cfg.TLSHSTSMaxAge = parseIntOrDefault("TLS_HSTS_MAX_AGE", 31536000)
+
+	// LookupEnv (not Getenv) so an explicitly-empty CONTENT_SECURITY_POLICY
+	// disables the header, while leaving it unset keeps the secure default.
+	if v, ok := os.LookupEnv("CONTENT_SECURITY_POLICY"); ok {
+		cfg.ContentSecurityPolicy = v
+	} else {
+		cfg.ContentSecurityPolicy = "default-src 'none'; frame-ancestors 'none'"
+	}
 
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY environment variable must be set")
