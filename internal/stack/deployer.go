@@ -19,9 +19,11 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/compose"
+	"github.com/arbianshkodra/accelero/internal/gitutil"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/network"
+	"github.com/arbianshkodra/accelero/internal/retry"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/arbianshkodra/accelero/internal/utils"
@@ -84,6 +86,12 @@ type Deployer struct {
 	// Per-service mutex prevents concurrent deploys of the same service.
 	serviceMu   sync.Mutex
 	serviceLocks map[string]*sync.Mutex
+
+	// retryPolicy bounds the exponential-backoff retries applied to
+	// transient operations (image pulls, git clones, network creation).
+	// Defaults to a single attempt (no retry) so tests and out-of-tree
+	// callers behave exactly as before unless SetRetryPolicy is called.
+	retryPolicy retry.Policy
 }
 
 // NewDeployer creates a Deployer with the given Docker client, store, and
@@ -95,7 +103,18 @@ func NewDeployer(cli *client.Client, s store.Store, stacksDir string) *Deployer 
 		store:        s,
 		stacksDir:    stacksDir,
 		serviceLocks: make(map[string]*sync.Mutex),
+		// One attempt = no retry, matching pre-retry behaviour until an
+		// operator opts in via SetRetryPolicy (wired from config in main).
+		retryPolicy: retry.Policy{MaxAttempts: 1},
 	}
+}
+
+// SetRetryPolicy configures the exponential-backoff retry applied to the
+// deployer's transient operations (image pulls, git clones, network
+// creation). A setter rather than a constructor parameter keeps existing
+// NewDeployer call sites (tests, out-of-tree callers) untouched.
+func (d *Deployer) SetRetryPolicy(p retry.Policy) {
+	d.retryPolicy = p
 }
 
 // SetAudit attaches an audit recorder. Keeping this as a setter rather
@@ -349,7 +368,11 @@ func (d *Deployer) executeDeploy(ctx context.Context, stack *store.Stack, deploy
 	// find them). Pre-existing networks from older deploys stay unlabelled
 	// until they're torn down and re-created.
 	for netName, netConfig := range composeFile.Networks {
-		if err := network.CreateNetworkForStack(ctx, d.cli, stack.Name, netName, netConfig); err != nil {
+		netName, netConfig := netName, netConfig
+		err := retry.Do(ctx, d.retryPolicy, "network create "+netName, func(ctx context.Context) error {
+			return network.CreateNetworkForStack(ctx, d.cli, stack.Name, netName, netConfig)
+		})
+		if err != nil {
 			return fmt.Errorf("failed to create network %s: %w", netName, err)
 		}
 	}
@@ -429,9 +452,6 @@ func (d *Deployer) cloneRepo(ctx context.Context, stack *store.Stack) (string, s
 	}
 
 	dir := d.stackRepoDir(stack.ID)
-	if err := os.RemoveAll(dir); err != nil {
-		return "", "", fmt.Errorf("clear previous clone at %s: %w", dir, err)
-	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
 		return "", "", fmt.Errorf("create stacks data dir: %w", err)
 	}
@@ -450,10 +470,30 @@ func (d *Deployer) cloneRepo(ctx context.Context, stack *store.Stack) (string, s
 		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(stack.RepoBranch)
 	}
 
-	repo, err := gogit.PlainCloneContext(ctx, dir, false, cloneOpts)
+	// Retry transient clone failures (network drops, upstream hiccups).
+	// Bad credentials / missing repo / missing branch are permanent —
+	// no amount of retrying fixes them. Each attempt starts from a clean
+	// directory since a partial clone would make the next PlainClone fail.
+	var repo *gogit.Repository
+	err := retry.Do(ctx, d.retryPolicy, "git clone "+stack.RepoURL, func(ctx context.Context) error {
+		if err := os.RemoveAll(dir); err != nil {
+			return retry.Permanent(fmt.Errorf("clear previous clone at %s: %w", dir, err))
+		}
+		r, cloneErr := gogit.PlainCloneContext(ctx, dir, false, cloneOpts)
+		if cloneErr != nil {
+			// The caller wraps this as "git clone failed: ..."; don't
+			// duplicate the prefix here.
+			if gitutil.IsPermanentCloneError(cloneErr) {
+				return retry.Permanent(cloneErr)
+			}
+			return cloneErr
+		}
+		repo = r
+		return nil
+	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return "", "", fmt.Errorf("git clone failed: %w", err)
+		return "", "", err
 	}
 
 	// Resolve HEAD commit.
@@ -1001,15 +1041,29 @@ func (d *Deployer) pullImage(ctx context.Context, imageRef, username, password, 
 		opts.RegistryAuth = base64.URLEncoding.EncodeToString(encoded)
 	}
 
-	resp, err := d.cli.ImagePull(ctx, imageRef, opts)
-	if err != nil {
-		return fmt.Errorf("failed to pull image %s: %w", imageRef, err)
-	}
-	defer resp.Close()
+	// Retry transient pull failures (registry blips, network drops) with
+	// backoff. Auth failures and missing images are permanent — retrying
+	// won't produce credentials or conjure the image, so short-circuit.
+	err := retry.Do(ctx, d.retryPolicy, "image pull "+imageRef, func(ctx context.Context) error {
+		resp, err := d.cli.ImagePull(ctx, imageRef, opts)
+		if err != nil {
+			if cerrdefs.IsUnauthorized(err) || cerrdefs.IsPermissionDenied(err) || cerrdefs.IsNotFound(err) {
+				return retry.Permanent(fmt.Errorf("failed to pull image %s: %w", imageRef, err))
+			}
+			return fmt.Errorf("failed to pull image %s: %w", imageRef, err)
+		}
+		defer resp.Close()
 
-	// Drain the stream to guarantee the pull completes before we return.
-	if _, err := io.Copy(io.Discard, resp); err != nil {
-		return fmt.Errorf("error reading image pull response for %s: %w", imageRef, err)
+		// Drain the stream to guarantee the pull completes before we return.
+		// A mid-stream failure here is transient (network drop), so it stays
+		// retryable rather than being marked permanent.
+		if _, err := io.Copy(io.Discard, resp); err != nil {
+			return fmt.Errorf("error reading image pull response for %s: %w", imageRef, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	logctx.FromContext(ctx).WithField("image", imageRef).Info("Image pulled successfully")
