@@ -198,8 +198,8 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [ ] Approval audit trail
 
 **Reliability:**
-- [ ] Retry with exponential backoff: image pulls, git clones, network operations
-- [ ] Configurable retry budget per operation type
+- [x] Retry with exponential backoff: image pulls, git clones, network operations. Bounded backoff + full jitter via `internal/retry` (`retry.Do` + `retry.Permanent`), wired into both the deploy and reconcile paths. Non-retryable failures (registry auth/not-found, git auth/repo-not-found/bad-branch) fail fast rather than burning the budget. Configurable via `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` (defaults 3 / 1s / 30s; attempts=1 disables).
+- [ ] Configurable retry budget *per operation type* (today one global policy covers pulls/clones/network ops)
 - [ ] Circuit breaker for repeatedly-failing stacks
 
 **Backup & disaster recovery:**
