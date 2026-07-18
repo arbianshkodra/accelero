@@ -1,0 +1,58 @@
+name: Bug report
+description: Report something that isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please **do not** include secrets
+        (API keys, repo/registry tokens) in logs or config you paste here.
+        For security vulnerabilities, follow [SECURITY.md](../blob/dev/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: When I ..., Accelero ...; I expected ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that triggers it.
+      placeholder: |
+        1. Create a stack with ...
+        2. Trigger a deploy ...
+        3. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / stack config
+      description: Logs around the failure and the stack/compose config, with secrets redacted.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Accelero version
+      description: Image tag or binary version (e.g. v0.6.0).
+    validations:
+      required: true
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: How are you running Accelero?
+      options:
+        - Docker
+        - Binary
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Host / Docker environment
+      description: OS + architecture and Docker version (e.g. Ubuntu 24.04 amd64, Docker 27.x).
