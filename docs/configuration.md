@@ -49,6 +49,25 @@ When a caller exhausts their bucket, Accelero responds with `429 Too Many Reques
 
 The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
 
+## Retries
+
+Transient operations in the deploy and reconcile paths — image pulls, git clones, and Docker network creation — are retried with bounded exponential backoff and full jitter. A registry blip or a dropped connection turns into a successful deploy on the second try instead of a failed one.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETRY_MAX_ATTEMPTS` | `3` | Total attempts including the first. `1` disables retrying. Clamped to `>=1`. |
+| `RETRY_BASE_DELAY` | `1s` | Backoff before the second attempt; doubles each subsequent attempt. Go duration (`500ms`, `2s`). |
+| `RETRY_MAX_DELAY` | `30s` | Ceiling on any single backoff sleep, so exponential growth can't produce absurd waits. |
+
+Backoff for attempt *n* is a uniform random draw in `[0, min(RETRY_BASE_DELAY × 2^(n-1), RETRY_MAX_DELAY)]` — full jitter spreads retries from concurrent deploys so they don't thundering-herd a recovering registry.
+
+Failures that a retry cannot fix are **not** retried — they fail fast:
+
+- Image pulls: unauthorized, permission denied, or image-not-found.
+- Git clones: authentication required / failed, repository not found, branch/reference not found.
+
+Everything else (connection resets, timeouts, upstream 5xx, DNS hiccups) is treated as transient and retried up to the budget.
+
 ## Native TLS
 
 | Variable | Default | Description |

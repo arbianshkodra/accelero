@@ -13,9 +13,11 @@ import (
 
 	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/compose"
+	"github.com/arbianshkodra/accelero/internal/gitutil"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/network"
+	"github.com/arbianshkodra/accelero/internal/retry"
 	"github.com/arbianshkodra/accelero/internal/service"
 	"github.com/arbianshkodra/accelero/internal/store"
 
@@ -93,6 +95,18 @@ type Reconciler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// retryPolicy bounds the exponential-backoff retries applied to the
+	// reconciler's git clone. Defaults to a single attempt (no retry)
+	// until SetRetryPolicy is called (wired from config in main).
+	retryPolicy retry.Policy
+}
+
+// SetRetryPolicy configures the exponential-backoff retry applied to the
+// reconciler's git clone. Setter rather than constructor param to avoid
+// churning every New() call site.
+func (r *Reconciler) SetRetryPolicy(p retry.Policy) {
+	r.retryPolicy = p
 }
 
 // SetAudit attaches an audit recorder. Setter rather than constructor
@@ -117,6 +131,8 @@ func New(s store.Store, dockerClient *client.Client, deployer Deployer) *Reconci
 		docker:   dockerClient,
 		deployer: deployer,
 		loops:    make(map[string]*stackLoop),
+		// One attempt = no retry until an operator opts in via config.
+		retryPolicy: retry.Policy{MaxAttempts: 1},
 	}
 }
 
@@ -654,9 +670,27 @@ func (r *Reconciler) fetchDesiredState(ctx context.Context, stack *store.Stack) 
 		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(stack.RepoBranch)
 	}
 
-	_, err = gogit.PlainCloneContext(ctx, tmpDir, false, cloneOpts)
+	// Retry transient clone failures with backoff. Auth/missing-repo/
+	// missing-branch errors are permanent and short-circuit. Each attempt
+	// starts from a clean dir since a partial clone would fail the next
+	// PlainClone with "repository already exists".
+	err = retry.Do(ctx, r.retryPolicy, "git clone "+stack.RepoURL, func(ctx context.Context) error {
+		if rmErr := os.RemoveAll(tmpDir); rmErr != nil {
+			return retry.Permanent(fmt.Errorf("clear temp clone dir %s: %w", tmpDir, rmErr))
+		}
+		if mkErr := os.MkdirAll(tmpDir, 0700); mkErr != nil {
+			return retry.Permanent(fmt.Errorf("recreate temp clone dir %s: %w", tmpDir, mkErr))
+		}
+		if _, cloneErr := gogit.PlainCloneContext(ctx, tmpDir, false, cloneOpts); cloneErr != nil {
+			if gitutil.IsPermanentCloneError(cloneErr) {
+				return retry.Permanent(fmt.Errorf("git clone: %w", cloneErr))
+			}
+			return fmt.Errorf("git clone: %w", cloneErr)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("git clone: %w", err)
+		return nil, nil, nil, err
 	}
 
 	// Read and parse compose file.
