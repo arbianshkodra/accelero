@@ -30,7 +30,7 @@ func TestRunOnce_WritesTimestampedSnapshot(t *testing.T) {
 	fb := &fakeBackuper{}
 	now := time.Date(2026, 7, 19, 3, 4, 5, 0, time.UTC)
 
-	path, err := RunOnce(context.Background(), fb, dir, 7, now)
+	path, err := RunOnce(context.Background(), fb, dir, 7, now, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, fb.calls)
 	assert.Equal(t, filepath.Join(dir, "accelero-backup-20260719T030405Z.db"), path)
@@ -41,7 +41,7 @@ func TestRunOnce_WritesTimestampedSnapshot(t *testing.T) {
 
 func TestRunOnce_CreatesDirIfMissing(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "backups")
-	_, err := RunOnce(context.Background(), &fakeBackuper{}, dir, 0, time.Now())
+	_, err := RunOnce(context.Background(), &fakeBackuper{}, dir, 0, time.Now(), nil)
 	require.NoError(t, err)
 	fi, err := os.Stat(dir)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestRunOnce_CreatesDirIfMissing(t *testing.T) {
 
 func TestRunOnce_PropagatesBackupError(t *testing.T) {
 	dir := t.TempDir()
-	_, err := RunOnce(context.Background(), &fakeBackuper{err: assert.AnError}, dir, 7, time.Now())
+	_, err := RunOnce(context.Background(), &fakeBackuper{err: assert.AnError}, dir, 7, time.Now(), nil)
 	assert.ErrorIs(t, err, assert.AnError)
 }
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/audit"
+	"github.com/arbianshkodra/accelero/internal/backup"
 	"github.com/arbianshkodra/accelero/internal/logctx"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
@@ -100,6 +101,11 @@ type Handler struct {
 	// hosts where the trade-off (emergency-write capability vs. one
 	// well-placed bug wiping volume data) is acceptable.
 	AllowVolumeWrites bool
+
+	// BackupEncryptor transforms the POST /admin/backup snapshot on the way
+	// out — age-encrypts it when BACKUP_ENCRYPTION_PASSPHRASE is set, or
+	// passes it through otherwise. Nil is treated as pass-through.
+	BackupEncryptor backup.Encryptor
 
 	// EncryptionEnabled reports whether at-rest encryption is active
 	// (cipher wired in cmd/main.go). The admin migration endpoint
@@ -781,7 +787,26 @@ func (h *Handler) AdminBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f, err := os.Open(dbPath)
+	// Transform the snapshot on the way out (age-encrypt when configured).
+	// Do it to a temp file first so we can send an accurate Content-Length
+	// and the right filename suffix.
+	enc := h.BackupEncryptor
+	if enc == nil {
+		enc = backup.NewEncryptor("")
+	}
+	servePath, ext := dbPath, ""
+	if enc.Enabled() {
+		encPath := dbPath + enc.Ext()
+		if err := backup.EncryptFile(dbPath, encPath, enc); err != nil {
+			logctx.FromContext(r.Context()).WithError(err).Error("admin backup: encryption failed")
+			writeError(w, "failed to encrypt backup", http.StatusInternalServerError)
+			h.recordBackupAudit(r, store.AuditOutcomeFailure, 0, "encrypt: "+err.Error())
+			return
+		}
+		servePath, ext = encPath, enc.Ext()
+	}
+
+	f, err := os.Open(servePath)
 	if err != nil {
 		writeError(w, "failed to read backup", http.StatusInternalServerError)
 		h.recordBackupAudit(r, store.AuditOutcomeFailure, 0, "open backup: "+err.Error())
@@ -794,7 +819,7 @@ func (h *Handler) AdminBackup(w http.ResponseWriter, r *http.Request) {
 		size = fi.Size()
 	}
 
-	filename := "accelero-backup-" + time.Now().UTC().Format("20060102T150405Z") + ".db"
+	filename := "accelero-backup-" + time.Now().UTC().Format("20060102T150405Z") + ".db" + ext
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	if size > 0 {

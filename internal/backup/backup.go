@@ -21,7 +21,8 @@ const (
 	filePrefix = "accelero-backup-"
 	fileSuffix = ".db"
 	tsLayout   = "20060102T150405Z"
-	glob       = filePrefix + "*" + fileSuffix
+	// glob matches both plaintext (.db) and age-encrypted (.db.age) snapshots.
+	glob = filePrefix + "*" + fileSuffix + "*"
 )
 
 // Backuper is the slice of the store this package depends on.
@@ -32,19 +33,65 @@ type Backuper interface {
 // RunOnce writes one timestamped snapshot into dir and then prunes older
 // snapshots, keeping the newest `keep` (keep <= 0 keeps all). It returns the
 // path of the snapshot just written. `now` is injected so callers (and tests)
-// control the filename timestamp.
-func RunOnce(ctx context.Context, b Backuper, dir string, keep int, now time.Time) (string, error) {
+// control the filename timestamp. enc transforms the snapshot on the way out
+// (age encryption when configured, pass-through otherwise); a nil enc means
+// pass-through. The final filename gets enc.Ext() appended (".age" when
+// encrypting).
+func RunOnce(ctx context.Context, b Backuper, dir string, keep int, now time.Time, enc Encryptor) (string, error) {
+	if enc == nil {
+		enc = nopEncryptor{}
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create backup dir %q: %w", dir, err)
 	}
-	dest := filepath.Join(dir, filePrefix+now.UTC().Format(tsLayout)+fileSuffix)
-	if err := b.Backup(ctx, dest); err != nil {
+	// Stage the raw VACUUM snapshot outside the backup dir so partial/temp
+	// files never sit alongside finished snapshots (and never match the glob).
+	stage, err := os.MkdirTemp("", "accelero-backup-stage-")
+	if err != nil {
+		return "", fmt.Errorf("create staging dir: %w", err)
+	}
+	defer os.RemoveAll(stage)
+
+	raw := filepath.Join(stage, "snapshot.db")
+	if err := b.Backup(ctx, raw); err != nil {
 		return "", err
 	}
+
+	dest := filepath.Join(dir, filePrefix+now.UTC().Format(tsLayout)+fileSuffix+enc.Ext())
+	if err := EncryptFile(raw, dest, enc); err != nil {
+		return "", err
+	}
+
 	// Pruning is best-effort: a failed prune must not fail the backup that
 	// already succeeded.
 	_, _ = Prune(dir, keep)
 	return dest, nil
+}
+
+// EncryptFile streams srcPath into dstPath via the encryptor (0600), cleaning
+// up a partial destination on failure. A nil enc passes bytes through
+// unchanged. Exported so the HTTP backup handler can reuse the exact same
+// snapshot-transform path as the scheduler.
+func EncryptFile(srcPath, dstPath string, enc Encryptor) error {
+	if enc == nil {
+		enc = nopEncryptor{}
+	}
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open snapshot: %w", err)
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create %q: %w", dstPath, err)
+	}
+	if err := enc.Encrypt(dst, src); err != nil {
+		dst.Close()
+		os.Remove(dstPath)
+		return err
+	}
+	return dst.Close()
 }
 
 // Prune removes all but the newest `keep` snapshot files in dir and returns

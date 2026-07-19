@@ -200,7 +200,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [x] `POST /admin/backup` — one-shot consistent SQLite snapshot (`VACUUM INTO`, safe against the live WAL DB) streamed as a file download; audited as `admin.backup`. Restore is a file swap at `DATABASE_PATH`.
 - [x] Scheduled backups to a local path — `BACKUP_INTERVAL` runs a consistent snapshot on start and every interval into `BACKUP_DIR`, retaining the newest `BACKUP_KEEP` (disabled by default). Reuses the same `VACUUM INTO` snapshot as `/admin/backup`.
 - [ ] Remote backup destinations (S3, GCS, or arbitrary SCP)
-- [ ] Backup encryption (age / gpg)
+- [x] Backup encryption — `BACKUP_ENCRYPTION_PASSPHRASE` age-encrypts every snapshot (scheduled + `/admin/backup`) as a standard age stream (`.db.age`), decryptable anywhere with `age -d`. Whole-file wrap via `filippo.io/age`, independent of the field-level `ACCELERO_ENCRYPTION_KEY`.
 - [ ] Restore wizard (load backup, verify, swap)
 
 **Templates (git-first, not in-app):**

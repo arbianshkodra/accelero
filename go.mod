@@ -3,6 +3,7 @@ module github.com/arbianshkodra/accelero
 go 1.25.5
 
 require (
+	filippo.io/age v1.3.1
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/go-units v0.5.0
 	github.com/go-git/go-git/v5 v5.19.1
@@ -19,6 +20,7 @@ require (
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
+	filippo.io/hpke v0.4.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

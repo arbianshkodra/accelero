@@ -57,11 +57,18 @@ Accelero can write periodic consistent snapshots of its SQLite database to a loc
 |----------|---------|-------------|
 | `BACKUP_INTERVAL` | `0` *(disabled)* | How often to write a snapshot (Go duration, e.g. `6h`, `24h`). `0` disables the scheduler. When set, one snapshot is also written immediately on startup. |
 | `BACKUP_DIR` | `./data/backups` | Directory the snapshots are written to (created if missing). |
-| `BACKUP_KEEP` | `7` | Retain only the newest N snapshots; older ones are pruned after each backup. `0` keeps all. Only files named `accelero-backup-*.db` are ever pruned. |
+| `BACKUP_KEEP` | `7` | Retain only the newest N snapshots; older ones are pruned after each backup. `0` keeps all. Only files named `accelero-backup-*.db`/`.db.age` are ever pruned. |
+| `BACKUP_ENCRYPTION_PASSPHRASE` | *(unset — plaintext)* | When set, every snapshot (scheduled **and** `POST /admin/backup`) is [age](https://age-encryption.org)-encrypted with this passphrase. |
 
-Snapshots are named `accelero-backup-<UTC timestamp>.db`. Restore is a file swap: stop Accelero, copy a snapshot over the file at `DATABASE_PATH`, and start again.
+Snapshots are named `accelero-backup-<UTC timestamp>.db` (or `.db.age` when encrypted). Restore is a file swap: stop Accelero, copy a snapshot over the file at `DATABASE_PATH`, and start again.
 
-> ⚠️ Snapshots contain the same sensitive data as `/admin/backup` (repo tokens, secrets — encrypted at rest only if `ACCELERO_ENCRYPTION_KEY` is set). Point `BACKUP_DIR` somewhere appropriately protected.
+**Encryption.** A snapshot contains everything Accelero persists — including repo tokens and per-stack secrets — so on-disk backups are a real exposure. Set `BACKUP_ENCRYPTION_PASSPHRASE` and every snapshot is written as a standard **age** stream (`.db.age`). Decrypt anywhere with the [`age`](https://github.com/FiloSottile/age) CLI:
+
+```bash
+age -d -o accelero.db accelero-backup-20260101T000000Z.db.age   # prompts for the passphrase
+```
+
+This is independent of `ACCELERO_ENCRYPTION_KEY` (which encrypts individual DB *fields*); backup encryption wraps the whole snapshot file. Without the passphrase set, snapshots are plaintext — point `BACKUP_DIR` somewhere protected.
 
 ## Retries
 

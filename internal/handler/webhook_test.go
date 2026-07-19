@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
+	"github.com/arbianshkodra/accelero/internal/backup"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/gorilla/mux"
@@ -294,6 +297,39 @@ func TestAdminBackup_StreamsSnapshotAndAudits(t *testing.T) {
 	assert.Equal(t, store.AuditOutcomeSuccess, rec.entries[0].Outcome)
 	assert.Equal(t, "admin", rec.entries[0].ResourceType)
 	assert.Equal(t, strconv.Itoa(len("SQLite format 3\x00hello-backup")), rec.entries[0].Metadata["bytes"])
+}
+
+func TestAdminBackup_EncryptsWhenConfigured(t *testing.T) {
+	rec := &captureRecorder{}
+	ms := &mockStore{backupContent: []byte("SQLite format 3\x00hello-backup")}
+	h := &Handler{
+		Store: ms, Deployer: &mockDeployer{}, Audit: rec,
+		BackupEncryptor: backup.NewEncryptor("s3cret-pass"),
+	}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/backup", nil)
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	// Filename gets the .age suffix, and the body is a standard age stream.
+	assert.Contains(t, rr.Header().Get("Content-Disposition"), ".db.age\"")
+	body := rr.Body.Bytes()
+	assert.True(t, bytes.HasPrefix(body, []byte("age-encryption.org/v1")), "body should be age-encrypted")
+	assert.NotContains(t, rr.Body.String(), "hello-backup", "plaintext must not be present")
+
+	// Decrypts back to the original snapshot with the passphrase.
+	id, _ := age.NewScryptIdentity("s3cret-pass")
+	dr, err := age.Decrypt(bytes.NewReader(body), id)
+	require.NoError(t, err)
+	dec, _ := io.ReadAll(dr)
+	assert.Equal(t, "SQLite format 3\x00hello-backup", string(dec))
+
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOutcomeSuccess, rec.entries[0].Outcome)
 }
 
 func TestAdminBackup_FailureAuditsAndReturns500(t *testing.T) {

@@ -152,8 +152,12 @@ func main() {
 			defer wg.Done()
 			backupLoop(ctx, db, cfg)
 		}()
-		logrus.Infof("Scheduled backups enabled: every %s to %s (keeping newest %d)",
-			cfg.BackupInterval, cfg.BackupDir, cfg.BackupKeep)
+		encNote := ""
+		if cfg.BackupEncryptionPassphrase != "" {
+			encNote = " (age-encrypted)"
+		}
+		logrus.Infof("Scheduled backups enabled: every %s to %s (keeping newest %d)%s",
+			cfg.BackupInterval, cfg.BackupDir, cfg.BackupKeep, encNote)
 	}
 
 	// 10. Set up HTTP server.
@@ -187,6 +191,7 @@ func main() {
 		VolumeBrowser:     volumepkg.NewDockerBrowser(cli, ""),
 		AllowVolumeWrites: cfg.AllowVolumeWrites,
 		EncryptionEnabled: cipher.Enabled(),
+		BackupEncryptor:   backup.NewEncryptor(cfg.BackupEncryptionPassphrase),
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
@@ -359,8 +364,9 @@ func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
 // immediately on start so operators get a snapshot without waiting a full
 // interval, then ticks. Failures are logged, not fatal.
 func backupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
+	enc := backup.NewEncryptor(cfg.BackupEncryptionPassphrase)
 	runBackup := func() {
-		path, err := backup.RunOnce(ctx, db, cfg.BackupDir, cfg.BackupKeep, time.Now())
+		path, err := backup.RunOnce(ctx, db, cfg.BackupDir, cfg.BackupKeep, time.Now(), enc)
 		if err != nil {
 			logrus.Errorf("Scheduled backup failed: %v", err)
 			return

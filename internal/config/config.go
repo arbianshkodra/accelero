@@ -39,6 +39,13 @@ type Config struct {
 	BackupInterval time.Duration
 	BackupDir      string
 	BackupKeep     int
+
+	// BackupEncryptionPassphrase, when non-empty, age-encrypts every backup
+	// snapshot (scheduled and POST /admin/backup) with a scrypt passphrase.
+	// Output files get a .age suffix and are decryptable anywhere with
+	// `age -d` + the passphrase — important because snapshots contain
+	// secrets (repo tokens, per-stack secrets). Empty = plaintext snapshots.
+	BackupEncryptionPassphrase string
 	// AuditMaxAge is how long to keep audit entries before the cleanup
 	// loop drops them. Audit is compliance/investigation data — kept
 	// considerably longer than deploy history by default (90 days vs 24h).
@@ -210,6 +217,7 @@ func Load() (*Config, error) {
 	if cfg.BackupKeep < 0 {
 		cfg.BackupKeep = 0
 	}
+	cfg.BackupEncryptionPassphrase = os.Getenv("BACKUP_ENCRYPTION_PASSPHRASE")
 
 	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))
