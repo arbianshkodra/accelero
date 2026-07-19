@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -214,6 +216,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	// Admin: one-shot migration that re-encrypts any plaintext
 	// secrets in place. No-op when encryption is disabled.
 	api.HandleFunc("/admin/encrypt-existing", h.EncryptExistingStacks).Methods("POST")
+	api.HandleFunc("/admin/backup", h.AdminBackup).Methods("POST")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -748,6 +751,77 @@ func (h *Handler) EncryptExistingStacks(w http.ResponseWriter, r *http.Request) 
 		body["stacks_failed"] = failed
 	}
 	writeJSON(w, body, http.StatusOK)
+}
+
+// AdminBackup streams a consistent snapshot of the SQLite database as a
+// download. It uses VACUUM INTO (via Store.Backup) to produce a safe, compact
+// copy of the live WAL database into a temp file, streams it to the client,
+// and cleans up. Every call is audited as admin.backup.
+//
+// The snapshot contains everything Accelero persists — including repo tokens
+// and registry/stack secrets. Those are encrypted at rest iff
+// ACCELERO_ENCRYPTION_KEY is set; otherwise the backup holds them in
+// plaintext. Treat the downloaded file accordingly.
+func (h *Handler) AdminBackup(w http.ResponseWriter, r *http.Request) {
+	// Hand VACUUM INTO a fresh path inside a private temp dir (never a
+	// pre-created file), and clean the whole dir up afterward.
+	tmpDir, err := os.MkdirTemp("", "accelero-backup-")
+	if err != nil {
+		writeError(w, "failed to prepare backup", http.StatusInternalServerError)
+		h.recordBackupAudit(r, store.AuditOutcomeFailure, 0, "mkdir temp: "+err.Error())
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "accelero.db")
+	if err := h.Store.Backup(r.Context(), dbPath); err != nil {
+		logctx.FromContext(r.Context()).WithError(err).Error("admin backup: VACUUM INTO failed")
+		writeError(w, "failed to create backup", http.StatusInternalServerError)
+		h.recordBackupAudit(r, store.AuditOutcomeFailure, 0, err.Error())
+		return
+	}
+
+	f, err := os.Open(dbPath)
+	if err != nil {
+		writeError(w, "failed to read backup", http.StatusInternalServerError)
+		h.recordBackupAudit(r, store.AuditOutcomeFailure, 0, "open backup: "+err.Error())
+		return
+	}
+	defer f.Close()
+
+	var size int64
+	if fi, statErr := f.Stat(); statErr == nil {
+		size = fi.Size()
+	}
+
+	filename := "accelero-backup-" + time.Now().UTC().Format("20060102T150405Z") + ".db"
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	if size > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.Copy(w, f); err != nil {
+		// Headers/status already sent; can't change the response now.
+		logctx.FromContext(r.Context()).WithError(err).Warn("admin backup: stream interrupted")
+		h.recordBackupAudit(r, store.AuditOutcomeFailure, size, "stream: "+err.Error())
+		return
+	}
+	h.recordBackupAudit(r, store.AuditOutcomeSuccess, size, "")
+}
+
+// recordBackupAudit writes the admin.backup audit entry. size is the backup
+// byte count (0 on early failure); errMsg is empty on success.
+func (h *Handler) recordBackupAudit(r *http.Request, outcome string, size int64, errMsg string) {
+	entry := audit.FromRequest(r, store.AuditOpAdminBackup)
+	entry.ResourceType = "admin"
+	entry.Outcome = outcome
+	entry.Metadata = map[string]string{"bytes": strconv.FormatInt(size, 10)}
+	if errMsg != "" {
+		entry.Metadata["error"] = errMsg
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
 }
 
 // --------------------------------------------------------------------------

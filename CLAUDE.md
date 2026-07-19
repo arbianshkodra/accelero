@@ -181,6 +181,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 
 **Admin:**
 - `POST /api/v1/admin/encrypt-existing` — one-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still in pre-encryption plaintext. Requires `ACCELERO_ENCRYPTION_KEY`; returns 400 when encryption is disabled. Idempotent (second call returns `stacks_migrated: 0`). Audited as `admin.encrypt-existing`.
+- `POST /api/v1/admin/backup` — streams a consistent SQLite snapshot as a file download (`Content-Disposition: attachment; filename="accelero-backup-<UTC>.db"`). Produced via `Store.Backup` → SQLite `VACUUM INTO` (safe against the live WAL DB) into a temp dir, streamed, then cleaned up. The snapshot contains all persisted data incl. secrets (encrypted at rest only if `ACCELERO_ENCRYPTION_KEY` is set). Audited as `admin.backup` with `bytes` in metadata (500 + failure audit on error).
 
 **Audit log (append-only):**
 - `GET /api/v1/audit` — filters: stack (id or name), actor, operation, since (Go duration), limit (≤1000). Newest first. Immutable at the store layer — no write/update/delete path.
@@ -225,7 +226,8 @@ Both `active` and `error` stacks are reconciled (`reconciler.shouldReconcile`); 
 
 ### Testing Strategy
 
-- `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer; also covers the `/admin/encrypt-existing` endpoint (disabled-state 400, happy path, idempotency)
+- `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer; also covers the `/admin/encrypt-existing` endpoint (disabled-state 400, happy path, idempotency) and `/admin/backup` (streams octet-stream snapshot with attachment filename + Content-Length, success/failure audit with `bytes`)
+- `store/sqlite_test.go`: `TestBackup_ProducesReadableSnapshot` — `VACUUM INTO` writes a non-empty file that opens as a valid store with the original data intact
 - `service/service_test.go`: Tests ParseDuration and EnvVars unmarshaling
 - `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName
 - `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`

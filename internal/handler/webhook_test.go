@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -36,6 +39,12 @@ type mockStore struct {
 
 	// registries mirrors the secrets layout but keyed by (stack_id, server).
 	registries map[string]map[string]*store.StackRegistry
+
+	// backup controls the mock's Backup behaviour: if backupErr is set it
+	// is returned; otherwise backupContent (or a default marker) is written
+	// to destPath to simulate VACUUM INTO producing a snapshot file.
+	backupErr     error
+	backupContent []byte
 }
 
 // newHandler wires a Handler with the three test doubles we need. Kept
@@ -197,6 +206,16 @@ func (m *mockStore) ListStacksNeedingEncryption() ([]string, error) {
 }
 func (m *mockStore) Ping(ctx context.Context) error { return nil }
 func (m *mockStore) Close() error                   { return nil }
+func (m *mockStore) Backup(ctx context.Context, destPath string) error {
+	if m.backupErr != nil {
+		return m.backupErr
+	}
+	content := m.backupContent
+	if content == nil {
+		content = []byte("SQLite format 3\x00mock-backup")
+	}
+	return os.WriteFile(destPath, content, 0600)
+}
 
 // mockDeployer implements Deployer for testing.
 type mockDeployer struct {
@@ -247,6 +266,53 @@ func TestCreateStack(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "test-stack", result.Name)
 	assert.NotEmpty(t, result.ID)
+}
+
+func TestAdminBackup_StreamsSnapshotAndAudits(t *testing.T) {
+	rec := &captureRecorder{}
+	ms := &mockStore{backupContent: []byte("SQLite format 3\x00hello-backup")}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/backup", nil)
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "application/octet-stream", rr.Header().Get("Content-Type"))
+	assert.Contains(t, rr.Header().Get("Content-Disposition"), "attachment; filename=\"accelero-backup-")
+	assert.Contains(t, rr.Header().Get("Content-Disposition"), ".db\"")
+	// Body is exactly the snapshot bytes the store produced.
+	assert.Equal(t, "SQLite format 3\x00hello-backup", rr.Body.String())
+	assert.Equal(t, strconv.Itoa(len("SQLite format 3\x00hello-backup")), rr.Header().Get("Content-Length"))
+
+	// Audited as admin.backup / success with the byte count.
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOpAdminBackup, rec.entries[0].Operation)
+	assert.Equal(t, store.AuditOutcomeSuccess, rec.entries[0].Outcome)
+	assert.Equal(t, "admin", rec.entries[0].ResourceType)
+	assert.Equal(t, strconv.Itoa(len("SQLite format 3\x00hello-backup")), rec.entries[0].Metadata["bytes"])
+}
+
+func TestAdminBackup_FailureAuditsAndReturns500(t *testing.T) {
+	rec := &captureRecorder{}
+	ms := &mockStore{backupErr: errors.New("disk full")}
+	h := &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/backup", nil)
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOpAdminBackup, rec.entries[0].Operation)
+	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
+	assert.Contains(t, rec.entries[0].Metadata["error"], "disk full")
 }
 
 func TestListStacks(t *testing.T) {

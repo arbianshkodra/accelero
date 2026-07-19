@@ -1,7 +1,9 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBackup_ProducesReadableSnapshot(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.CreateStack(makeStack("s1", "alpha")))
+
+	dest := filepath.Join(t.TempDir(), "backup.db")
+	require.NoError(t, s.Backup(context.Background(), dest))
+
+	fi, err := os.Stat(dest)
+	require.NoError(t, err)
+	assert.Greater(t, fi.Size(), int64(0), "backup file should be non-empty")
+
+	// Open the snapshot as its own store — the data must have come across.
+	restored, err := NewSQLiteStore(dest)
+	require.NoError(t, err)
+	defer restored.Close()
+	got, err := restored.GetStack("s1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "alpha", got.Name)
+}
 
 // newTestStore creates a temporary SQLite store for a single test.
 func newTestStore(t *testing.T) *SQLiteStore {

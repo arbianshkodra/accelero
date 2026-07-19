@@ -782,6 +782,22 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
+// Backup writes a consistent snapshot of the database to destPath using
+// SQLite's `VACUUM INTO`. Unlike copying the .db file, this is safe against
+// a live WAL database (it checkpoints internally) and produces a compact,
+// defragmented, self-contained copy. destPath must not already exist.
+//
+// The path is a server-generated temp path (never user input), but we still
+// escape single quotes since VACUUM INTO takes a string literal, not a bound
+// parameter.
+func (s *SQLiteStore) Backup(ctx context.Context, destPath string) error {
+	escaped := strings.ReplaceAll(destPath, "'", "''")
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO '"+escaped+"'"); err != nil {
+		return fmt.Errorf("vacuum into %q: %w", destPath, err)
+	}
+	return nil
+}
+
 // --- scan helpers ---
 
 type scannable interface {
