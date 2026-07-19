@@ -187,6 +187,7 @@ const (
 	AuditOpVolumeRead         = "volume.read"
 	AuditOpVolumeWrite        = "volume.write"
 	AuditOpAdminEncrypt       = "admin.encrypt-existing"
+	AuditOpAdminBackup        = "admin.backup"
 
 	// Per-stack secrets CRUD. Values never appear in audit metadata —
 	// only the name and outcome do. See handler.StackSecretsSet /

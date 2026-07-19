@@ -335,6 +335,7 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `drift.detected` | `system:reconciler` | One per reconcile cycle with drift (not per drift item — kept compact). Metadata: `drift_count`, per-type counts (`drift_type_missing`, `drift_type_image_mismatch`, etc.). |
 | `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
 | `admin.encrypt-existing` | `api-key` | Re-saves pre-encryption plaintext rows through the cipher. Metadata: `stacks_migrated`, `stacks_failed`. Outcome is `failure` if any row failed. |
+| `admin.backup` | `api-key` | One-shot SQLite snapshot download (`VACUUM INTO`). Metadata: `bytes` (and `error` on failure). |
 | `stack.secret.set` | `api-key` | Upsert of a per-stack secret. Metadata: `rewrote_existing`. **Value is never included.** |
 | `stack.secret.delete` | `api-key` | Delete of a per-stack secret. Always recorded — failures carry `error_message: "not found"` when the caller tried to delete a non-existent key. |
 | `stack.registry.set` | `api-key` | Upsert of a per-stack registry credential. Metadata: `rewrote_existing`, `username`. **Password is never included.** |
@@ -1044,6 +1045,31 @@ If any row fails to migrate (e.g. transient store error), the failed IDs are ret
 **Errors:** `400 Bad Request` when the server has no encryption key attached.
 
 Audited as `admin.encrypt-existing` with `stacks_migrated` and `stacks_failed` counts in metadata.
+
+### Back Up the Database
+`POST /api/v1/admin/backup`
+
+Streams a consistent snapshot of Accelero's SQLite database as a file download. The snapshot is produced with SQLite's `VACUUM INTO`, which is safe to run against the live (WAL) database and yields a compact, defragmented, self-contained copy — no need to stop the server or copy the `.db` file by hand.
+
+**Response:** `200 OK`
+- `Content-Type: application/octet-stream`
+- `Content-Disposition: attachment; filename="accelero-backup-<UTC timestamp>.db"`
+- `Content-Length: <bytes>`
+- Body: the raw SQLite database file.
+
+```bash
+curl -X POST https://your-host/api/v1/admin/backup \
+  -H "X-API-KEY: your-key" \
+  -o accelero-backup.db
+```
+
+Restore is a file swap: stop Accelero, replace the file at `DATABASE_PATH` with the downloaded snapshot, and start again.
+
+> ⚠️ **The backup contains everything Accelero persists**, including repo tokens and per-stack/registry secrets. Those are encrypted at rest **only if** `ACCELERO_ENCRYPTION_KEY` is set; otherwise they are in plaintext in the file. Store the download securely.
+
+**Errors:** `500 Internal Server Error` if the snapshot can't be produced.
+
+Every call is audited as `admin.backup` (outcome `success`/`failure`, with the byte count in metadata).
 
 ---
 

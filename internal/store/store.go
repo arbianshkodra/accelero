@@ -57,6 +57,12 @@ type Store interface {
 	// plaintext form. Empty slice means nothing to migrate.
 	ListStacksNeedingEncryption() ([]string, error)
 
+	// Backup writes a consistent snapshot of the database to destPath
+	// (which must not already exist) using SQLite's VACUUM INTO. It is
+	// safe to run against a live WAL database and produces a compact,
+	// self-contained copy.
+	Backup(ctx context.Context, destPath string) error
+
 	// Lifecycle
 	Ping(ctx context.Context) error
 	Close() error
