@@ -1,3 +1,6 @@
+<!-- Docker Hub repository Overview. Paste this into the Docker Hub repo's
+     Overview on release — it is NOT auto-synced (see release.yaml). Keep it
+     version-agnostic so it doesn't need updating per release. -->
 <p align="center">
   <img src="https://raw.githubusercontent.com/arbianshkodra/accelero/dev/docs/images/logo.png" width="420" />
 </p>
@@ -16,7 +19,7 @@ Docker Compose**.
 ## Supported tags
 
 - `latest` — the most recent release (multi-arch: `amd64`, `arm64`, `arm`, `386`)
-- `x.y.z` — a specific release (e.g. `0.6.0`)
+- `X.Y.Z` — a specific release; see [Releases](https://github.com/arbianshkodra/accelero/releases) or [all Docker Hub tags](https://hub.docker.com/r/arbianshkodra/accelero/tags)
 
 ## Quick start
 
@@ -53,6 +56,7 @@ curl -X POST http://localhost:8000/api/v1/stacks \
 - **Observability** — container logs/stats (incl. live WebSocket streams), exec, Docker events (SSE), resource browsers, Prometheus `/metrics`
 - **Security** — native TLS + HSTS, per-stack secrets, at-rest encryption, per-API-key rate limiting, HMAC-signed webhooks, append-only audit log
 - **Reliability** — retries with backoff, an auto-deploy circuit breaker, and self-healing of failed stacks
+- **Backup & DR** — one-shot (`POST /admin/backup`) and scheduled local SQLite snapshots
 - **Single binary** — SQLite persistence, no dependencies beyond Docker
 
 ## Configuration
