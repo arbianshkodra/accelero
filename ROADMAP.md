@@ -46,10 +46,6 @@ Unlike Portainer (UI-first, click-to-deploy, imperative), Accelero is **git-firs
 - [x] Container labeling (`managed-by=accelero`, `accelero-stack=<name>`)
 - [x] CI/CD pipeline (split lint/test on PRs, build/release on tags, docs deploy)
 
----
-
-## In Progress
-
 ### Phase 2 — Compose Compatibility & Core Observability
 
 Goal: accept any reasonable real-world compose file, and surface enough runtime state to diagnose a deployment.
@@ -77,10 +73,6 @@ Goal: accept any reasonable real-world compose file, and surface enough runtime 
 - [x] Prometheus metrics endpoint (`/metrics`) — deployments count, duration, failures, drift events, active reconcile loops
 - [x] Deployment diff preview (`POST /stacks/{id}/preview` — show what would change without deploying)
 - [x] `/healthz` and `/readyz` endpoints (distinct from `/health`)
-
----
-
-## Planned
 
 ### Phase 3 — GitOps Operator Experience
 
@@ -114,6 +106,8 @@ Goal: operators can observe, debug, and audit GitOps-managed workloads without n
 - [x] Time-based retention — `AUDIT_MAX_AGE` (default 90d; `0` disables). Runs on the existing `STATUS_CLEANUP_INTERVAL` cadence (default hourly).
 
 ---
+
+## In Progress
 
 ### Phase 4 — Security & Multi-Tenancy
 
@@ -204,7 +198,8 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 
 **Backup & disaster recovery:**
 - [x] `POST /admin/backup` — one-shot consistent SQLite snapshot (`VACUUM INTO`, safe against the live WAL DB) streamed as a file download; audited as `admin.backup`. Restore is a file swap at `DATABASE_PATH`.
-- [ ] Scheduled backups (cron-like) to local path, S3, GCS, or arbitrary SCP
+- [x] Scheduled backups to a local path — `BACKUP_INTERVAL` runs a consistent snapshot on start and every interval into `BACKUP_DIR`, retaining the newest `BACKUP_KEEP` (disabled by default). Reuses the same `VACUUM INTO` snapshot as `/admin/backup`.
+- [ ] Remote backup destinations (S3, GCS, or arbitrary SCP)
 - [ ] Backup encryption (age / gpg)
 - [ ] Restore wizard (load backup, verify, swap)
 
@@ -213,6 +208,8 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [ ] `POST /stacks/from-template` — create a stack from a template URL
 
 ---
+
+## Planned
 
 ### Phase 6 — Web UI
 

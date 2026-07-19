@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/audit"
+	"github.com/arbianshkodra/accelero/internal/backup"
 	"github.com/arbianshkodra/accelero/internal/breaker"
 	"github.com/arbianshkodra/accelero/internal/config"
 	"github.com/arbianshkodra/accelero/internal/handler"
@@ -143,6 +144,17 @@ func main() {
 		defer wg.Done()
 		deploymentCleanupLoop(ctx, db, cfg)
 	}()
+
+	// 9b. Start the scheduled-backup routine if enabled.
+	if cfg.BackupInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			backupLoop(ctx, db, cfg)
+		}()
+		logrus.Infof("Scheduled backups enabled: every %s to %s (keeping newest %d)",
+			cfg.BackupInterval, cfg.BackupDir, cfg.BackupKeep)
+	}
 
 	// 10. Set up HTTP server.
 	r := mux.NewRouter()
@@ -342,6 +354,35 @@ func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
 // history: 24h; audit: 90d) but sharing the ticker keeps the number of
 // background goroutines down — the cleanup work is all cheap DELETE
 // queries.
+// backupLoop writes a consistent database snapshot to cfg.BackupDir every
+// cfg.BackupInterval, retaining the newest cfg.BackupKeep. It runs one backup
+// immediately on start so operators get a snapshot without waiting a full
+// interval, then ticks. Failures are logged, not fatal.
+func backupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
+	runBackup := func() {
+		path, err := backup.RunOnce(ctx, db, cfg.BackupDir, cfg.BackupKeep, time.Now())
+		if err != nil {
+			logrus.Errorf("Scheduled backup failed: %v", err)
+			return
+		}
+		logrus.Infof("Wrote scheduled backup: %s", path)
+	}
+
+	runBackup() // once at startup
+
+	ticker := time.NewTicker(cfg.BackupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Info("Scheduled backup routine stopped")
+			return
+		case <-ticker.C:
+			runBackup()
+		}
+	}
+}
+
 func deploymentCleanupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
 	ticker := time.NewTicker(cfg.StatusCleanupInterval)
 	defer ticker.Stop()
