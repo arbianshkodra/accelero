@@ -49,6 +49,20 @@ When a caller exhausts their bucket, Accelero responds with `429 Too Many Reques
 
 The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
 
+## Scheduled backups
+
+Accelero can write periodic consistent snapshots of its SQLite database to a local directory (the same `VACUUM INTO` snapshot as the on-demand `POST /api/v1/admin/backup`). Disabled by default.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKUP_INTERVAL` | `0` *(disabled)* | How often to write a snapshot (Go duration, e.g. `6h`, `24h`). `0` disables the scheduler. When set, one snapshot is also written immediately on startup. |
+| `BACKUP_DIR` | `./data/backups` | Directory the snapshots are written to (created if missing). |
+| `BACKUP_KEEP` | `7` | Retain only the newest N snapshots; older ones are pruned after each backup. `0` keeps all. Only files named `accelero-backup-*.db` are ever pruned. |
+
+Snapshots are named `accelero-backup-<UTC timestamp>.db`. Restore is a file swap: stop Accelero, copy a snapshot over the file at `DATABASE_PATH`, and start again.
+
+> ⚠️ Snapshots contain the same sensitive data as `/admin/backup` (repo tokens, secrets — encrypted at rest only if `ACCELERO_ENCRYPTION_KEY` is set). Point `BACKUP_DIR` somewhere appropriately protected.
+
 ## Retries
 
 Transient operations in the deploy and reconcile paths — image pulls, git clones, and Docker network creation — are retried with bounded exponential backoff and full jitter. A registry blip or a dropped connection turns into a successful deploy on the second try instead of a failed one.

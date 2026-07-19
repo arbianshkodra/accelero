@@ -29,6 +29,16 @@ type Config struct {
 	// Status Cleanup
 	StatusCleanupInterval time.Duration
 	StatusMaxAge          time.Duration
+
+	// BackupInterval / BackupDir / BackupKeep configure scheduled local
+	// database backups. BackupInterval <= 0 disables the scheduler (the
+	// default; on-demand POST /admin/backup still works). When enabled, a
+	// consistent snapshot is written to BackupDir every interval and only
+	// the newest BackupKeep snapshots are retained (BackupKeep <= 0 keeps
+	// all).
+	BackupInterval time.Duration
+	BackupDir      string
+	BackupKeep     int
 	// AuditMaxAge is how long to keep audit entries before the cleanup
 	// loop drops them. Audit is compliance/investigation data — kept
 	// considerably longer than deploy history by default (90 days vs 24h).
@@ -192,6 +202,14 @@ func Load() (*Config, error) {
 		cfg.CircuitBreakerThreshold = 0
 	}
 	cfg.CircuitBreakerCooldown = parseDurationOrDefault("CIRCUIT_BREAKER_COOLDOWN", 10*time.Minute)
+
+	// Scheduled local backups. Disabled by default (interval 0).
+	cfg.BackupInterval = parseDurationOrDefault("BACKUP_INTERVAL", 0)
+	cfg.BackupDir = envOrDefault("BACKUP_DIR", "./data/backups")
+	cfg.BackupKeep = parseIntOrDefault("BACKUP_KEEP", 7)
+	if cfg.BackupKeep < 0 {
+		cfg.BackupKeep = 0
+	}
 
 	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))

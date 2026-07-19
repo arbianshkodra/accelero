@@ -111,6 +111,7 @@ Optional:
 - `LOG_FORMAT`: Log format — "json" or "text" (default: text)
 - `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)
 - `QUEUE_SIZE`: Task queue buffer size override (default: 15 * workers, min: 50, max: 1000)
+- `BACKUP_INTERVAL` / `BACKUP_DIR` / `BACKUP_KEEP`: scheduled local DB backups. `BACKUP_INTERVAL` (Go duration, default `0` = disabled) writes a consistent `VACUUM INTO` snapshot on startup and every interval into `BACKUP_DIR` (default `./data/backups`), retaining the newest `BACKUP_KEEP` (default `7`; `0` keeps all — prunes only `accelero-backup-*.db`). Same snapshot as `POST /admin/backup`. Implemented in `internal/backup` (`RunOnce` + `Prune`); driven by `backupLoop` in `cmd/main.go`.
 - `STATUS_CLEANUP_INTERVAL`: Deployment record cleanup interval (default: 1h) — shared with audit cleanup
 - `STATUS_MAX_AGE`: Max deployment record age (default: 24h)
 - `AUDIT_MAX_AGE`: Max audit entry age before cleanup (default: 90 days). Set to `0` to disable retention (useful for compliance contexts that require indefinite retention)
@@ -228,6 +229,7 @@ Both `active` and `error` stacks are reconciled (`reconciler.shouldReconcile`); 
 
 - `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer; also covers the `/admin/encrypt-existing` endpoint (disabled-state 400, happy path, idempotency) and `/admin/backup` (streams octet-stream snapshot with attachment filename + Content-Length, success/failure audit with `bytes`)
 - `store/sqlite_test.go`: `TestBackup_ProducesReadableSnapshot` — `VACUUM INTO` writes a non-empty file that opens as a valid store with the original data intact
+- `backup/backup_test.go`: `RunOnce` writes a timestamped snapshot / creates the dir / propagates backup errors; `Prune` keeps newest N, `keep<=0` retains all, fewer-than-keep is a no-op, and it never touches non-`accelero-backup-*.db` files
 - `service/service_test.go`: Tests ParseDuration and EnvVars unmarshaling
 - `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName
 - `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`
