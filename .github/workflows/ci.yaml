@@ -22,11 +22,12 @@ jobs:
         with:
           go-version: 1.25.x
 
+      # Run staticcheck directly rather than via dominikh/staticcheck-action,
+      # whose latest release (v1.4.1) still bundles a Node.js-20 actions/cache
+      # and triggers the runner deprecation warning. `go run` uses the Go
+      # toolchain already set up above — no third-party action, no Node dep.
       - name: Static check
-        uses: dominikh/staticcheck-action@v1.4.1
-        with:
-          version: "latest"
-          install-go: "false"
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
   test:
     name: Test
