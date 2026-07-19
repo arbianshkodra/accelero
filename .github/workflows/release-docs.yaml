@@ -1,8 +1,8 @@
-name: Release Docs Dev
+name: Release Docs
 
 on:
   workflow_run:
-    workflows: ["Release Dev"]
+    workflows: ["Release"]
     types:
       - completed
 
@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  release-docs-dev:
-    name: Release Docs Dev
+  release-docs:
+    name: Release Docs
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
