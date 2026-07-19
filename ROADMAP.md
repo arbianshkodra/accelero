@@ -203,7 +203,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [x] Circuit breaker for repeatedly-failing stacks. The reconciler now also reconciles `error`-status stacks (not just `active`), so a failed deploy self-heals once its repo is fixed; a per-stack breaker (`internal/breaker`) throttles those retries — after `CIRCUIT_BREAKER_THRESHOLD` consecutive failures it trips open, skips auto-deploys for `CIRCUIT_BREAKER_COOLDOWN`, then allows a half-open trial. Manual deploys are never gated. Trips audited (`stack.circuit_breaker.opened`) and metered (`accelero_circuit_breaker_tripped_total`, `accelero_auto_deploys_skipped_total`). Also hardened `runLoop` so a transient DB error at loop start no longer permanently kills a stack's reconcile loop.
 
 **Backup & disaster recovery:**
-- [ ] `POST /admin/backup` — one-shot backup of SQLite
+- [x] `POST /admin/backup` — one-shot consistent SQLite snapshot (`VACUUM INTO`, safe against the live WAL DB) streamed as a file download; audited as `admin.backup`. Restore is a file swap at `DATABASE_PATH`.
 - [ ] Scheduled backups (cron-like) to local path, S3, GCS, or arbitrary SCP
 - [ ] Backup encryption (age / gpg)
 - [ ] Restore wizard (load backup, verify, swap)
