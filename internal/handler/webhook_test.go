@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"testing"
@@ -60,7 +61,7 @@ func newTestHandler(store *mockStore, docker DockerClient) *Handler {
 	}
 }
 
-func (m *mockStore) CreateStack(s *store.Stack) error               { m.stacks = append(m.stacks, s); return nil }
+func (m *mockStore) CreateStack(s *store.Stack) error { m.stacks = append(m.stacks, s); return nil }
 func (m *mockStore) GetStack(id string) (*store.Stack, error) {
 	for _, s := range m.stacks {
 		if s.ID == id {
@@ -86,17 +87,22 @@ func (m *mockStore) UpdateStack(s *store.Stack) error {
 	return nil
 }
 func (m *mockStore) DeleteStack(id string) error { return nil }
-func (m *mockStore) CreateDeployment(d *store.Deployment) error                   { m.deployments = append(m.deployments, d); return nil }
-func (m *mockStore) GetDeployment(id string) (*store.Deployment, error)           { return nil, nil }
+func (m *mockStore) CreateDeployment(d *store.Deployment) error {
+	m.deployments = append(m.deployments, d)
+	return nil
+}
+func (m *mockStore) GetDeployment(id string) (*store.Deployment, error) { return nil, nil }
 func (m *mockStore) ListDeployments(stackID string, limit int) ([]*store.Deployment, error) {
 	return m.deployments, nil
 }
-func (m *mockStore) UpdateDeployment(d *store.Deployment) error                   { return nil }
-func (m *mockStore) CleanupOldDeployments(maxAge time.Duration) (int, error)      { return 0, nil }
-func (m *mockStore) TrackContainer(c *store.ManagedContainer) error               { return nil }
-func (m *mockStore) ListContainers(stackID string) ([]*store.ManagedContainer, error) { return nil, nil }
-func (m *mockStore) RemoveContainer(containerID string) error                     { return nil }
-func (m *mockStore) RemoveContainersByStack(stackID string) error                 { return nil }
+func (m *mockStore) UpdateDeployment(d *store.Deployment) error              { return nil }
+func (m *mockStore) CleanupOldDeployments(maxAge time.Duration) (int, error) { return 0, nil }
+func (m *mockStore) TrackContainer(c *store.ManagedContainer) error          { return nil }
+func (m *mockStore) ListContainers(stackID string) ([]*store.ManagedContainer, error) {
+	return nil, nil
+}
+func (m *mockStore) RemoveContainer(containerID string) error     { return nil }
+func (m *mockStore) RemoveContainersByStack(stackID string) error { return nil }
 func (m *mockStore) CreateAuditEntry(e *store.AuditEntry) error {
 	m.auditEntries = append(m.auditEntries, e)
 	return nil
@@ -349,6 +355,101 @@ func TestAdminBackup_FailureAuditsAndReturns500(t *testing.T) {
 	assert.Equal(t, store.AuditOpAdminBackup, rec.entries[0].Operation)
 	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
 	assert.Contains(t, rec.entries[0].Metadata["error"], "disk full")
+}
+
+// validBackupBytes returns the bytes of a valid, standalone Accelero SQLite
+// snapshot (schema present) for restore-upload tests.
+func validBackupBytes(t *testing.T) []byte {
+	t.Helper()
+	s, err := store.NewSQLiteStore(filepath.Join(t.TempDir(), "src.db"))
+	require.NoError(t, err)
+	snap := filepath.Join(t.TempDir(), "snap.db")
+	require.NoError(t, s.Backup(context.Background(), snap))
+	s.Close()
+	b, err := os.ReadFile(snap)
+	require.NoError(t, err)
+	return b
+}
+
+func TestAdminRestore_DisabledReturns403(t *testing.T) {
+	rec := &captureRecorder{}
+	h := &Handler{Store: &mockStore{}, Deployer: &mockDeployer{}, Audit: rec, AllowRestore: false}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/restore", bytes.NewReader([]byte("x")))
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	h.RegisterRoutes(router, func(n http.Handler) http.Handler { return n })
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusForbidden, rr.Code)
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOpAdminRestore, rec.entries[0].Operation)
+	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
+}
+
+func TestAdminRestore_StagesValidBackup(t *testing.T) {
+	rec := &captureRecorder{}
+	dbPath := filepath.Join(t.TempDir(), "accelero.db")
+	h := &Handler{
+		Store: &mockStore{}, Deployer: &mockDeployer{}, Audit: rec,
+		AllowRestore: true, DatabasePath: dbPath,
+	}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/restore", bytes.NewReader(validBackupBytes(t)))
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	h.RegisterRoutes(router, func(n http.Handler) http.Handler { return n })
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	assert.FileExists(t, dbPath+".restore")
+	// The staged file is itself a valid backup.
+	assert.NoError(t, store.ValidateBackupFile(dbPath+".restore"))
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOutcomeSuccess, rec.entries[0].Outcome)
+}
+
+func TestAdminRestore_RejectsInvalidUpload(t *testing.T) {
+	rec := &captureRecorder{}
+	dbPath := filepath.Join(t.TempDir(), "accelero.db")
+	h := &Handler{
+		Store: &mockStore{}, Deployer: &mockDeployer{}, Audit: rec,
+		AllowRestore: true, DatabasePath: dbPath,
+	}
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/restore", bytes.NewReader([]byte("this is not a database")))
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	h.RegisterRoutes(router, func(n http.Handler) http.Handler { return n })
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.NoFileExists(t, dbPath+".restore")
+	require.Len(t, rec.entries, 1)
+	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
+}
+
+func TestAdminRestore_DecryptsEncryptedUpload(t *testing.T) {
+	rec := &captureRecorder{}
+	dbPath := filepath.Join(t.TempDir(), "accelero.db")
+	h := &Handler{
+		Store: &mockStore{}, Deployer: &mockDeployer{}, Audit: rec,
+		AllowRestore: true, DatabasePath: dbPath, BackupPassphrase: "pw",
+	}
+
+	// age-encrypt a valid backup, then upload it.
+	var enc bytes.Buffer
+	require.NoError(t, backup.NewEncryptor("pw").Encrypt(&enc, bytes.NewReader(validBackupBytes(t))))
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/restore", bytes.NewReader(enc.Bytes()))
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	h.RegisterRoutes(router, func(n http.Handler) http.Handler { return n })
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	assert.FileExists(t, dbPath+".restore")
+	assert.NoError(t, store.ValidateBackupFile(dbPath+".restore"), "staged file should be decrypted + valid")
 }
 
 func TestListStacks(t *testing.T) {
@@ -1079,12 +1180,12 @@ func TestSetStackSecret_RejectsInvalidNames(t *testing.T) {
 	_, _, _, router := secretsRouter(t)
 
 	cases := []string{
-		"lowercase",    // not uppercase
-		"MIXEDCase",    // not uppercase
-		"9LEADING",     // leading digit
-		"WITH-DASH",    // dash not allowed
-		"SPACE CHAR",   // space not allowed
-		"",             // empty
+		"lowercase",  // not uppercase
+		"MIXEDCase",  // not uppercase
+		"9LEADING",   // leading digit
+		"WITH-DASH",  // dash not allowed
+		"SPACE CHAR", // space not allowed
+		"",           // empty
 	}
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {

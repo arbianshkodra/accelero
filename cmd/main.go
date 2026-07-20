@@ -46,7 +46,12 @@ func main() {
 	initLogging(cfg)
 	logrus.Infof("Accelero %s (commit: %s, built: %s)", version, commit, date)
 
-	// 2. Open the database.
+	// 2. Apply a pending restore (staged by POST /admin/restore) BEFORE
+	// opening the database, so the file swap happens while nothing holds it
+	// open — the only safe moment for SQLite.
+	applyPendingRestore(cfg.DatabasePath)
+
+	// Open the database.
 	db, err := store.NewSQLiteStore(cfg.DatabasePath)
 	if err != nil {
 		logrus.Fatalf("Database error: %v", err)
@@ -192,6 +197,9 @@ func main() {
 		AllowVolumeWrites: cfg.AllowVolumeWrites,
 		EncryptionEnabled: cipher.Enabled(),
 		BackupEncryptor:   backup.NewEncryptor(cfg.BackupEncryptionPassphrase),
+		DatabasePath:      cfg.DatabasePath,
+		AllowRestore:      cfg.AllowRestore,
+		BackupPassphrase:  cfg.BackupEncryptionPassphrase,
 		DockerPing: func(ctx context.Context) error {
 			_, err := cli.Ping(ctx, client.PingOptions{})
 			return err
@@ -359,6 +367,35 @@ func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
 // history: 24h; audit: 90d) but sharing the ticker keeps the number of
 // background goroutines down — the cleanup work is all cheap DELETE
 // queries.
+// applyPendingRestore swaps in a snapshot staged by POST /admin/restore. It
+// runs at startup, before the DB is opened, so the file replacement happens
+// while nothing holds the database open — the only safe moment for SQLite. The
+// previous database is preserved as <dbPath>.pre-restore-<ts> as a safety net.
+func applyPendingRestore(dbPath string) {
+	staged := dbPath + ".restore"
+	if _, err := os.Stat(staged); err != nil {
+		return // nothing staged
+	}
+	logrus.Warnf("Pending database restore found (%s) — applying before startup", staged)
+
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	if _, err := os.Stat(dbPath); err == nil {
+		bak := dbPath + ".pre-restore-" + ts
+		if err := os.Rename(dbPath, bak); err != nil {
+			logrus.Fatalf("restore: could not move current DB aside: %v", err)
+		}
+		logrus.Infof("restore: previous database preserved at %s", bak)
+	}
+	// Drop stale WAL/SHM sidecars of the old DB so the restored file opens clean.
+	for _, s := range []string{"-wal", "-shm"} {
+		_ = os.Remove(dbPath + s)
+	}
+	if err := os.Rename(staged, dbPath); err != nil {
+		logrus.Fatalf("restore: could not move staged snapshot into place: %v", err)
+	}
+	logrus.Infof("restore: applied staged snapshot to %s", dbPath)
+}
+
 // backupLoop writes a consistent database snapshot to cfg.BackupDir every
 // cfg.BackupInterval, retaining the newest cfg.BackupKeep. It runs one backup
 // immediately on start so operators get a snapshot without waiting a full

@@ -201,7 +201,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [x] Scheduled backups to a local path — `BACKUP_INTERVAL` runs a consistent snapshot on start and every interval into `BACKUP_DIR`, retaining the newest `BACKUP_KEEP` (disabled by default). Reuses the same `VACUUM INTO` snapshot as `/admin/backup`.
 - [ ] Remote backup destinations (S3, GCS, or arbitrary SCP)
 - [x] Backup encryption — `BACKUP_ENCRYPTION_PASSPHRASE` age-encrypts every snapshot (scheduled + `/admin/backup`) as a standard age stream (`.db.age`), decryptable anywhere with `age -d`. Whole-file wrap via `filippo.io/age`, independent of the field-level `ACCELERO_ENCRYPTION_KEY`.
-- [ ] Restore wizard (load backup, verify, swap)
+- [x] Restore endpoint — `POST /admin/restore` (gated by `ALLOW_RESTORE`) uploads a snapshot (plaintext or age `.db.age`), decrypts + validates it (`integrity_check` + `stacks` table), and stages it; the swap happens safely on the next restart, preserving the prior DB as `<db>.pre-restore-<ts>`.
 
 **Templates (git-first, not in-app):**
 - [ ] Curated list of public GitOps-ready sample repos (fork-to-deploy pattern)

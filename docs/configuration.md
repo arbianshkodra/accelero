@@ -70,6 +70,12 @@ age -d -o accelero.db accelero-backup-20260101T000000Z.db.age   # prompts for th
 
 This is independent of `ACCELERO_ENCRYPTION_KEY` (which encrypts individual DB *fields*); backup encryption wraps the whole snapshot file. Without the passphrase set, snapshots are plaintext — point `BACKUP_DIR` somewhere protected.
 
+**Restore.** `POST /api/v1/admin/restore` uploads a snapshot (plaintext or `.db.age`) to replace the database. It's gated behind `ALLOW_RESTORE=true` (a wrong file is total data loss) and applies on the **next restart** — Accelero can't safely swap an open SQLite file live, so it validates + stages the upload and swaps it at startup, preserving the previous DB as `<DATABASE_PATH>.pre-restore-<timestamp>`. See the [API reference](api-reference.md#restore-the-database).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOW_RESTORE` | `false` | Set to `true` to enable `POST /admin/restore`. Off by default because a bad restore wipes all data. |
+
 ## Retries
 
 Transient operations in the deploy and reconcile paths — image pulls, git clones, and Docker network creation — are retried with bounded exponential backoff and full jitter. A registry blip or a dropped connection turns into a successful deploy on the second try instead of a failed one.

@@ -336,6 +336,7 @@ Returns audit entries newest-first. Every notable write action — stack CRUD, d
 | `drift.auto_deployed` | `system:reconciler` | Emitted when auto-deploy fires on drift. Metadata: `drift_count`. The resulting deploy then emits its own `deploy.*` entries. |
 | `admin.encrypt-existing` | `api-key` | Re-saves pre-encryption plaintext rows through the cipher. Metadata: `stacks_migrated`, `stacks_failed`. Outcome is `failure` if any row failed. |
 | `admin.backup` | `api-key` | One-shot SQLite snapshot download (`VACUUM INTO`). Metadata: `bytes` (and `error` on failure). |
+| `admin.restore` | `api-key` | Staged a uploaded snapshot to be applied on next restart. Metadata: `detail` (outcome/reason). |
 | `stack.secret.set` | `api-key` | Upsert of a per-stack secret. Metadata: `rewrote_existing`. **Value is never included.** |
 | `stack.secret.delete` | `api-key` | Delete of a per-stack secret. Always recorded — failures carry `error_message: "not found"` when the caller tried to delete a non-existent key. |
 | `stack.registry.set` | `api-key` | Upsert of a per-stack registry credential. Metadata: `rewrote_existing`, `username`. **Password is never included.** |
@@ -1070,6 +1071,41 @@ Restore is a file swap: stop Accelero, replace the file at `DATABASE_PATH` with 
 **Errors:** `500 Internal Server Error` if the snapshot can't be produced.
 
 Every call is audited as `admin.backup` (outcome `success`/`failure`, with the byte count in metadata).
+
+### Restore the Database
+`POST /api/v1/admin/restore`
+
+Uploads a backup snapshot to replace the database. **Gated behind `ALLOW_RESTORE=true`** (returns `403` otherwise) — a wrong file means total data loss.
+
+Send the snapshot as the raw request body — either a plaintext `.db` or an age-encrypted `.db.age`:
+
+```bash
+# plaintext snapshot
+curl -X POST https://your-host/api/v1/admin/restore \
+  -H "X-API-KEY: your-key" \
+  --data-binary @accelero-backup-20260101T000000Z.db
+
+# age-encrypted snapshot (passphrase via header, or falls back to BACKUP_ENCRYPTION_PASSPHRASE)
+curl -X POST https://your-host/api/v1/admin/restore \
+  -H "X-API-KEY: your-key" \
+  -H "X-Backup-Passphrase: your-passphrase" \
+  --data-binary @accelero-backup-20260101T000000Z.db.age
+```
+
+**How it works (important):** overwriting a live, open SQLite database is unsafe, so restore does **not** swap the file immediately. Instead it:
+
+1. Decrypts the upload if it's an age stream (using `X-Backup-Passphrase`, else `BACKUP_ENCRYPTION_PASSPHRASE`).
+2. Validates it: SQLite magic + `PRAGMA integrity_check` + presence of the core `stacks` table. Invalid/corrupt/wrong-file uploads are rejected with `400` and nothing is staged.
+3. **Stages** it at `<DATABASE_PATH>.restore` and returns `202 Accepted`.
+
+**You must restart Accelero to apply it.** On startup, Accelero swaps the staged file into place (while nothing holds the DB open) and **preserves the previous database** as `<DATABASE_PATH>.pre-restore-<timestamp>` as a safety net.
+
+**Response:** `202 Accepted`
+```json
+{ "status": "staged", "message": "Backup validated and staged. Restart Accelero to apply it; the current database will be preserved as <db>.pre-restore-<timestamp>." }
+```
+
+**Errors:** `403` (disabled), `400` (empty/invalid/corrupt upload, or decryption failure). Every attempt is audited as `admin.restore`.
 
 ---
 

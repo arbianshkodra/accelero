@@ -107,6 +107,7 @@ Optional:
 - `DATABASE_PATH`: SQLite database path (default: ./data/accelero.db)
 - `STACKS_DATA_DIR`: Root directory for per-stack cloned repos (default: ./data/stacks). Used as the bind-mount source when a compose service references `./path/from/repo`. When Accelero runs in Docker, this path must be the same inside and outside the container — bind-mount the host dir at the same path.
 - `ALLOW_VOLUME_WRITES`: Set to `true` to enable `POST /volumes/{name}/files` (emergency file write into a managed volume). Default `false`. Every call is audited as `volume.write` regardless of outcome.
+- `ALLOW_RESTORE`: Set to `true` to enable `POST /api/v1/admin/restore` (upload a snapshot to replace the DB). Default `false` (foot-gun: wrong file = total data loss). Restore validates + **stages** the upload; the file swap happens at the **next restart** (`applyPendingRestore` in `cmd/main.go`, before the DB is opened), preserving the prior DB as `<DATABASE_PATH>.pre-restore-<ts>`. Accepts plaintext `.db` or age `.db.age` (decrypted via `X-Backup-Passphrase` header or `BACKUP_ENCRYPTION_PASSPHRASE`). Validation is `store.ValidateBackupFile` (SQLite magic + `PRAGMA integrity_check` + `stacks` table). Audited as `admin.restore`.
 - `LOG_LEVEL`: Logging level (default: info)
 - `LOG_FORMAT`: Log format — "json" or "text" (default: text)
 - `WORKER_COUNT`: Worker goroutine count override (default: 2 * CPU cores, min: 2, max: 50)
@@ -183,6 +184,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 
 **Admin:**
 - `POST /api/v1/admin/encrypt-existing` — one-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still in pre-encryption plaintext. Requires `ACCELERO_ENCRYPTION_KEY`; returns 400 when encryption is disabled. Idempotent (second call returns `stacks_migrated: 0`). Audited as `admin.encrypt-existing`.
+- `POST /api/v1/admin/restore` — upload a snapshot (plaintext `.db` or age `.db.age`) to replace the DB. Gated by `ALLOW_RESTORE`; validates + stages, applies on next restart (see `ALLOW_RESTORE` above). Audited as `admin.restore`.
 - `POST /api/v1/admin/backup` — streams a consistent SQLite snapshot as a file download (`Content-Disposition: attachment; filename="accelero-backup-<UTC>.db"`). Produced via `Store.Backup` → SQLite `VACUUM INTO` (safe against the live WAL DB) into a temp dir, streamed, then cleaned up. The snapshot contains all persisted data incl. secrets (encrypted at rest only if `ACCELERO_ENCRYPTION_KEY` is set). Audited as `admin.backup` with `bytes` in metadata (500 + failure audit on error).
 
 **Audit log (append-only):**
@@ -229,7 +231,8 @@ Both `active` and `error` stacks are reconciled (`reconciler.shouldReconcile`); 
 ### Testing Strategy
 
 - `handler/webhook_test.go`: Tests stack CRUD API, legacy webhook, health endpoint using mock store/deployer; also covers the `/admin/encrypt-existing` endpoint (disabled-state 400, happy path, idempotency) and `/admin/backup` (streams octet-stream snapshot with attachment filename + Content-Length, success/failure audit with `bytes`)
-- `store/sqlite_test.go`: `TestBackup_ProducesReadableSnapshot` — `VACUUM INTO` writes a non-empty file that opens as a valid store with the original data intact
+- `store/sqlite_test.go`: `TestBackup_ProducesReadableSnapshot` — `VACUUM INTO` writes a non-empty file that opens as a valid store with the original data intact; `TestValidateBackupFile` — accepts a real Accelero snapshot, rejects junk (bad magic), a non-Accelero SQLite DB (missing `stacks`), and a missing file
+- `handler/webhook_test.go` (restore): `AdminRestore` — disabled → 403 + audited; valid upload → 202 + staged file validates; junk → 400, nothing staged; age-encrypted upload decrypts + stages
 - `backup/backup_test.go`: `RunOnce` writes a timestamped snapshot / creates the dir / propagates backup errors; `Prune` keeps newest N, `keep<=0` retains all, fewer-than-keep is a no-op, and it never touches non-`accelero-backup-*.db` files
 - `backup/encrypt_test.go`: `NewEncryptor` nop vs age (Enabled/Ext); nop passes through; age produces a standard `age-encryption.org/v1` stream that round-trips with the passphrase and fails on a wrong one; `RunOnce` with a passphrase writes `.db.age` (no plaintext left in the dir) that decrypts to the snapshot; `Prune` matches `.db.age` files
 - `handler/webhook_test.go` (backup): `AdminBackup` encrypted path — `.db.age` filename, `age`-stream body (no plaintext), decrypts back to the snapshot, audited success
