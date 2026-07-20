@@ -46,6 +46,18 @@ type Config struct {
 	// `age -d` + the passphrase — important because snapshots contain
 	// secrets (repo tokens, per-stack secrets). Empty = plaintext snapshots.
 	BackupEncryptionPassphrase string
+
+	// BackupS3* configure an optional S3-compatible remote destination for
+	// scheduled snapshots (AWS S3, R2, MinIO, B2, GCS-interop). When
+	// BackupS3Bucket is set, each scheduled snapshot is uploaded after it's
+	// written locally. Remote retention is left to bucket lifecycle policies.
+	BackupS3Bucket    string
+	BackupS3Endpoint  string // host[:port], no scheme; empty = AWS
+	BackupS3Region    string
+	BackupS3Prefix    string
+	BackupS3AccessKey string
+	BackupS3SecretKey string
+	BackupS3UseSSL    bool
 	// AuditMaxAge is how long to keep audit entries before the cleanup
 	// loop drops them. Audit is compliance/investigation data — kept
 	// considerably longer than deploy history by default (90 days vs 24h).
@@ -225,6 +237,13 @@ func Load() (*Config, error) {
 		cfg.BackupKeep = 0
 	}
 	cfg.BackupEncryptionPassphrase = os.Getenv("BACKUP_ENCRYPTION_PASSPHRASE")
+	cfg.BackupS3Bucket = os.Getenv("BACKUP_S3_BUCKET")
+	cfg.BackupS3Endpoint = os.Getenv("BACKUP_S3_ENDPOINT")
+	cfg.BackupS3Region = os.Getenv("BACKUP_S3_REGION")
+	cfg.BackupS3Prefix = os.Getenv("BACKUP_S3_PREFIX")
+	cfg.BackupS3AccessKey = os.Getenv("BACKUP_S3_ACCESS_KEY_ID")
+	cfg.BackupS3SecretKey = os.Getenv("BACKUP_S3_SECRET_ACCESS_KEY")
+	cfg.BackupS3UseSSL = envOrDefault("BACKUP_S3_USE_SSL", "true") == "true"
 
 	cfg.TLSCertFile = strings.TrimSpace(os.Getenv("TLS_CERT_FILE"))
 	cfg.TLSKeyFile = strings.TrimSpace(os.Getenv("TLS_KEY_FILE"))

@@ -70,6 +70,19 @@ age -d -o accelero.db accelero-backup-20260101T000000Z.db.age   # prompts for th
 
 This is independent of `ACCELERO_ENCRYPTION_KEY` (which encrypts individual DB *fields*); backup encryption wraps the whole snapshot file. Without the passphrase set, snapshots are plaintext — point `BACKUP_DIR` somewhere protected.
 
+**Remote destination (S3-compatible).** Set `BACKUP_S3_BUCKET` and each scheduled snapshot is uploaded off-host after it's written locally (so encryption applies to the uploaded copy too). Works with AWS S3, Cloudflare R2, MinIO, Backblaze B2, and GCS (interop mode).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKUP_S3_BUCKET` | *(unset — no upload)* | Target bucket. Setting it enables S3 upload for scheduled backups. |
+| `BACKUP_S3_ENDPOINT` | *(AWS: `s3.<region>.amazonaws.com`)* | `host[:port]`, no scheme. Set for R2/MinIO/B2/GCS-interop. |
+| `BACKUP_S3_REGION` | `us-east-1` | Signing region. |
+| `BACKUP_S3_ACCESS_KEY_ID` / `BACKUP_S3_SECRET_ACCESS_KEY` | — | Credentials. |
+| `BACKUP_S3_PREFIX` | *(none)* | Optional object-key prefix, e.g. `accelero/`. |
+| `BACKUP_S3_USE_SSL` | `true` | HTTPS. Set `false` only for a local plaintext endpoint (e.g. dev MinIO). |
+
+Upload is best-effort: a failed upload logs an error but never fails the local backup. **Remote retention is not managed by Accelero** — configure a bucket lifecycle policy to expire old objects (the idiomatic S3 approach). `BACKUP_KEEP` only prunes the local directory.
+
 **Restore.** `POST /api/v1/admin/restore` uploads a snapshot (plaintext or `.db.age`) to replace the database. It's gated behind `ALLOW_RESTORE=true` (a wrong file is total data loss) and applies on the **next restart** — Accelero can't safely swap an open SQLite file live, so it validates + stages the upload and swaps it at startup, preserving the previous DB as `<DATABASE_PATH>.pre-restore-<timestamp>`. See the [API reference](api-reference.md#restore-the-database).
 
 | Variable | Default | Description |
