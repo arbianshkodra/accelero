@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -160,6 +161,9 @@ func main() {
 		encNote := ""
 		if cfg.BackupEncryptionPassphrase != "" {
 			encNote = " (age-encrypted)"
+		}
+		if cfg.BackupS3Bucket != "" {
+			encNote += " + S3 bucket " + cfg.BackupS3Bucket
 		}
 		logrus.Infof("Scheduled backups enabled: every %s to %s (keeping newest %d)%s",
 			cfg.BackupInterval, cfg.BackupDir, cfg.BackupKeep, encNote)
@@ -402,6 +406,15 @@ func applyPendingRestore(dbPath string) {
 // interval, then ticks. Failures are logged, not fatal.
 func backupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
 	enc := backup.NewEncryptor(cfg.BackupEncryptionPassphrase)
+	s3 := backup.S3Config{
+		Endpoint:  cfg.BackupS3Endpoint,
+		Region:    cfg.BackupS3Region,
+		Bucket:    cfg.BackupS3Bucket,
+		Prefix:    cfg.BackupS3Prefix,
+		AccessKey: cfg.BackupS3AccessKey,
+		SecretKey: cfg.BackupS3SecretKey,
+		UseSSL:    cfg.BackupS3UseSSL,
+	}
 	runBackup := func() {
 		path, err := backup.RunOnce(ctx, db, cfg.BackupDir, cfg.BackupKeep, time.Now(), enc)
 		if err != nil {
@@ -409,6 +422,17 @@ func backupLoop(ctx context.Context, db store.Store, cfg *config.Config) {
 			return
 		}
 		logrus.Infof("Wrote scheduled backup: %s", path)
+
+		// Best-effort offsite copy — a failed upload must not fail the
+		// (already-written) local backup.
+		if s3.Enabled() {
+			key, err := s3.UploadFile(ctx, path, filepath.Base(path))
+			if err != nil {
+				logrus.Errorf("Scheduled backup: S3 upload failed: %v", err)
+			} else {
+				logrus.Infof("Scheduled backup: uploaded to s3 bucket %s as %s", s3.Bucket, key)
+			}
+		}
 	}
 
 	runBackup() // once at startup

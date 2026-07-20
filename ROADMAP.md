@@ -199,7 +199,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 **Backup & disaster recovery:**
 - [x] `POST /admin/backup` — one-shot consistent SQLite snapshot (`VACUUM INTO`, safe against the live WAL DB) streamed as a file download; audited as `admin.backup`. Restore is a file swap at `DATABASE_PATH`.
 - [x] Scheduled backups to a local path — `BACKUP_INTERVAL` runs a consistent snapshot on start and every interval into `BACKUP_DIR`, retaining the newest `BACKUP_KEEP` (disabled by default). Reuses the same `VACUUM INTO` snapshot as `/admin/backup`.
-- [ ] Remote backup destinations (S3, GCS, or arbitrary SCP)
+- [x] Remote backup destinations (S3-compatible) — `BACKUP_S3_*` uploads each scheduled snapshot to any S3 API endpoint (AWS S3, Cloudflare R2, MinIO, Backblaze B2, GCS interop) after it's written locally; best-effort, remote retention via bucket lifecycle. Verified live against MinIO. (Native GCS / SCP transports remain possible follow-ups.)
 - [x] Backup encryption — `BACKUP_ENCRYPTION_PASSPHRASE` age-encrypts every snapshot (scheduled + `/admin/backup`) as a standard age stream (`.db.age`), decryptable anywhere with `age -d`. Whole-file wrap via `filippo.io/age`, independent of the field-level `ACCELERO_ENCRYPTION_KEY`.
 - [x] Restore endpoint — `POST /admin/restore` (gated by `ALLOW_RESTORE`) uploads a snapshot (plaintext or age `.db.age`), decrypts + validates it (`integrity_check` + `stacks` table), and stages it; the swap happens safely on the next restart, preserving the prior DB as `<db>.pre-restore-<ts>`.
 
