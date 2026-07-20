@@ -66,6 +66,12 @@ type Config struct {
 	// to enable. Every write is still audited.
 	AllowVolumeWrites bool
 
+	// AllowRestore gates POST /api/v1/admin/restore, which stages an
+	// uploaded database snapshot to replace ALL current data on the next
+	// restart. It's a foot-gun (wrong file = total data loss), so it's off
+	// by default; set ALLOW_RESTORE=true to enable. Every attempt is audited.
+	AllowRestore bool
+
 	// RateLimitRPS / RateLimitBurst configure the per-API-key token
 	// bucket applied after authentication. RateLimitRPS<=0 disables
 	// the limiter entirely (the default — existing deployments keep
@@ -164,6 +170,7 @@ func Load() (*Config, error) {
 		DatabasePath:          envOrDefault("DATABASE_PATH", "./data/accelero.db"),
 		StacksDataDir:         envOrDefault("STACKS_DATA_DIR", "./data/stacks"),
 		AllowVolumeWrites:     envOrDefault("ALLOW_VOLUME_WRITES", "false") == "true",
+		AllowRestore:          envOrDefault("ALLOW_RESTORE", "false") == "true",
 		StatusCleanupInterval: parseDurationOrDefault("STATUS_CLEANUP_INTERVAL", 1*time.Hour),
 		StatusMaxAge:          parseDurationOrDefault("STATUS_MAX_AGE", 24*time.Hour),
 		AuditMaxAge:           parseDurationOrDefault("AUDIT_MAX_AGE", 90*24*time.Hour),

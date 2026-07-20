@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,45 @@ import (
 	"github.com/arbianshkodra/accelero/internal/secrets"
 	_ "modernc.org/sqlite"
 )
+
+// ValidateBackupFile checks that path is a healthy Accelero database snapshot
+// before it's accepted for restore: valid SQLite magic, passes
+// PRAGMA integrity_check, and contains the core `stacks` table. It opens the
+// file read-only and does not touch the live database.
+func ValidateBackupFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open backup: %w", err)
+	}
+	magic := make([]byte, 16)
+	n, _ := io.ReadFull(f, magic)
+	f.Close()
+	if n < 16 || string(magic) != "SQLite format 3\x00" {
+		return fmt.Errorf("not a SQLite database (bad magic header)")
+	}
+
+	db, err := sql.Open("sqlite", path+"?mode=ro")
+	if err != nil {
+		return fmt.Errorf("open backup db: %w", err)
+	}
+	defer db.Close()
+
+	var res string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&res); err != nil {
+		return fmt.Errorf("integrity check could not run: %w", err)
+	}
+	if res != "ok" {
+		return fmt.Errorf("integrity check failed: %s", res)
+	}
+
+	var name string
+	if err := db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type='table' AND name='stacks'",
+	).Scan(&name); err != nil {
+		return fmt.Errorf("not an Accelero backup (missing 'stacks' table): %w", err)
+	}
+	return nil
+}
 
 // SQLiteStore implements Store using SQLite.
 type SQLiteStore struct {

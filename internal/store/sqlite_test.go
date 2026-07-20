@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,33 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateBackupFile(t *testing.T) {
+	// A real Accelero DB (schema created by newTestStore) validates.
+	s := newTestStore(t)
+	valid := filepath.Join(t.TempDir(), "good.db")
+	require.NoError(t, s.Backup(context.Background(), valid))
+	assert.NoError(t, ValidateBackupFile(valid))
+
+	// Junk bytes: rejected on the magic-header check.
+	junk := filepath.Join(t.TempDir(), "junk.db")
+	require.NoError(t, os.WriteFile(junk, []byte("not a database at all"), 0600))
+	assert.Error(t, ValidateBackupFile(junk))
+
+	// A valid SQLite DB that isn't an Accelero backup (no `stacks` table).
+	other := filepath.Join(t.TempDir(), "other.db")
+	odb, err := sql.Open("sqlite", other)
+	require.NoError(t, err)
+	_, err = odb.Exec("CREATE TABLE unrelated (id INTEGER)")
+	require.NoError(t, err)
+	odb.Close()
+	err = ValidateBackupFile(other)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stacks")
+
+	// Missing file.
+	assert.Error(t, ValidateBackupFile(filepath.Join(t.TempDir(), "nope.db")))
+}
 
 func TestBackup_ProducesReadableSnapshot(t *testing.T) {
 	s := newTestStore(t)
@@ -60,8 +88,8 @@ func makeStack(id, name string) *Stack {
 		AutoDeploy:        true,
 		ReconcileInterval: 300,
 		Status:            StackStatusActive,
-		DockerUsername:     "duser",
-		DockerPassword:     "dpass",
+		DockerUsername:    "duser",
+		DockerPassword:    "dpass",
 		DockerRegistry:    "registry.example.com",
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -917,7 +945,7 @@ func TestAudit_LimitCap(t *testing.T) {
 	// Insert more than the cap; verify the store clamps it.
 	for i := 0; i < 50; i++ {
 		assert.NoError(t, s.CreateAuditEntry(&AuditEntry{
-			ID:        string(rune('a' + i)) + "_" + string(rune('0'+i%10)) + "_x",
+			ID:        string(rune('a'+i)) + "_" + string(rune('0'+i%10)) + "_x",
 			Timestamp: time.Now().Add(-time.Duration(i) * time.Second),
 			Actor:     "api-key",
 			Operation: AuditOpStackCreate,

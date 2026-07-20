@@ -107,6 +107,18 @@ type Handler struct {
 	// passes it through otherwise. Nil is treated as pass-through.
 	BackupEncryptor backup.Encryptor
 
+	// DatabasePath is the live SQLite path; POST /admin/restore stages an
+	// uploaded snapshot at "<DatabasePath>.restore" for swap on next restart.
+	DatabasePath string
+
+	// AllowRestore gates POST /admin/restore (ALLOW_RESTORE). Off by default.
+	AllowRestore bool
+
+	// BackupPassphrase (BACKUP_ENCRYPTION_PASSPHRASE) decrypts an uploaded
+	// age-encrypted backup during restore, unless overridden per-request via
+	// the X-Backup-Passphrase header.
+	BackupPassphrase string
+
 	// EncryptionEnabled reports whether at-rest encryption is active
 	// (cipher wired in cmd/main.go). The admin migration endpoint
 	// requires this to be true — there's no point re-saving rows
@@ -223,6 +235,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	// secrets in place. No-op when encryption is disabled.
 	api.HandleFunc("/admin/encrypt-existing", h.EncryptExistingStacks).Methods("POST")
 	api.HandleFunc("/admin/backup", h.AdminBackup).Methods("POST")
+	api.HandleFunc("/admin/restore", h.AdminRestore).Methods("POST")
 
 	api.HandleFunc("/webhook", h.LegacyWebhook).Methods("POST")
 
@@ -846,6 +859,157 @@ func (h *Handler) recordBackupAudit(r *http.Request, outcome string, size int64,
 	if errMsg != "" {
 		entry.Metadata["error"] = errMsg
 	}
+	_ = h.auditOr().Record(r.Context(), entry)
+}
+
+// maxRestoreUpload caps the restore upload (generous — a whole DB) to avoid a
+// runaway upload filling the disk.
+const maxRestoreUpload = 4 << 30 // 4 GiB
+
+// AdminRestore accepts an uploaded database snapshot (raw body; plaintext .db
+// or age-encrypted .db.age), validates it, and STAGES it to replace the live
+// database on the next restart. It deliberately does not swap the file live —
+// overwriting an open SQLite database is unsafe; applyPendingRestore performs
+// the swap at startup while nothing holds the DB open. Gated behind
+// ALLOW_RESTORE. Every attempt is audited as admin.restore.
+func (h *Handler) AdminRestore(w http.ResponseWriter, r *http.Request) {
+	if !h.AllowRestore {
+		writeError(w, "restore is disabled (set ALLOW_RESTORE=true to enable)", http.StatusForbidden)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "disabled")
+		return
+	}
+	if h.DatabasePath == "" {
+		writeError(w, "restore unavailable: database path not configured", http.StatusInternalServerError)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "no db path")
+		return
+	}
+
+	tmpDir, err := os.MkdirTemp("", "accelero-restore-")
+	if err != nil {
+		writeError(w, "failed to prepare restore", http.StatusInternalServerError)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "mkdir: "+err.Error())
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Stream the upload to a temp file (capped).
+	uploaded := filepath.Join(tmpDir, "upload")
+	uf, err := os.Create(uploaded)
+	if err != nil {
+		writeError(w, "failed to prepare restore", http.StatusInternalServerError)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "create tmp: "+err.Error())
+		return
+	}
+	n, err := io.Copy(uf, io.LimitReader(r.Body, maxRestoreUpload))
+	uf.Close()
+	if err != nil {
+		writeError(w, "failed to read upload", http.StatusBadRequest)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "read: "+err.Error())
+		return
+	}
+	if n == 0 {
+		writeError(w, "empty upload — send the backup file as the request body", http.StatusBadRequest)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "empty upload")
+		return
+	}
+
+	// Decrypt if it's an age stream.
+	candidate := uploaded
+	head, _ := os.ReadFile(uploaded)
+	if len(head) > 32 {
+		head = head[:32]
+	}
+	if backup.IsAgeEncrypted(head) {
+		passphrase := r.Header.Get("X-Backup-Passphrase")
+		if passphrase == "" {
+			passphrase = h.BackupPassphrase
+		}
+		if passphrase == "" {
+			writeError(w, "backup is age-encrypted; provide a passphrase via X-Backup-Passphrase or set BACKUP_ENCRYPTION_PASSPHRASE", http.StatusBadRequest)
+			h.recordRestoreAudit(r, store.AuditOutcomeFailure, "no passphrase")
+			return
+		}
+		decPath := filepath.Join(tmpDir, "decrypted.db")
+		if err := decryptToFile(uploaded, decPath, passphrase); err != nil {
+			writeError(w, "decryption failed (wrong passphrase or not an age file)", http.StatusBadRequest)
+			h.recordRestoreAudit(r, store.AuditOutcomeFailure, "decrypt: "+err.Error())
+			return
+		}
+		candidate = decPath
+	}
+
+	// Validate it's a healthy Accelero database.
+	if err := store.ValidateBackupFile(candidate); err != nil {
+		writeError(w, "invalid backup: "+err.Error(), http.StatusBadRequest)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "validate: "+err.Error())
+		return
+	}
+
+	// Stage it next to the live DB (atomic rename within the DB's directory).
+	staged := h.DatabasePath + ".restore"
+	if err := stageFile(candidate, staged); err != nil {
+		writeError(w, "failed to stage restore", http.StatusInternalServerError)
+		h.recordRestoreAudit(r, store.AuditOutcomeFailure, "stage: "+err.Error())
+		return
+	}
+
+	h.recordRestoreAudit(r, store.AuditOutcomeSuccess, "staged")
+	writeJSON(w, map[string]interface{}{
+		"status":  "staged",
+		"message": "Backup validated and staged. Restart Accelero to apply it; the current database will be preserved as <db>.pre-restore-<timestamp>.",
+	}, http.StatusAccepted)
+}
+
+// decryptToFile age-decrypts srcPath into dstPath with the passphrase.
+func decryptToFile(srcPath, dstPath, passphrase string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	if err := backup.Decrypt(dst, src, passphrase); err != nil {
+		dst.Close()
+		return err
+	}
+	return dst.Close()
+}
+
+// stageFile copies src to dst atomically (write to dst.partial in the same dir,
+// then rename), so an interrupted upload can't leave a half-written staged DB
+// that startup would try to apply.
+func stageFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	partial := dst + ".partial"
+	out, err := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(partial)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(partial)
+		return err
+	}
+	return os.Rename(partial, dst)
+}
+
+// recordRestoreAudit writes the admin.restore audit entry.
+func (h *Handler) recordRestoreAudit(r *http.Request, outcome, detail string) {
+	entry := audit.FromRequest(r, store.AuditOpAdminRestore)
+	entry.ResourceType = "admin"
+	entry.Outcome = outcome
+	entry.Metadata = map[string]string{"detail": detail}
 	_ = h.auditOr().Record(r.Context(), entry)
 }
 
