@@ -1358,3 +1358,58 @@ func TestStackSecret_EncryptedInDB(t *testing.T) {
 	require.Len(t, list, 1)
 	assert.Equal(t, "postgres://superSecretValue", list[0].Value)
 }
+
+func TestStackRequiresApproval_Persisted(t *testing.T) {
+	s := newTestStore(t)
+	st := makeStack("s-appr", "appr")
+	st.RequiresApproval = true
+	require.NoError(t, s.CreateStack(st))
+
+	got, err := s.GetStack("s-appr")
+	require.NoError(t, err)
+	assert.True(t, got.RequiresApproval, "requires_approval should round-trip through INSERT/scan")
+
+	// Flip it off via UpdateStack and confirm it persists.
+	got.RequiresApproval = false
+	require.NoError(t, s.UpdateStack(got))
+	got2, err := s.GetStack("s-appr")
+	require.NoError(t, err)
+	assert.False(t, got2.RequiresApproval)
+}
+
+func TestPendingApprovals(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.CreateStack(makeStack("s1", "one")))
+	require.NoError(t, s.CreateStack(makeStack("s2", "two")))
+
+	mkDep := func(id, stackID, status string, started time.Time) {
+		require.NoError(t, s.CreateDeployment(&Deployment{
+			ID: id, StackID: stackID, StackName: stackID,
+			Status: status, Trigger: TriggerManual, StartedAt: started,
+		}))
+	}
+
+	base := time.Now().Truncate(time.Second)
+	mkDep("d-done", "s1", DeploymentCompleted, base.Add(-time.Hour))
+	mkDep("d-pend1", "s1", DeploymentPendingApproval, base.Add(-30*time.Minute))
+	mkDep("d-pend2", "s2", DeploymentPendingApproval, base.Add(-10*time.Minute))
+
+	// GetPendingApproval returns the open approval for a stack, nil when none.
+	p1, err := s.GetPendingApproval("s1")
+	require.NoError(t, err)
+	require.NotNil(t, p1)
+	assert.Equal(t, "d-pend1", p1.ID)
+
+	// A stack with no pending approval → (nil, nil).
+	require.NoError(t, s.CreateStack(makeStack("s3", "three")))
+	p3, err := s.GetPendingApproval("s3")
+	require.NoError(t, err)
+	assert.Nil(t, p3)
+
+	// ListPendingApprovals returns both, oldest first, excluding the completed one.
+	all, err := s.ListPendingApprovals()
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.Equal(t, "d-pend1", all[0].ID, "oldest first")
+	assert.Equal(t, "d-pend2", all[1].ID)
+}

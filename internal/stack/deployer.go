@@ -174,20 +174,17 @@ func (d *Deployer) lockService(name string) *sync.Mutex {
 // services with zero-downtime semantics.  On failure it rolls back to the
 // pre-deployment state.  It returns the Deployment record regardless of outcome.
 func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error) {
+	// Approval gate: hold the deploy for manual approval instead of
+	// executing. requestApproval dedupes so a reconcile loop firing every
+	// cycle doesn't create (and notify) a fresh approval each time.
+	if stack.RequiresApproval {
+		return d.requestApproval(ctx, stack, trigger)
+	}
+
 	deployID, err := generateID()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate deployment id: %w", err)
 	}
-
-	// Enrich the context so every log line from this deployment carries
-	// the deployment/stack/trigger fields, including in downstream helpers.
-	ctx = logctx.WithFields(ctx, logrus.Fields{
-		"deployment_id": deployID,
-		"stack_id":      stack.ID,
-		"stack_name":    stack.Name,
-		"trigger":       trigger,
-	})
-	log := logctx.FromContext(ctx)
 
 	deployment := &store.Deployment{
 		ID:        deployID,
@@ -200,6 +197,165 @@ func (d *Deployer) Deploy(ctx context.Context, stack *store.Stack, trigger strin
 	if err := d.store.CreateDeployment(deployment); err != nil {
 		return nil, fmt.Errorf("failed to create deployment record: %w", err)
 	}
+
+	return d.runDeployment(ctx, stack, deployment)
+}
+
+// requestApproval records a deployment in the pending_approval state and audits
+// approval.requested (which the notify wrapper turns into a Slack/webhook
+// message) instead of deploying. It holds at most one open approval per stack:
+// if one already exists it's returned unchanged, so repeated triggers (e.g. the
+// reconcile loop) don't spawn duplicate approvals or spam notifications.
+func (d *Deployer) requestApproval(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error) {
+	if existing, err := d.store.GetPendingApproval(stack.ID); err != nil {
+		return nil, fmt.Errorf("check pending approval: %w", err)
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	deployID, err := generateID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate deployment id: %w", err)
+	}
+	ctx = logctx.WithFields(ctx, logrus.Fields{
+		"deployment_id": deployID,
+		"stack_id":      stack.ID,
+		"stack_name":    stack.Name,
+		"trigger":       trigger,
+	})
+
+	deployment := &store.Deployment{
+		ID:        deployID,
+		StackID:   stack.ID,
+		StackName: stack.Name,
+		Status:    store.DeploymentPendingApproval,
+		Trigger:   trigger,
+		StartedAt: time.Now(),
+	}
+	if err := d.store.CreateDeployment(deployment); err != nil {
+		return nil, fmt.Errorf("failed to create deployment record: %w", err)
+	}
+
+	entry := audit.FromSystem("deployer", store.AuditOpApprovalRequested)
+	entry.ResourceType = "deployment"
+	entry.ResourceID = deployment.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Outcome = store.AuditOutcomeInProgress
+	entry.Metadata = map[string]string{"trigger": trigger, "deployment_id": deployment.ID}
+	d.recordAudit(ctx, entry)
+
+	logctx.FromContext(ctx).Info("deploy held for approval (stack requires_approval=true)")
+	return deployment, nil
+}
+
+// ApproveDeployment executes a deployment that was held for approval. It
+// verifies the record is still pending_approval, loads its stack, and runs the
+// rollout. The HTTP handler records the approval.granted audit (it knows the
+// actor); this method only executes. Returns an error if the deployment isn't
+// pending approval (e.g. already approved, rejected, or timed out).
+func (d *Deployer) ApproveDeployment(ctx context.Context, deploymentID string) (*store.Deployment, error) {
+	deployment, err := d.store.GetDeployment(deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	if deployment == nil {
+		return nil, fmt.Errorf("deployment %s not found", deploymentID)
+	}
+	if deployment.Status != store.DeploymentPendingApproval {
+		return nil, fmt.Errorf("deployment %s is not pending approval (status=%s)", deploymentID, deployment.Status)
+	}
+	stack, err := d.store.GetStack(deployment.StackID)
+	if err != nil {
+		return nil, err
+	}
+	if stack == nil {
+		return nil, fmt.Errorf("stack %s not found for deployment %s", deployment.StackID, deploymentID)
+	}
+	return d.runDeployment(ctx, stack, deployment)
+}
+
+// RejectDeployment marks a pending_approval deployment as rejected. The HTTP
+// handler records the approval.rejected audit; this only mutates the record.
+func (d *Deployer) RejectDeployment(ctx context.Context, deploymentID, reason string) (*store.Deployment, error) {
+	deployment, err := d.store.GetDeployment(deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	if deployment == nil {
+		return nil, fmt.Errorf("deployment %s not found", deploymentID)
+	}
+	if deployment.Status != store.DeploymentPendingApproval {
+		return nil, fmt.Errorf("deployment %s is not pending approval (status=%s)", deploymentID, deployment.Status)
+	}
+	now := time.Now()
+	deployment.Status = store.DeploymentRejected
+	deployment.CompletedAt = &now
+	if reason != "" {
+		deployment.ErrorMessage = reason
+	}
+	if err := d.store.UpdateDeployment(deployment); err != nil {
+		return nil, err
+	}
+	return deployment, nil
+}
+
+// ExpirePendingApprovals rejects approvals that have waited longer than maxAge,
+// auditing each as approval.timed_out. maxAge<=0 disables expiry. Called
+// periodically from a background loop.
+func (d *Deployer) ExpirePendingApprovals(ctx context.Context, maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	pending, err := d.store.ListPendingApprovals()
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	expired := 0
+	for _, dep := range pending {
+		if dep.StartedAt.After(cutoff) {
+			continue
+		}
+		now := time.Now()
+		dep.Status = store.DeploymentRejected
+		dep.ErrorMessage = fmt.Sprintf("approval timed out after %s", maxAge)
+		dep.CompletedAt = &now
+		if err := d.store.UpdateDeployment(dep); err != nil {
+			logctx.FromContext(ctx).WithError(err).Warnf("failed to expire pending approval %s", dep.ID)
+			continue
+		}
+		entry := audit.FromSystem("deployer", store.AuditOpApprovalTimedOut)
+		entry.ResourceType = "deployment"
+		entry.ResourceID = dep.ID
+		entry.StackID = dep.StackID
+		entry.StackName = dep.StackName
+		entry.Outcome = store.AuditOutcomeFailure
+		entry.Metadata = map[string]string{"max_age": maxAge.String()}
+		d.recordAudit(ctx, entry)
+		expired++
+	}
+	return expired, nil
+}
+
+// runDeployment executes an already-created deployment record to completion. It
+// is shared by the direct deploy path (Deploy) and the approve path
+// (ApproveDeployment). StartedAt is reset here so an approved deploy's duration
+// measures execution time, not the time it spent waiting for approval.
+func (d *Deployer) runDeployment(ctx context.Context, stack *store.Stack, deployment *store.Deployment) (*store.Deployment, error) {
+	trigger := deployment.Trigger
+
+	// Enrich the context so every log line from this deployment carries
+	// the deployment/stack/trigger fields, including in downstream helpers.
+	ctx = logctx.WithFields(ctx, logrus.Fields{
+		"deployment_id": deployment.ID,
+		"stack_id":      stack.ID,
+		"stack_name":    stack.Name,
+		"trigger":       trigger,
+	})
+	log := logctx.FromContext(ctx)
+
+	deployment.StartedAt = time.Now()
 
 	// Mark the stack as deploying.
 	stack.Status = store.StackStatusDeploying

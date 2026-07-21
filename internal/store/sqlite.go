@@ -257,6 +257,7 @@ func (s *SQLiteStore) applyColumnMigrations() error {
 	}
 	cols := []addCol{
 		{"stacks", "secrets_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"stacks", "requires_approval", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, c := range cols {
 		present, err := s.columnExists(c.table, c.col)
@@ -301,13 +302,15 @@ func (s *SQLiteStore) CreateStack(stack *Stack) error {
 	_, err = s.db.Exec(`
 		INSERT INTO stacks (id, name, repo_url, repo_username, repo_token, repo_branch,
 			compose_path, service_filter, auto_deploy, reconcile_interval_seconds, status,
-			docker_username, docker_password, docker_registry, created_at, updated_at, secrets_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			docker_username, docker_password, docker_registry, created_at, updated_at, secrets_hash,
+			requires_approval)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stack.ID, stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval, stack.Status,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
 		stack.CreatedAt, stack.UpdatedAt, stack.SecretsHash,
+		boolToInt(stack.RequiresApproval),
 	)
 	return err
 }
@@ -352,14 +355,15 @@ func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 		UPDATE stacks SET name=?, repo_url=?, repo_username=?, repo_token=?, repo_branch=?,
 			compose_path=?, service_filter=?, auto_deploy=?, reconcile_interval_seconds=?,
 			status=?, last_deployed_at=?, last_reconciled_at=?, git_commit=?,
-			docker_username=?, docker_password=?, docker_registry=?, updated_at=?, secrets_hash=?
+			docker_username=?, docker_password=?, docker_registry=?, updated_at=?, secrets_hash=?,
+			requires_approval=?
 		WHERE id=?`,
 		stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval,
 		stack.Status, stack.LastDeployedAt, stack.LastReconciledAt, stack.GitCommit,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
-		stack.UpdatedAt, stack.SecretsHash, stack.ID,
+		stack.UpdatedAt, stack.SecretsHash, boolToInt(stack.RequiresApproval), stack.ID,
 	)
 	return err
 }
@@ -435,6 +439,43 @@ func (s *SQLiteStore) ListDeployments(stackID string, limit int) ([]*Deployment,
 	rows, err := s.db.Query(
 		`SELECT * FROM deployments WHERE stack_id = ? ORDER BY started_at DESC LIMIT ?`,
 		stackID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deployments []*Deployment
+	for rows.Next() {
+		d, err := s.scanDeploymentFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		deployments = append(deployments, d)
+	}
+	return deployments, rows.Err()
+}
+
+// GetPendingApproval returns the most recent deployment for a stack that is
+// still awaiting approval, or (nil, nil) if there is none. Used to dedupe:
+// a stack with requires_approval should hold at most one open approval at a
+// time so a reconcile loop doesn't spawn (and notify) a new one every cycle.
+func (s *SQLiteStore) GetPendingApproval(stackID string) (*Deployment, error) {
+	row := s.db.QueryRow(
+		`SELECT * FROM deployments WHERE stack_id = ? AND status = ?
+		 ORDER BY started_at DESC LIMIT 1`,
+		stackID, DeploymentPendingApproval,
+	)
+	return s.scanDeployment(row)
+}
+
+// ListPendingApprovals returns all deployments awaiting approval across every
+// stack, oldest first (so a timeout sweep processes the longest-waiting one
+// first, and the API surfaces the queue in arrival order).
+func (s *SQLiteStore) ListPendingApprovals() ([]*Deployment, error) {
+	rows, err := s.db.Query(
+		`SELECT * FROM deployments WHERE status = ? ORDER BY started_at ASC`,
+		DeploymentPendingApproval,
 	)
 	if err != nil {
 		return nil, err
@@ -846,7 +887,7 @@ type scannable interface {
 
 func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 	st := &Stack{}
-	var autoDeploy int
+	var autoDeploy, requiresApproval int
 	var lastDeployed, lastReconciled sql.NullTime
 
 	err := row.Scan(
@@ -856,10 +897,11 @@ func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 		&lastDeployed, &lastReconciled, &st.GitCommit,
 		&st.DockerUsername, &st.DockerPassword, &st.DockerRegistry,
 		&st.CreatedAt, &st.UpdatedAt,
-		// secrets_hash is the latest column added via
-		// applyColumnMigrations — appended by SQLite at the end of the
-		// table, so it lands here at the end of the scan.
+		// Columns added via applyColumnMigrations land at the end of the
+		// table in the order they were added, so they scan here after the
+		// base columns: secrets_hash, then requires_approval.
 		&st.SecretsHash,
+		&requiresApproval,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -869,6 +911,7 @@ func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 	}
 
 	st.AutoDeploy = autoDeploy != 0
+	st.RequiresApproval = requiresApproval != 0
 	if lastDeployed.Valid {
 		st.LastDeployedAt = &lastDeployed.Time
 	}

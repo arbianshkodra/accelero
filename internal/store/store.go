@@ -21,6 +21,10 @@ type Store interface {
 	ListDeployments(stackID string, limit int) ([]*Deployment, error)
 	UpdateDeployment(d *Deployment) error
 	CleanupOldDeployments(maxAge time.Duration) (int, error)
+	// Approval gates: at-most-one open approval per stack (dedupe) and the
+	// cross-stack queue (API listing + timeout sweep).
+	GetPendingApproval(stackID string) (*Deployment, error)
+	ListPendingApprovals() ([]*Deployment, error)
 
 	// Container tracking
 	TrackContainer(c *ManagedContainer) error

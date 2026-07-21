@@ -15,6 +15,13 @@ type Stack struct {
 	AutoDeploy        bool       `json:"auto_deploy"`
 	ReconcileInterval int        `json:"reconcile_interval_seconds"` // seconds, 0 = disabled
 	Status            string     `json:"status"`                     // active, paused, deploying, error
+
+	// RequiresApproval gates deploys behind a manual approval step. When
+	// true, any deploy trigger (manual, webhook, or reconcile auto-deploy)
+	// creates a deployment in the pending_approval state and notifies
+	// instead of executing; an operator must approve it via the API for it
+	// to run. Off by default (deploys run immediately).
+	RequiresApproval bool `json:"requires_approval"`
 	LastDeployedAt    *time.Time `json:"last_deployed_at,omitempty"`
 	LastReconciledAt  *time.Time `json:"last_reconciled_at,omitempty"`
 	GitCommit         string     `json:"git_commit,omitempty"`
@@ -41,7 +48,7 @@ type Deployment struct {
 	ID           string     `json:"id"`
 	StackID      string     `json:"stack_id"`
 	StackName    string     `json:"stack_name"`
-	Status       string     `json:"status"` // pending, in_progress, completed, failed, rolled_back
+	Status       string     `json:"status"` // pending, pending_approval, in_progress, completed, failed, rolled_back, rejected
 	Trigger      string     `json:"trigger"` // webhook, reconcile, manual
 	GitCommit    string     `json:"git_commit,omitempty"`
 	Changes      string     `json:"changes,omitempty"`
@@ -106,11 +113,13 @@ const (
 
 // Deployment status constants
 const (
-	DeploymentPending    = "pending"
-	DeploymentInProgress = "in_progress"
-	DeploymentCompleted  = "completed"
-	DeploymentFailed     = "failed"
-	DeploymentRolledBack = "rolled_back"
+	DeploymentPending         = "pending"
+	DeploymentPendingApproval = "pending_approval"
+	DeploymentInProgress      = "in_progress"
+	DeploymentCompleted       = "completed"
+	DeploymentFailed          = "failed"
+	DeploymentRolledBack      = "rolled_back"
+	DeploymentRejected        = "rejected"
 )
 
 // Deployment trigger constants
@@ -200,4 +209,13 @@ const (
 	// in audit metadata.
 	AuditOpStackRegistrySet    = "stack.registry.set"
 	AuditOpStackRegistryDelete = "stack.registry.delete"
+
+	// Approval-gate lifecycle for stacks with requires_approval=true.
+	// requested (system:deployer, in_progress) when a deploy is held for
+	// approval; granted/rejected (actor api-key) when an operator acts;
+	// timed_out (system:deployer) when the approval expires unactioned.
+	AuditOpApprovalRequested = "approval.requested"
+	AuditOpApprovalGranted   = "approval.granted"
+	AuditOpApprovalRejected  = "approval.rejected"
+	AuditOpApprovalTimedOut  = "approval.timed_out"
 )

@@ -159,6 +159,17 @@ func main() {
 		deploymentCleanupLoop(ctx, db, cfg)
 	}()
 
+	// 9a. Start the approval-timeout sweep if enabled — auto-rejects
+	// deploys held for approval that have waited longer than the timeout.
+	if cfg.ApprovalTimeout > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			approvalTimeoutLoop(ctx, deployer, cfg)
+		}()
+		logrus.Infof("Approval-timeout sweep enabled (timeout %s)", cfg.ApprovalTimeout)
+	}
+
 	// 9b. Start the scheduled-backup routine if enabled.
 	if cfg.BackupInterval > 0 {
 		wg.Add(1)
@@ -484,6 +495,37 @@ func deploymentCleanupLoop(ctx context.Context, db store.Store, cfg *config.Conf
 				} else if n > 0 {
 					logrus.Infof("Cleaned up %d old audit entries", n)
 				}
+			}
+		}
+	}
+}
+
+// approvalTimeoutLoop periodically auto-rejects deploys held for approval
+// longer than cfg.ApprovalTimeout. The check cadence is capped at 1h (and
+// floored at 1m) so short timeouts are honoured reasonably promptly without
+// busy-looping on long ones.
+func approvalTimeoutLoop(ctx context.Context, deployer *stack.Deployer, cfg *config.Config) {
+	interval := cfg.ApprovalTimeout
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Info("Approval-timeout sweep stopped")
+			return
+		case <-ticker.C:
+			n, err := deployer.ExpirePendingApprovals(ctx, cfg.ApprovalTimeout)
+			if err != nil {
+				logrus.Errorf("Approval-timeout sweep error: %v", err)
+			} else if n > 0 {
+				logrus.Infof("Auto-rejected %d timed-out approval(s)", n)
 			}
 		}
 	}

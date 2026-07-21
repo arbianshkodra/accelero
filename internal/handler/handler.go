@@ -48,6 +48,11 @@ const (
 // Deployer is the interface the stack deployer must satisfy.
 type Deployer interface {
 	Deploy(ctx context.Context, stack *store.Stack, trigger string) (*store.Deployment, error)
+	// ApproveDeployment runs a deployment held for approval; RejectDeployment
+	// marks it rejected. Both return an error if the deployment isn't in the
+	// pending_approval state.
+	ApproveDeployment(ctx context.Context, deploymentID string) (*store.Deployment, error)
+	RejectDeployment(ctx context.Context, deploymentID, reason string) (*store.Deployment, error)
 	// CleanupStackData removes the stack's cloned-repo workdir from disk.
 	// Called by DeleteStack after the DB record is gone so orphan clones
 	// don't accumulate forever.
@@ -196,6 +201,12 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/drift", h.CheckDrift).Methods("GET")
 	api.HandleFunc("/stacks/{id}/preview", h.PreviewDeploy).Methods("POST")
 
+	// Approval gates (stacks with requires_approval=true). A held deploy is
+	// a deployment in pending_approval; approve runs it, reject cancels it.
+	api.HandleFunc("/stacks/{id}/deployments/{deployId}/approve", h.ApproveDeployment).Methods("POST")
+	api.HandleFunc("/stacks/{id}/deployments/{deployId}/reject", h.RejectDeployment).Methods("POST")
+	api.HandleFunc("/approvals", h.ListApprovals).Methods("GET")
+
 	// Per-stack secrets — encrypted at rest via the existing cipher.
 	// List returns names/timestamps only; values never leave via the
 	// API (they're injected into containers at deploy time, follow-up PR).
@@ -275,6 +286,7 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 		ServiceFilter     string `json:"service_filter"`
 		AutoDeploy        bool   `json:"auto_deploy"`
 		ReconcileInterval int    `json:"reconcile_interval_seconds"`
+		RequiresApproval  bool   `json:"requires_approval"`
 		DockerUsername    string `json:"docker_username"`
 		DockerPassword    string `json:"docker_password"`
 		DockerRegistry    string `json:"docker_registry"`
@@ -307,6 +319,7 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 		ServiceFilter:     input.ServiceFilter,
 		AutoDeploy:        input.AutoDeploy,
 		ReconcileInterval: input.ReconcileInterval,
+		RequiresApproval:  input.RequiresApproval,
 		Status:            store.StackStatusActive,
 		DockerUsername:    input.DockerUsername,
 		DockerPassword:    input.DockerPassword,
@@ -395,6 +408,7 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 		ServiceFilter     *string `json:"service_filter"`
 		AutoDeploy        *bool   `json:"auto_deploy"`
 		ReconcileInterval *int    `json:"reconcile_interval_seconds"`
+		RequiresApproval  *bool   `json:"requires_approval"`
 		Status            *string `json:"status"`
 		DockerUsername    *string `json:"docker_username"`
 		DockerPassword    *string `json:"docker_password"`
@@ -432,6 +446,9 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.ReconcileInterval != nil {
 		stack.ReconcileInterval = *input.ReconcileInterval
+	}
+	if input.RequiresApproval != nil {
+		stack.RequiresApproval = *input.RequiresApproval
 	}
 	if input.Status != nil {
 		stack.Status = *input.Status
@@ -537,14 +554,21 @@ func (h *Handler) DeployStack(w http.ResponseWriter, r *http.Request) {
 	// Record the "deploy requested" intent synchronously before the
 	// background goroutine runs. The deployer itself records the
 	// completion/failure outcome once it knows which one applies.
-	startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
-	startEntry.ResourceType = "stack"
-	startEntry.ResourceID = stack.ID
-	startEntry.StackID = stack.ID
-	startEntry.StackName = stack.Name
-	startEntry.Outcome = store.AuditOutcomeInProgress
-	startEntry.Metadata = map[string]string{"trigger": store.TriggerManual}
-	_ = h.auditOr().Record(r.Context(), startEntry)
+	//
+	// Skip this for approval-gated stacks: the deploy isn't starting, it's
+	// being held. The deployer records approval.requested instead, so
+	// emitting deploy.start here too would fire a contradictory
+	// "🚀 Deploy started" + "🔔 awaiting approval" notification pair.
+	if !stack.RequiresApproval {
+		startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
+		startEntry.ResourceType = "stack"
+		startEntry.ResourceID = stack.ID
+		startEntry.StackID = stack.ID
+		startEntry.StackName = stack.Name
+		startEntry.Outcome = store.AuditOutcomeInProgress
+		startEntry.Metadata = map[string]string{"trigger": store.TriggerManual}
+		_ = h.auditOr().Record(r.Context(), startEntry)
+	}
 
 	// Capture the request's logger so the background goroutine keeps the
 	// request_id on every subsequent log line.
@@ -564,6 +588,115 @@ func (h *Handler) DeployStack(w http.ResponseWriter, r *http.Request) {
 		"stack_id": stack.ID,
 		"message":  "Deployment started. Check deployments for progress.",
 	}, http.StatusAccepted)
+}
+
+// pendingApprovalFor resolves a deployment by id, verifies it belongs to the
+// stack and is still awaiting approval. Writes the appropriate error (404 for
+// unknown/foreign, 409 for wrong state) and returns nil on any failure.
+func (h *Handler) pendingApprovalFor(w http.ResponseWriter, stack *store.Stack, deployID string) *store.Deployment {
+	dep, err := h.Store.GetDeployment(deployID)
+	if err != nil || dep == nil || dep.StackID != stack.ID {
+		writeError(w, "deployment not found", http.StatusNotFound)
+		return nil
+	}
+	if dep.Status != store.DeploymentPendingApproval {
+		writeError(w, fmt.Sprintf("deployment is not pending approval (status=%s)", dep.Status), http.StatusConflict)
+		return nil
+	}
+	return dep
+}
+
+// ApproveDeployment approves a deployment held for approval and starts its
+// rollout asynchronously (202). Audited as approval.granted with the api-key
+// actor. Returns 404 for an unknown deployment and 409 if it's no longer
+// pending (already approved/rejected/timed out).
+func (h *Handler) ApproveDeployment(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	deployID := mux.Vars(r)["deployId"]
+	dep := h.pendingApprovalFor(w, stack, deployID)
+	if dep == nil {
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpApprovalGranted)
+	entry.ResourceType = "deployment"
+	entry.ResourceID = dep.ID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Outcome = store.AuditOutcomeSuccess
+	entry.Metadata = map[string]string{"trigger": dep.Trigger}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	reqLogger := logctx.FromContext(r.Context())
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		ctx = logctx.WithLogger(ctx, reqLogger)
+		if _, err := h.Deployer.ApproveDeployment(ctx, deployID); err != nil {
+			logctx.FromContext(ctx).WithError(err).Errorf("approved deployment %s failed", deployID)
+		}
+	}()
+
+	writeJSON(w, map[string]string{
+		"status":        "accepted",
+		"deployment_id": deployID,
+		"message":       "Deployment approved; rollout started.",
+	}, http.StatusAccepted)
+}
+
+// RejectDeployment rejects a deployment held for approval. Optional JSON body
+// {"reason": "..."} is recorded on the deployment and audit. Audited as
+// approval.rejected. Returns the updated deployment (200).
+func (h *Handler) RejectDeployment(w http.ResponseWriter, r *http.Request) {
+	stack, ok := h.resolveStack(w, r)
+	if !ok {
+		return
+	}
+	deployID := mux.Vars(r)["deployId"]
+	if dep := h.pendingApprovalFor(w, stack, deployID); dep == nil {
+		return
+	}
+
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = readJSON(r, &body) // body is optional; empty/absent reason is fine
+
+	rejected, err := h.Deployer.RejectDeployment(r.Context(), deployID, body.Reason)
+	if err != nil {
+		writeError(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	entry := audit.FromRequest(r, store.AuditOpApprovalRejected)
+	entry.ResourceType = "deployment"
+	entry.ResourceID = deployID
+	entry.StackID = stack.ID
+	entry.StackName = stack.Name
+	entry.Outcome = store.AuditOutcomeSuccess
+	if body.Reason != "" {
+		entry.Metadata = map[string]string{"reason": body.Reason}
+	}
+	_ = h.auditOr().Record(r.Context(), entry)
+
+	writeJSON(w, rejected, http.StatusOK)
+}
+
+// ListApprovals returns all deployments awaiting approval across every stack,
+// oldest first (arrival order).
+func (h *Handler) ListApprovals(w http.ResponseWriter, r *http.Request) {
+	pending, err := h.Store.ListPendingApprovals()
+	if err != nil {
+		writeError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if pending == nil {
+		pending = []*store.Deployment{}
+	}
+	writeJSON(w, pending, http.StatusOK)
 }
 
 func (h *Handler) ListDeployments(w http.ResponseWriter, r *http.Request) {
@@ -1476,14 +1609,18 @@ func (h *Handler) LegacyWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
-	startEntry.ResourceType = "stack"
-	startEntry.ResourceID = stack.ID
-	startEntry.StackID = stack.ID
-	startEntry.StackName = stack.Name
-	startEntry.Outcome = store.AuditOutcomeInProgress
-	startEntry.Metadata = map[string]string{"trigger": store.TriggerWebhook}
-	_ = h.auditOr().Record(r.Context(), startEntry)
+	// Skip deploy.start for approval-gated stacks — the deployer records
+	// approval.requested instead (see DeployStack for the rationale).
+	if !stack.RequiresApproval {
+		startEntry := audit.FromRequest(r, store.AuditOpDeployStart)
+		startEntry.ResourceType = "stack"
+		startEntry.ResourceID = stack.ID
+		startEntry.StackID = stack.ID
+		startEntry.StackName = stack.Name
+		startEntry.Outcome = store.AuditOutcomeInProgress
+		startEntry.Metadata = map[string]string{"trigger": store.TriggerWebhook}
+		_ = h.auditOr().Record(r.Context(), startEntry)
+	}
 
 	reqLogger := logctx.FromContext(r.Context())
 
