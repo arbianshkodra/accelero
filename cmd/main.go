@@ -19,6 +19,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/handler"
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
+	"github.com/arbianshkodra/accelero/internal/notify"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/retry"
 	"github.com/arbianshkodra/accelero/internal/secrets"
@@ -120,10 +121,17 @@ func main() {
 			cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown)
 	}
 
-	// Shared audit recorder — writes to the same SQLite store.
-	auditRecorder := audit.NewStoreRecorder(db)
+	// Shared audit recorder — writes to the same SQLite store. When
+	// notification destinations are configured, wrap it so notable
+	// deploy/drift events are also pushed out (deployer/reconciler need no
+	// changes — they already record these events).
+	notifier := notify.New(cfg.NotifyWebhookURL, cfg.NotifySlackWebhookURL)
+	auditRecorder := notify.WrapRecorder(audit.NewStoreRecorder(db), notifier)
 	deployer.SetAudit(auditRecorder)
 	rec.SetAudit(auditRecorder)
+	if notifier.Enabled() {
+		logrus.Info("Notifications enabled for deploy/drift events")
+	}
 
 	// 5. Migrate legacy env-var config to a "default" stack if needed.
 	migrateLegacyConfig(cfg, db)

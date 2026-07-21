@@ -189,6 +189,34 @@ Setting both variables is a fatal configuration error — the two sources are mu
 
 Without either, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
 
+## Notifications
+
+Accelero can push notable lifecycle events to external destinations. Set either or both URLs to enable it; with neither set, notifications are off (zero overhead).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOTIFY_WEBHOOK_URL` | *(unset — disabled)* | Generic webhook. Receives the full event as JSON via `POST`. |
+| `NOTIFY_SLACK_WEBHOOK_URL` | *(unset — disabled)* | Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Receives a `{"text": "<message>"}` payload. |
+
+**Events notified:** deploy started, completed, failed, rolled back; drift detected; auto-deploy triggered. Read-only, secret-CRUD, and other audit operations are deliberately *not* notified (avoids channel spam).
+
+**Delivery semantics:** best-effort and asynchronous — each sink fires in its own goroutine with a 10s timeout. A failing or slow sink logs a warning and is never allowed to block or fail a deploy. There are no retries and no ordering guarantees.
+
+**Generic webhook payload** (`NOTIFY_WEBHOOK_URL`):
+
+```json
+{
+  "type": "deploy.failed",
+  "stack": "web",
+  "outcome": "failure",
+  "message": "❌ Deploy failed for stack `web`: git clone failed: ...",
+  "fields": { "changes": "3" },
+  "time": "2026-07-21T10:04:05Z"
+}
+```
+
+`type` is the audit operation (`deploy.start`, `deploy.complete`, `deploy.failed`, `deploy.rolled_back`, `drift.detected`, `drift.auto_deployed`); `fields` mirrors the audit metadata. Implemented in `internal/notify` by wrapping the shared audit recorder, so the deployer and reconciler need no changes — anything that records one of these audit events is notified automatically.
+
 ## Legacy Single-Stack Variables
 
 These variables are supported for backward compatibility. If set, Accelero creates a "default" stack from them on first startup. For new deployments, use the REST API to create stacks instead.
