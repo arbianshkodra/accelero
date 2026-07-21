@@ -1,0 +1,55 @@
+## Golang
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories (remove the comment below if you're using Go modules)
+# /vendor/
+
+# GoLand IDE settings
+.idea/
+
+# Goland project-specific settings
+*.iml
+
+# Created new files
+data
+database
+
+# Environment variables
+envs/
+test.env
+samples.env
+# The runtime env at the repo root must not leak — keep only .env.example
+# committed.  Anchored to root so samples/.env (the interpolation docs-by-
+# example) remains tracked.
+/.env
+/.env.local
+/.env.*.local
+*.bak
+
+# Build artifacts
+dist/
+.venv/
+
+# Mkdocs
+site/
+
+# configs
+server-config.md
+
+# vscode
+.vscode/

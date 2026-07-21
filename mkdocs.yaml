@@ -1,0 +1,49 @@
+site_name: Accelero
+site_url: https://accelero.sh/docs/
+repo_url: https://github.com/arbianshkodra/accelero/
+# Path: docs/. Don't forget to update branch name 
+edit_uri: blob/dev/docs/
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo 
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  font:
+    text: Roboto
+    code: Roboto Mono
+  color_mode: auto
+  locale: en
+  icon:
+    previous: fontawesome/solid/angle-left
+    next: fontawesome/solid/angle-right
+  favicon: "./images/favicon.ico"
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Introduction: introduction.md
+  - Usage Overview: usage-overview.md
+  - Configuration: configuration.md
+  - API Reference: api-reference.md

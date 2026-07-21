@@ -1,0 +1,19 @@
+# Caddy config for samples/docker-compose.yaml.
+#
+# Committed to git and bind-mounted into the proxy container at
+# /etc/caddy/Caddyfile by the compose service definition.  Accelero
+# resolves `./Caddyfile` against the stack's cloned repo directory.
+#
+# `reverse_proxy web:80` uses Docker's embedded DNS to resolve `web` to
+# whichever replicas are currently healthy.  Caddy re-resolves on each
+# connection, so rolling updates of `web` do not require any change
+# here.
+
+{
+	admin off
+}
+
+:80 {
+	reverse_proxy web:80
+	header X-Served-By "accelero-sample"
+}
