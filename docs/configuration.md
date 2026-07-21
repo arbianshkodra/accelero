@@ -211,12 +211,14 @@ Each lifecycle event (`approval.requested` / `granted` / `rejected` / `timed_out
 
 ## Notifications
 
-Accelero can push notable lifecycle events to external destinations. Set either or both URLs to enable it; with neither set, notifications are off (zero overhead).
+Accelero can push notable lifecycle events to external destinations. Set any of the URLs below to enable that sink; sinks fire independently and with none set, notifications are off (zero overhead).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NOTIFY_WEBHOOK_URL` | *(unset — disabled)* | Generic webhook. Receives the full event as JSON via `POST`. |
 | `NOTIFY_SLACK_WEBHOOK_URL` | *(unset — disabled)* | Slack [incoming webhook](https://api.slack.com/messaging/webhooks). Receives a `{"text": "<message>"}` payload. |
+| `NOTIFY_DISCORD_WEBHOOK_URL` | *(unset — disabled)* | Discord [webhook](https://support.discord.com/hc/en-us/articles/228383668). Receives a `{"content": "<message>"}` payload. |
+| `NOTIFY_TEAMS_WEBHOOK_URL` | *(unset — disabled)* | Microsoft Teams incoming webhook. Receives a `MessageCard` (`{"@type":"MessageCard", ..., "text":"<message>"}`), the portable form across connector versions. |
 
 **Events notified:** deploy started, completed, failed, rolled back; drift detected; auto-deploy triggered. Read-only, secret-CRUD, and other audit operations are deliberately *not* notified (avoids channel spam).
 

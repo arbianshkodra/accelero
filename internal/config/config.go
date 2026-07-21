@@ -99,8 +99,13 @@ type Config struct {
 	// failed/rolled_back, drift detected, auto-deploy). Empty = disabled.
 	// NotifyWebhookURL receives the full Event as JSON; NotifySlackWebhookURL
 	// is a Slack incoming-webhook URL that receives a {"text": ...} payload.
-	NotifyWebhookURL      string
-	NotifySlackWebhookURL string
+	// NotifyDiscordWebhookURL / NotifyTeamsWebhookURL are additional sinks:
+	// a Discord webhook ({"content": ...}) and a Microsoft Teams incoming
+	// webhook (MessageCard). Empty = disabled.
+	NotifyWebhookURL        string
+	NotifySlackWebhookURL   string
+	NotifyDiscordWebhookURL string
+	NotifyTeamsWebhookURL   string
 
 	// WebhookSecret is the shared secret used to verify HMAC-SHA256
 	// signatures on the legacy /webhook endpoint. Callers sign the raw
@@ -224,6 +229,8 @@ func Load() (*Config, error) {
 	cfg.WebhookSecret = os.Getenv("WEBHOOK_SECRET")
 	cfg.NotifyWebhookURL = os.Getenv("NOTIFY_WEBHOOK_URL")
 	cfg.NotifySlackWebhookURL = os.Getenv("NOTIFY_SLACK_WEBHOOK_URL")
+	cfg.NotifyDiscordWebhookURL = os.Getenv("NOTIFY_DISCORD_WEBHOOK_URL")
+	cfg.NotifyTeamsWebhookURL = os.Getenv("NOTIFY_TEAMS_WEBHOOK_URL")
 
 	// Retry budget for transient deploy-path operations. Clamp attempts
 	// to >=1 so a nonsensical RETRY_MAX_ATTEMPTS=0 can't disable the

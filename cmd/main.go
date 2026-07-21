@@ -125,7 +125,12 @@ func main() {
 	// notification destinations are configured, wrap it so notable
 	// deploy/drift events are also pushed out (deployer/reconciler need no
 	// changes — they already record these events).
-	notifier := notify.New(cfg.NotifyWebhookURL, cfg.NotifySlackWebhookURL)
+	notifier := notify.New(notify.Config{
+		WebhookURL: cfg.NotifyWebhookURL,
+		SlackURL:   cfg.NotifySlackWebhookURL,
+		DiscordURL: cfg.NotifyDiscordWebhookURL,
+		TeamsURL:   cfg.NotifyTeamsWebhookURL,
+	})
 	auditRecorder := notify.WrapRecorder(audit.NewStoreRecorder(db), notifier)
 	deployer.SetAudit(auditRecorder)
 	rec.SetAudit(auditRecorder)
