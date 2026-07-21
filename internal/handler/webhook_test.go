@@ -91,12 +91,31 @@ func (m *mockStore) CreateDeployment(d *store.Deployment) error {
 	m.deployments = append(m.deployments, d)
 	return nil
 }
-func (m *mockStore) GetDeployment(id string) (*store.Deployment, error) { return nil, nil }
+func (m *mockStore) GetDeployment(id string) (*store.Deployment, error) {
+	for _, d := range m.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return nil, nil
+}
 func (m *mockStore) ListDeployments(stackID string, limit int) ([]*store.Deployment, error) {
 	return m.deployments, nil
 }
 func (m *mockStore) UpdateDeployment(d *store.Deployment) error              { return nil }
 func (m *mockStore) CleanupOldDeployments(maxAge time.Duration) (int, error) { return 0, nil }
+func (m *mockStore) GetPendingApproval(stackID string) (*store.Deployment, error) {
+	return nil, nil
+}
+func (m *mockStore) ListPendingApprovals() ([]*store.Deployment, error) {
+	var out []*store.Deployment
+	for _, d := range m.deployments {
+		if d.Status == store.DeploymentPendingApproval {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
 func (m *mockStore) TrackContainer(c *store.ManagedContainer) error          { return nil }
 func (m *mockStore) ListContainers(stackID string) ([]*store.ManagedContainer, error) {
 	return nil, nil
@@ -242,6 +261,15 @@ func (d *mockDeployer) Deploy(ctx context.Context, stack *store.Stack, trigger s
 		Trigger:   trigger,
 		StartedAt: time.Now(),
 	}, nil
+}
+
+func (d *mockDeployer) ApproveDeployment(ctx context.Context, deploymentID string) (*store.Deployment, error) {
+	d.deployCalled = true
+	return &store.Deployment{ID: deploymentID, Status: store.DeploymentCompleted}, nil
+}
+
+func (d *mockDeployer) RejectDeployment(ctx context.Context, deploymentID, reason string) (*store.Deployment, error) {
+	return &store.Deployment{ID: deploymentID, Status: store.DeploymentRejected, ErrorMessage: reason}, nil
 }
 
 func (d *mockDeployer) CleanupStackData(stackID string) error {
@@ -1426,4 +1454,90 @@ func TestDeleteStackRegistry_MissingAuditedAsFailure(t *testing.T) {
 	require.Len(t, rec.entries, 1)
 	assert.Equal(t, store.AuditOutcomeFailure, rec.entries[0].Outcome)
 	assert.Equal(t, "not found", rec.entries[0].ErrorMessage)
+}
+
+// --- Approval gates ---------------------------------------------------------
+
+func approvalTestHandler(pendingStatus string) (*Handler, *captureRecorder) {
+	rec := &captureRecorder{}
+	ms := &mockStore{
+		stacks: []*store.Stack{{ID: "s1", Name: "web", Status: store.StackStatusActive, RequiresApproval: true}},
+		deployments: []*store.Deployment{{
+			ID: "dep1", StackID: "s1", StackName: "web",
+			Status: pendingStatus, Trigger: store.TriggerManual,
+		}},
+	}
+	return &Handler{Store: ms, Deployer: &mockDeployer{}, Audit: rec}, rec
+}
+
+func serve(h *Handler, method, path string, body []byte) *httptest.ResponseRecorder {
+	var r *http.Request
+	if body != nil {
+		r = httptest.NewRequest(method, path, bytes.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+	} else {
+		r = httptest.NewRequest(method, path, nil)
+	}
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	noAuth := func(next http.Handler) http.Handler { return next }
+	h.RegisterRoutes(router, noAuth)
+	router.ServeHTTP(rr, r)
+	return rr
+}
+
+func hasAuditOp(entries []store.AuditEntry, op string) bool {
+	for _, e := range entries {
+		if e.Operation == op {
+			return true
+		}
+	}
+	return false
+}
+
+func TestApproveDeployment_HappyPath(t *testing.T) {
+	h, rec := approvalTestHandler(store.DeploymentPendingApproval)
+	rr := serve(h, "POST", "/api/v1/stacks/s1/deployments/dep1/approve", nil)
+	assert.Equal(t, http.StatusAccepted, rr.Code)
+	assert.True(t, hasAuditOp(rec.entries, store.AuditOpApprovalGranted), "approval.granted must be audited")
+}
+
+func TestApproveDeployment_Unknown404(t *testing.T) {
+	h, _ := approvalTestHandler(store.DeploymentPendingApproval)
+	rr := serve(h, "POST", "/api/v1/stacks/s1/deployments/nope/approve", nil)
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestApproveDeployment_NotPending409(t *testing.T) {
+	h, _ := approvalTestHandler(store.DeploymentCompleted)
+	rr := serve(h, "POST", "/api/v1/stacks/s1/deployments/dep1/approve", nil)
+	assert.Equal(t, http.StatusConflict, rr.Code)
+}
+
+func TestRejectDeployment_HappyPath(t *testing.T) {
+	h, rec := approvalTestHandler(store.DeploymentPendingApproval)
+	body, _ := json.Marshal(map[string]string{"reason": "not now"})
+	rr := serve(h, "POST", "/api/v1/stacks/s1/deployments/dep1/reject", body)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, hasAuditOp(rec.entries, store.AuditOpApprovalRejected), "approval.rejected must be audited")
+
+	var got store.Deployment
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, store.DeploymentRejected, got.Status)
+}
+
+func TestRejectDeployment_NotPending409(t *testing.T) {
+	h, _ := approvalTestHandler(store.DeploymentFailed)
+	rr := serve(h, "POST", "/api/v1/stacks/s1/deployments/dep1/reject", nil)
+	assert.Equal(t, http.StatusConflict, rr.Code)
+}
+
+func TestListApprovals(t *testing.T) {
+	h, _ := approvalTestHandler(store.DeploymentPendingApproval)
+	rr := serve(h, "GET", "/api/v1/approvals", nil)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	var got []store.Deployment
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	require.Len(t, got, 1)
+	assert.Equal(t, "dep1", got[0].ID)
 }

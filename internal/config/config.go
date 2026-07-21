@@ -129,6 +129,11 @@ type Config struct {
 	CircuitBreakerThreshold int
 	CircuitBreakerCooldown  time.Duration
 
+	// ApprovalTimeout is how long a deploy held for approval
+	// (stacks with requires_approval) waits before it's auto-rejected as
+	// approval.timed_out. 0 disables expiry (approvals wait indefinitely).
+	ApprovalTimeout time.Duration
+
 	// TLSCertFile / TLSKeyFile point at PEM-encoded certificate (or
 	// chain) and private key. Both must be set together; either alone
 	// is a startup error. Unset = plain HTTP (the default — many
@@ -238,6 +243,11 @@ func Load() (*Config, error) {
 		cfg.CircuitBreakerThreshold = 0
 	}
 	cfg.CircuitBreakerCooldown = parseDurationOrDefault("CIRCUIT_BREAKER_COOLDOWN", 10*time.Minute)
+
+	cfg.ApprovalTimeout = parseDurationOrDefault("APPROVAL_TIMEOUT", 24*time.Hour)
+	if cfg.ApprovalTimeout < 0 {
+		cfg.ApprovalTimeout = 0
+	}
 
 	// Scheduled local backups. Disabled by default (interval 0).
 	cfg.BackupInterval = parseDurationOrDefault("BACKUP_INTERVAL", 0)

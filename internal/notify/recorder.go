@@ -64,6 +64,14 @@ func eventFromAudit(e store.AuditEntry) (Event, bool) {
 		}
 	case store.AuditOpDriftAutoDeployed:
 		msg = fmt.Sprintf("🔄 Auto-deploying stack `%s` to resolve drift", stack)
+	case store.AuditOpApprovalRequested:
+		msg = fmt.Sprintf("🔔 Deploy of stack `%s` is awaiting approval", stack)
+	case store.AuditOpApprovalGranted:
+		msg = fmt.Sprintf("👍 Deploy of stack `%s` was approved", stack)
+	case store.AuditOpApprovalRejected:
+		msg = fmt.Sprintf("🚫 Deploy of stack `%s` was rejected", stack)
+	case store.AuditOpApprovalTimedOut:
+		msg = fmt.Sprintf("⏰ Approval for stack `%s` timed out", stack)
 	default:
 		return Event{}, false
 	}

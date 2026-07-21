@@ -186,10 +186,10 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 - [ ] Notification templates (customizable content)
 
 **Approval gates:**
-- [ ] Stacks can require approval before deploy (`requires_approval: true`)
-- [ ] Approval via API, Slack interactive message, or UI button
-- [ ] Approval timeouts (auto-reject after N minutes)
-- [ ] Approval audit trail
+- [x] Stacks can require approval before deploy (`requires_approval: true`). Every trigger (manual, webhook, reconcile auto-deploy) creates a `pending_approval` deployment and notifies instead of running; at most one open approval per stack (deduped, so a reconcile loop doesn't spawn one per cycle). Implemented as a gate at the top of `Deployer.Deploy` (`requestApproval` / shared `runDeployment`).
+- [x] Approval via API — `POST /stacks/{id}/deployments/{deployId}/approve` (runs it) / `/reject` (optional `{"reason"}`); `GET /approvals` lists the cross-stack queue. Slack interactive message / UI button remain follow-ups.
+- [x] Approval timeouts (auto-reject after the wait) — `APPROVAL_TIMEOUT` (default 24h, 0 disables); a background sweep rejects expired approvals as `approval.timed_out`.
+- [x] Approval audit trail — `approval.requested` / `granted` / `rejected` / `timed_out`, each also delivered as a notification.
 
 **Reliability:**
 - [x] Retry with exponential backoff: image pulls, git clones, network operations. Bounded backoff + full jitter via `internal/retry` (`retry.Do` + `retry.Permanent`), wired into both the deploy and reconcile paths. Non-retryable failures (registry auth/not-found, git auth/repo-not-found/bad-branch) fail fast rather than burning the budget. Configurable via `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` (defaults 3 / 1s / 30s; attempts=1 disables).

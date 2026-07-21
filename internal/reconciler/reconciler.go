@@ -381,7 +381,16 @@ func (r *Reconciler) reconcileOnce(ctx context.Context, stackID string) {
 		r.recordAudit(ctx, driftAudit)
 
 		if stack.AutoDeploy {
-			if !r.breaker.Allow(stack.ID) {
+			if stack.RequiresApproval {
+				// Don't auto-deploy: hold for manual approval. Deploy()
+				// creates (or returns the existing) pending approval and
+				// notifies — deduped, so we don't touch the breaker or
+				// record an auto_deployed audit (nothing was deployed).
+				log.Info("drift detected; holding for approval (stack requires_approval=true)")
+				if _, err := r.deployer.Deploy(ctx, stack, store.TriggerReconcile); err != nil {
+					log.WithError(err).Error("failed to create pending approval")
+				}
+			} else if !r.breaker.Allow(stack.ID) {
 				// Breaker open: this stack keeps failing, so we skip the
 				// auto-deploy until the cooldown elapses (Allow will then
 				// permit one half-open trial). Manual deploys are never

@@ -189,6 +189,26 @@ Setting both variables is a fatal configuration error — the two sources are mu
 
 Without either, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
 
+## Approval gates
+
+A stack created (or updated) with `requires_approval: true` holds every deploy behind a manual approval step instead of running it immediately. This applies to all triggers — manual `POST /deploy`, the legacy webhook, and reconcile auto-deploy.
+
+When a deploy is triggered on such a stack, Accelero creates a deployment in the `pending_approval` state, emits an `approval.requested` audit event (delivered as a notification), and does **not** execute. At most one approval is open per stack at a time — repeated triggers (e.g. the reconcile loop firing every cycle) return the existing one rather than spawning duplicates or re-notifying.
+
+An operator then acts via the API:
+
+| Endpoint | Effect |
+|----------|--------|
+| `POST /api/v1/stacks/{id}/deployments/{deployId}/approve` | Runs the held deploy (202; rollout is async). Audited `approval.granted`. |
+| `POST /api/v1/stacks/{id}/deployments/{deployId}/reject` | Cancels it. Optional body `{"reason": "..."}`. Audited `approval.rejected`. |
+| `GET /api/v1/approvals` | Lists all pending approvals across every stack, oldest first. |
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APPROVAL_TIMEOUT` | `24h` | How long a pending approval waits before being auto-rejected (`approval.timed_out`). Go duration. `0` disables expiry — approvals wait indefinitely. |
+
+Each lifecycle event (`approval.requested` / `granted` / `rejected` / `timed_out`) is written to the audit log and, if notifications are configured, delivered to the webhook/Slack sinks. `deploy.start` is deliberately *not* emitted for a gated stack, so you don't get a contradictory "deploy started" + "awaiting approval" pair.
+
 ## Notifications
 
 Accelero can push notable lifecycle events to external destinations. Set either or both URLs to enable it; with neither set, notifications are off (zero overhead).
