@@ -15,9 +15,11 @@ import (
 )
 
 func TestNew_DisabledWhenNoURLs(t *testing.T) {
-	assert.False(t, New("", "").Enabled())
-	assert.True(t, New("http://x/webhook", "").Enabled())
-	assert.True(t, New("", "http://x/slack").Enabled())
+	assert.False(t, New(Config{}).Enabled())
+	assert.True(t, New(Config{WebhookURL: "http://x/webhook"}).Enabled())
+	assert.True(t, New(Config{SlackURL: "http://x/slack"}).Enabled())
+	assert.True(t, New(Config{DiscordURL: "http://x/discord"}).Enabled())
+	assert.True(t, New(Config{TeamsURL: "http://x/teams"}).Enabled())
 }
 
 // capture is a tiny server that records the bodies it receives.
@@ -59,24 +61,38 @@ func (c *capture) waitFor(t *testing.T, n int) {
 func TestNotify_WebhookAndSlackReceivePayloads(t *testing.T) {
 	webhook := newCapture(t)
 	slack := newCapture(t)
-	n := New(webhook.srv.URL, slack.srv.URL)
+	discord := newCapture(t)
+	teams := newCapture(t)
+	n := New(Config{
+		WebhookURL: webhook.srv.URL,
+		SlackURL:   slack.srv.URL,
+		DiscordURL: discord.srv.URL,
+		TeamsURL:   teams.srv.URL,
+	})
 
 	n.Notify(Event{Type: "deploy.failed", StackName: "web", Outcome: "failure", Message: "❌ Deploy failed for stack `web`"})
 
 	webhook.waitFor(t, 1)
 	slack.waitFor(t, 1)
+	discord.waitFor(t, 1)
+	teams.waitFor(t, 1)
 
 	// Generic webhook gets the full event.
 	assert.Equal(t, "deploy.failed", webhook.bodies[0]["type"])
 	assert.Equal(t, "web", webhook.bodies[0]["stack"])
 	// Slack gets a {"text": ...} payload.
 	assert.Contains(t, slack.bodies[0]["text"], "Deploy failed")
+	// Discord gets a {"content": ...} payload.
+	assert.Contains(t, discord.bodies[0]["content"], "Deploy failed")
+	// Teams gets a MessageCard with the message in "text".
+	assert.Equal(t, "MessageCard", teams.bodies[0]["@type"])
+	assert.Contains(t, teams.bodies[0]["text"], "Deploy failed")
 }
 
 func TestWrapRecorder_NotifiesOnDeployAndDriftOnly(t *testing.T) {
 	webhook := newCapture(t)
 	base := &fakeRecorder{}
-	rec := WrapRecorder(base, New(webhook.srv.URL, ""))
+	rec := WrapRecorder(base, New(Config{WebhookURL: webhook.srv.URL}))
 
 	// Notable events → notify.
 	require.NoError(t, rec.Record(context.Background(), store.AuditEntry{Operation: store.AuditOpDeployComplete, StackName: "web", Outcome: "success", Metadata: map[string]string{"changes": "3"}}))
@@ -100,7 +116,7 @@ func TestWrapRecorder_NotifiesOnDeployAndDriftOnly(t *testing.T) {
 func TestWrapRecorder_NoopWhenDisabled(t *testing.T) {
 	base := &fakeRecorder{}
 	// Disabled notifier → returns the base recorder unchanged.
-	assert.Same(t, base, WrapRecorder(base, New("", "")))
+	assert.Same(t, base, WrapRecorder(base, New(Config{})))
 }
 
 func TestEventFromAudit_Messages(t *testing.T) {

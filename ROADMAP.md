@@ -178,7 +178,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 Goal: make Accelero production-grade for teams that need notifications, approvals, and disaster recovery.
 
 **Notifications:**
-- [x] Slack incoming-webhook integration (`NOTIFY_SLACK_WEBHOOK_URL`, `{"text": ...}`). Discord/Teams still open.
+- [x] Slack incoming-webhook integration (`NOTIFY_SLACK_WEBHOOK_URL`, `{"text": ...}`), Discord (`NOTIFY_DISCORD_WEBHOOK_URL`, `{"content": ...}`), and Microsoft Teams (`NOTIFY_TEAMS_WEBHOOK_URL`, MessageCard). Each sink fires independently; `notify.New` takes a `notify.Config` struct.
 - [x] Generic webhook (POST full Event JSON to `NOTIFY_WEBHOOK_URL`). Best-effort, async, never blocks/fails a deploy. Implemented in `internal/notify` by wrapping the shared audit recorder — deployer/reconciler untouched.
 - [ ] Email (SMTP)
 - [x] Event types: deploy started/completed/failed/rolled-back, drift detected, auto-deploy triggered. (Approval-requested pending the approval-gates work.)

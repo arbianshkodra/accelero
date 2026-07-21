@@ -39,15 +39,31 @@ type Notifier interface {
 	Enabled() bool
 }
 
+// Config holds the destination URLs for each supported sink. Empty fields are
+// skipped. Using a struct (rather than positional args) keeps call sites
+// readable as more sinks are added.
+type Config struct {
+	WebhookURL string // generic JSON webhook (full Event)
+	SlackURL   string // Slack incoming webhook ({"text": ...})
+	DiscordURL string // Discord webhook ({"content": ...})
+	TeamsURL   string // Microsoft Teams incoming webhook (MessageCard)
+}
+
 // New builds a Notifier from the configured destination URLs. Empty URLs are
 // skipped; with none configured the result is a no-op (Enabled() == false).
-func New(webhookURL, slackURL string) Notifier {
+func New(cfg Config) Notifier {
 	d := &dispatcher{client: &http.Client{Timeout: 10 * time.Second}}
-	if webhookURL != "" {
-		d.sinks = append(d.sinks, &webhookSink{url: webhookURL, client: d.client})
+	if cfg.WebhookURL != "" {
+		d.sinks = append(d.sinks, &webhookSink{url: cfg.WebhookURL, client: d.client})
 	}
-	if slackURL != "" {
-		d.sinks = append(d.sinks, &slackSink{url: slackURL, client: d.client})
+	if cfg.SlackURL != "" {
+		d.sinks = append(d.sinks, &slackSink{url: cfg.SlackURL, client: d.client})
+	}
+	if cfg.DiscordURL != "" {
+		d.sinks = append(d.sinks, &discordSink{url: cfg.DiscordURL, client: d.client})
+	}
+	if cfg.TeamsURL != "" {
+		d.sinks = append(d.sinks, &teamsSink{url: cfg.TeamsURL, client: d.client})
 	}
 	return d
 }
@@ -123,4 +139,33 @@ type slackSink struct {
 func (s *slackSink) Name() string { return "slack" }
 func (s *slackSink) Send(ctx context.Context, e Event) error {
 	return postJSON(ctx, s.client, s.url, map[string]string{"text": e.Message})
+}
+
+// discordSink POSTs a Discord webhook payload ({"content": ...}).
+type discordSink struct {
+	url    string
+	client *http.Client
+}
+
+func (s *discordSink) Name() string { return "discord" }
+func (s *discordSink) Send(ctx context.Context, e Event) error {
+	return postJSON(ctx, s.client, s.url, map[string]string{"content": e.Message})
+}
+
+// teamsSink POSTs a Microsoft Teams incoming-webhook MessageCard. The classic
+// connector renders a bare {"text": ...}, but a MessageCard (with a summary,
+// required by the schema) is the portable form across connector versions.
+type teamsSink struct {
+	url    string
+	client *http.Client
+}
+
+func (s *teamsSink) Name() string { return "teams" }
+func (s *teamsSink) Send(ctx context.Context, e Event) error {
+	return postJSON(ctx, s.client, s.url, map[string]string{
+		"@type":    "MessageCard",
+		"@context": "https://schema.org/extensions",
+		"summary":  "Accelero notification",
+		"text":     e.Message,
+	})
 }
