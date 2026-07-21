@@ -125,12 +125,23 @@ func main() {
 	// notification destinations are configured, wrap it so notable
 	// deploy/drift events are also pushed out (deployer/reconciler need no
 	// changes — they already record these events).
-	notifier := notify.New(notify.Config{
+	notifyCfg := notify.Config{
 		WebhookURL: cfg.NotifyWebhookURL,
 		SlackURL:   cfg.NotifySlackWebhookURL,
 		DiscordURL: cfg.NotifyDiscordWebhookURL,
 		TeamsURL:   cfg.NotifyTeamsWebhookURL,
-	})
+	}
+	if cfg.NotifySMTPHost != "" {
+		notifyCfg.Email = &notify.EmailConfig{
+			Host:     cfg.NotifySMTPHost,
+			Port:     cfg.NotifySMTPPort,
+			Username: cfg.NotifySMTPUsername,
+			Password: cfg.NotifySMTPPassword,
+			From:     cfg.NotifyEmailFrom,
+			To:       cfg.NotifyEmailTo,
+		}
+	}
+	notifier := notify.New(notifyCfg)
 	auditRecorder := notify.WrapRecorder(audit.NewStoreRecorder(db), notifier)
 	deployer.SetAudit(auditRecorder)
 	rec.SetAudit(auditRecorder)

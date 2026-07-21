@@ -43,10 +43,11 @@ type Notifier interface {
 // skipped. Using a struct (rather than positional args) keeps call sites
 // readable as more sinks are added.
 type Config struct {
-	WebhookURL string // generic JSON webhook (full Event)
-	SlackURL   string // Slack incoming webhook ({"text": ...})
-	DiscordURL string // Discord webhook ({"content": ...})
-	TeamsURL   string // Microsoft Teams incoming webhook (MessageCard)
+	WebhookURL string       // generic JSON webhook (full Event)
+	SlackURL   string       // Slack incoming webhook ({"text": ...})
+	DiscordURL string       // Discord webhook ({"content": ...})
+	TeamsURL   string       // Microsoft Teams incoming webhook (MessageCard)
+	Email      *EmailConfig // SMTP sink; nil or incomplete = disabled
 }
 
 // New builds a Notifier from the configured destination URLs. Empty URLs are
@@ -64,6 +65,9 @@ func New(cfg Config) Notifier {
 	}
 	if cfg.TeamsURL != "" {
 		d.sinks = append(d.sinks, &teamsSink{url: cfg.TeamsURL, client: d.client})
+	}
+	if cfg.Email != nil && cfg.Email.enabled() {
+		d.sinks = append(d.sinks, newSMTPSink(*cfg.Email))
 	}
 	return d
 }
