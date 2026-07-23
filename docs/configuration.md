@@ -220,6 +220,16 @@ Accelero can push notable lifecycle events to external destinations. Set any of 
 | `NOTIFY_DISCORD_WEBHOOK_URL` | *(unset — disabled)* | Discord [webhook](https://support.discord.com/hc/en-us/articles/228383668). Receives a `{"content": "<message>"}` payload. |
 | `NOTIFY_TEAMS_WEBHOOK_URL` | *(unset — disabled)* | Microsoft Teams incoming webhook. Receives a `MessageCard` (`{"@type":"MessageCard", ..., "text":"<message>"}`), the portable form across connector versions. |
 
+**Email (SMTP).** The email sink is enabled when `NOTIFY_SMTP_HOST`, `NOTIFY_EMAIL_FROM`, and `NOTIFY_EMAIL_TO` are all set. It sends one plain-text message per event.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOTIFY_SMTP_HOST` | *(unset — disabled)* | SMTP server hostname. Setting it (with FROM + TO) enables the email sink. |
+| `NOTIFY_SMTP_PORT` | `587` | Port. `465` uses implicit TLS; any other port uses STARTTLS when the server advertises it (else plaintext). |
+| `NOTIFY_SMTP_USERNAME` / `NOTIFY_SMTP_PASSWORD` | — | Credentials. When a username is set, PLAIN auth is used. Omit both for an unauthenticated relay. |
+| `NOTIFY_EMAIL_FROM` | *(unset)* | Envelope + header `From` address. |
+| `NOTIFY_EMAIL_TO` | *(unset)* | Comma-separated recipient list. |
+
 **Events notified:** deploy started, completed, failed, rolled back; drift detected; auto-deploy triggered. Read-only, secret-CRUD, and other audit operations are deliberately *not* notified (avoids channel spam).
 
 **Delivery semantics:** best-effort and asynchronous — each sink fires in its own goroutine with a 10s timeout. A failing or slow sink logs a warning and is never allowed to block or fail a deploy. There are no retries and no ordering guarantees.

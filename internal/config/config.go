@@ -107,6 +107,15 @@ type Config struct {
 	NotifyDiscordWebhookURL string
 	NotifyTeamsWebhookURL   string
 
+	// SMTP email sink. Enabled when Host, From, and at least one To are set.
+	// Port 465 = implicit TLS; otherwise STARTTLS is used when offered.
+	NotifySMTPHost     string
+	NotifySMTPPort     int
+	NotifySMTPUsername string
+	NotifySMTPPassword string
+	NotifyEmailFrom    string
+	NotifyEmailTo      []string
+
 	// WebhookSecret is the shared secret used to verify HMAC-SHA256
 	// signatures on the legacy /webhook endpoint. Callers sign the raw
 	// request body with this secret and pass the hex digest as
@@ -231,6 +240,17 @@ func Load() (*Config, error) {
 	cfg.NotifySlackWebhookURL = os.Getenv("NOTIFY_SLACK_WEBHOOK_URL")
 	cfg.NotifyDiscordWebhookURL = os.Getenv("NOTIFY_DISCORD_WEBHOOK_URL")
 	cfg.NotifyTeamsWebhookURL = os.Getenv("NOTIFY_TEAMS_WEBHOOK_URL")
+
+	cfg.NotifySMTPHost = os.Getenv("NOTIFY_SMTP_HOST")
+	cfg.NotifySMTPPort = parseIntOrDefault("NOTIFY_SMTP_PORT", 587)
+	cfg.NotifySMTPUsername = os.Getenv("NOTIFY_SMTP_USERNAME")
+	cfg.NotifySMTPPassword = os.Getenv("NOTIFY_SMTP_PASSWORD")
+	cfg.NotifyEmailFrom = os.Getenv("NOTIFY_EMAIL_FROM")
+	for _, addr := range strings.Split(os.Getenv("NOTIFY_EMAIL_TO"), ",") {
+		if a := strings.TrimSpace(addr); a != "" {
+			cfg.NotifyEmailTo = append(cfg.NotifyEmailTo, a)
+		}
+	}
 
 	// Retry budget for transient deploy-path operations. Clamp attempts
 	// to >=1 so a nonsensical RETRY_MAX_ATTEMPTS=0 can't disable the

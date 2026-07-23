@@ -180,7 +180,7 @@ Goal: make Accelero production-grade for teams that need notifications, approval
 **Notifications:**
 - [x] Slack incoming-webhook integration (`NOTIFY_SLACK_WEBHOOK_URL`, `{"text": ...}`), Discord (`NOTIFY_DISCORD_WEBHOOK_URL`, `{"content": ...}`), and Microsoft Teams (`NOTIFY_TEAMS_WEBHOOK_URL`, MessageCard). Each sink fires independently; `notify.New` takes a `notify.Config` struct.
 - [x] Generic webhook (POST full Event JSON to `NOTIFY_WEBHOOK_URL`). Best-effort, async, never blocks/fails a deploy. Implemented in `internal/notify` by wrapping the shared audit recorder — deployer/reconciler untouched.
-- [ ] Email (SMTP)
+- [x] Email (SMTP) — `NOTIFY_SMTP_*` / `NOTIFY_EMAIL_*`; one plain-text message per event. Implicit TLS (465) / STARTTLS / plaintext, optional PLAIN auth. Stdlib `net/smtp`, no new deps.
 - [x] Event types: deploy started/completed/failed/rolled-back, drift detected, auto-deploy triggered. (Approval-requested pending the approval-gates work.)
 - [ ] Per-stack notification routing (stack A → #prod channel, stack B → email)
 - [ ] Notification templates (customizable content)
