@@ -6,95 +6,130 @@ import (
 	"testing"
 
 	"github.com/arbianshkodra/accelero/internal/logctx"
+	"github.com/arbianshkodra/accelero/internal/rbac"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestAPIKeyAuth_ValidKey(t *testing.T) {
-	t.Setenv("API_KEY", "test-key")
-
-	handlerCalled := false
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handlerCalled = true
-		w.WriteHeader(http.StatusOK)
-	})
-
-	handler := APIKeyAuth(inner)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-API-KEY", "test-key")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.True(t, handlerCalled, "expected inner handler to be called")
+// lookupFor returns a KeyLookup that resolves the given raw keys to identities.
+func lookupFor(keys map[string]rbac.Identity) KeyLookup {
+	return func(raw string) (rbac.Identity, bool, error) {
+		id, ok := keys[raw]
+		return id, ok, nil
+	}
 }
 
-func TestAPIKeyAuth_MissingKey(t *testing.T) {
-	t.Setenv("API_KEY", "test-key")
-
+func serveAuth(t *testing.T, auth func(http.Handler) http.Handler, method, path, key string) (*httptest.ResponseRecorder, *rbac.Identity) {
+	t.Helper()
+	var captured *rbac.Identity
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("inner handler should not be called")
+		if id, ok := rbac.IdentityFromContext(r.Context()); ok {
+			captured = &id
+		}
+		w.WriteHeader(http.StatusOK)
 	})
-
-	handler := APIKeyAuth(inner)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(method, path, nil)
+	if key != "" {
+		req.Header.Set("X-API-KEY", key)
+	}
 	rec := httptest.NewRecorder()
+	auth(inner).ServeHTTP(rec, req)
+	return rec, captured
+}
 
-	handler.ServeHTTP(rec, req)
+func TestAuth_EnvKeyIsAdmin(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(nil))
+	rec, id := serveAuth(t, auth, http.MethodPost, "/api/v1/admin/backup", "env-secret")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, id)
+	assert.Equal(t, "env-admin", id.Name)
+	assert.Equal(t, rbac.RoleAdmin, id.Role)
+}
 
+func TestAuth_MissingKey401(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(nil))
+	rec, _ := serveAuth(t, auth, http.MethodGet, "/api/v1/stacks", "")
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Contains(t, rec.Body.String(), "API key is required")
 }
 
-func TestAPIKeyAuth_WrongKey(t *testing.T) {
-	t.Setenv("API_KEY", "test-key")
-
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("inner handler should not be called")
-	})
-
-	handler := APIKeyAuth(inner)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-API-KEY", "wrong-key")
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
+func TestAuth_UnknownKey403(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(nil))
+	rec, _ := serveAuth(t, auth, http.MethodGet, "/api/v1/stacks", "nope")
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 	assert.Contains(t, rec.Body.String(), "Invalid API key")
 }
 
-// TestAPIKeyAuth_UnauthorizedLogsRequestID verifies that the unauthorized
-// warn entries carry contextual fields from the request context — in
-// particular request_id, which is attached upstream by RequestID middleware.
-// This is the fix for the Phase 2 "structured ID propagation" gap: security
-// events were previously logged bare.
-func TestAPIKeyAuth_UnauthorizedLogsRequestID(t *testing.T) {
-	t.Setenv("API_KEY", "test-key")
+func TestAuth_ViewerRoleEnforcement(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(map[string]rbac.Identity{
+		"vkey": {Name: "reader", Role: rbac.RoleViewer},
+	}))
+	// Viewer can read.
+	rec, id := serveAuth(t, auth, http.MethodGet, "/api/v1/stacks", "vkey")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, id)
+	assert.Equal(t, "reader", id.Name)
+	// Viewer cannot mutate.
+	rec, _ = serveAuth(t, auth, http.MethodPost, "/api/v1/stacks/x/deploy", "vkey")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "insufficient role")
+}
 
+func TestAuth_OperatorRoleEnforcement(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(map[string]rbac.Identity{
+		"okey": {Name: "ops", Role: rbac.RoleOperator},
+	}))
+	// Operator can deploy.
+	rec, _ := serveAuth(t, auth, http.MethodPost, "/api/v1/stacks/x/deploy", "okey")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// Operator cannot touch admin endpoints or key management.
+	rec, _ = serveAuth(t, auth, http.MethodPost, "/api/v1/admin/restore", "okey")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	rec, _ = serveAuth(t, auth, http.MethodPost, "/api/v1/apikeys", "okey")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestAuth_ExecRequiresOperator(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", lookupFor(map[string]rbac.Identity{
+		"vkey": {Name: "reader", Role: rbac.RoleViewer},
+		"okey": {Name: "ops", Role: rbac.RoleOperator},
+	}))
+	// exec is a mutating GET — viewer is denied, operator allowed.
+	rec, _ := serveAuth(t, auth, http.MethodGet, "/api/v1/stacks/x/containers/c/exec", "vkey")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	rec, _ = serveAuth(t, auth, http.MethodGet, "/api/v1/stacks/x/containers/c/exec", "okey")
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestAuth_LookupErrorIs500(t *testing.T) {
+	auth := NewAPIKeyAuth("env-secret", func(raw string) (rbac.Identity, bool, error) {
+		return rbac.Identity{}, false, assertErr{}
+	})
+	rec, _ := serveAuth(t, auth, http.MethodGet, "/api/v1/stacks", "anything")
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+type assertErr struct{}
+
+func (assertErr) Error() string { return "boom" }
+
+func TestAuth_UnauthorizedLogsRequestID(t *testing.T) {
 	hook := logrustest.NewGlobal()
 	defer hook.Reset()
 
-	handler := APIKeyAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	auth := NewAPIKeyAuth("test-key", lookupFor(nil))
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("inner handler should not be called on unauth")
-	}))
-
-	// Simulate what the RequestID middleware does upstream: stick a
-	// request_id onto the context before APIKeyAuth sees the request.
+	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stacks", nil)
-	ctx := logctx.WithField(req.Context(), "request_id", "req-abc-123")
-	req = req.WithContext(ctx)
+	req = req.WithContext(logctx.WithField(req.Context(), "request_id", "req-abc-123"))
 	rec := httptest.NewRecorder()
 
-	handler.ServeHTTP(rec, req)
+	auth(inner).ServeHTTP(rec, req)
 
-	require.NotEmpty(t, hook.Entries, "expected a log entry from the unauthorized path")
+	require.NotEmpty(t, hook.Entries)
 	entry := hook.LastEntry()
 	assert.Equal(t, logrus.WarnLevel, entry.Level)
 	assert.Equal(t, "req-abc-123", entry.Data["request_id"])
@@ -102,4 +137,3 @@ func TestAPIKeyAuth_UnauthorizedLogsRequestID(t *testing.T) {
 	assert.Equal(t, "POST", entry.Data["method"])
 	assert.Contains(t, entry.Message, "missing API key")
 }
-

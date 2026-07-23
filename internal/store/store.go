@@ -26,6 +26,14 @@ type Store interface {
 	GetPendingApproval(stackID string) (*Deployment, error)
 	ListPendingApprovals() ([]*Deployment, error)
 
+	// API keys (RBAC). Keys are stored hashed; GetAPIKeyByHash returns
+	// (nil, nil) when no key matches.
+	CreateAPIKey(k *APIKey) error
+	GetAPIKeyByHash(hash string) (*APIKey, error)
+	ListAPIKeys() ([]*APIKey, error)
+	DeleteAPIKey(id string) (bool, error)
+	TouchAPIKey(id string, t time.Time) error
+
 	// Container tracking
 	TrackContainer(c *ManagedContainer) error
 	ListContainers(stackID string) ([]*ManagedContainer, error)

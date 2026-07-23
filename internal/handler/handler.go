@@ -207,6 +207,12 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/stacks/{id}/deployments/{deployId}/reject", h.RejectDeployment).Methods("POST")
 	api.HandleFunc("/approvals", h.ListApprovals).Methods("GET")
 
+	// API key management (RBAC). Admin-only via the route-policy prefix
+	// (see rbac.RequiredRole). The raw key is returned once on creation.
+	api.HandleFunc("/apikeys", h.CreateAPIKey).Methods("POST")
+	api.HandleFunc("/apikeys", h.ListAPIKeys).Methods("GET")
+	api.HandleFunc("/apikeys/{id}", h.DeleteAPIKey).Methods("DELETE")
+
 	// Per-stack secrets — encrypted at rest via the existing cipher.
 	// List returns names/timestamps only; values never leave via the
 	// API (they're injected into containers at deploy time, follow-up PR).

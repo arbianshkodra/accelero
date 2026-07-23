@@ -20,6 +20,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
 	"github.com/arbianshkodra/accelero/internal/notify"
+	"github.com/arbianshkodra/accelero/internal/rbac"
 	"github.com/arbianshkodra/accelero/internal/reconciler"
 	"github.com/arbianshkodra/accelero/internal/retry"
 	"github.com/arbianshkodra/accelero/internal/secrets"
@@ -259,8 +260,27 @@ func main() {
 		logrus.Infof("Rate limiting enabled: %.2f req/s per API key, burst %d",
 			cfg.RateLimitRPS, cfg.RateLimitBurst)
 	}
+	// RBAC key lookup: hash the presented key, resolve its role, and record
+	// last-used (best-effort). The env API_KEY is handled inside the
+	// middleware as the bootstrap admin key.
+	keyLookup := func(raw string) (rbac.Identity, bool, error) {
+		k, err := db.GetAPIKeyByHash(store.HashAPIKey(raw))
+		if err != nil {
+			return rbac.Identity{}, false, err
+		}
+		if k == nil || k.Disabled {
+			return rbac.Identity{}, false, nil
+		}
+		role, ok := rbac.ParseRole(k.Role)
+		if !ok {
+			return rbac.Identity{}, false, nil
+		}
+		go func() { _ = db.TouchAPIKey(k.ID, time.Now()) }()
+		return rbac.Identity{Name: k.Name, Role: role}, true, nil
+	}
+	apiKeyAuth := middleware.NewAPIKeyAuth(cfg.APIKey, keyLookup)
 	authChain := func(next http.Handler) http.Handler {
-		return middleware.APIKeyAuth(rateLimit(next))
+		return apiKeyAuth(rateLimit(next))
 	}
 
 	// Register all routes — handler applies auth middleware where needed.
