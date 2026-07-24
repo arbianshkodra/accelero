@@ -16,6 +16,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/backup"
 	"github.com/arbianshkodra/accelero/internal/breaker"
 	"github.com/arbianshkodra/accelero/internal/config"
+	"github.com/arbianshkodra/accelero/internal/dockerhost"
 	"github.com/arbianshkodra/accelero/internal/handler"
 	"github.com/arbianshkodra/accelero/internal/metrics"
 	"github.com/arbianshkodra/accelero/internal/middleware"
@@ -102,6 +103,21 @@ func main() {
 	}
 	logrus.Info("Connected to Docker daemon")
 
+	// Multi-host: this daemon is the default host (stacks with an empty
+	// host_id target it); additional hosts are registered in the store and
+	// their clients built lazily on first use.
+	hostManager := dockerhost.NewManager(cli, func(id string) (*dockerhost.Host, error) {
+		h, err := db.GetDockerHost(id)
+		if err != nil || h == nil {
+			return nil, err
+		}
+		return &dockerhost.Host{
+			ID: h.ID, Name: h.Name, Endpoint: h.Endpoint,
+			TLSCA: h.TLSCA, TLSCert: h.TLSCert, TLSKey: h.TLSKey,
+		}, nil
+	})
+	defer hostManager.Close()
+
 	// 4. Create core components.
 	retryPolicy := retry.Policy{
 		MaxAttempts: cfg.RetryMaxAttempts,
@@ -110,8 +126,10 @@ func main() {
 	}
 	deployer := stack.NewDeployer(cli, db, cfg.StacksDataDir)
 	deployer.SetRetryPolicy(retryPolicy)
+	deployer.SetHostClients(hostManager)
 	rec := reconciler.New(db, cli, deployer)
 	rec.SetRetryPolicy(retryPolicy)
+	rec.SetHostClients(hostManager)
 	rec.SetCircuitBreaker(breaker.New(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown))
 	if cfg.RetryMaxAttempts > 1 {
 		logrus.Infof("Transient-operation retries enabled: up to %d attempts, backoff %s..%s",

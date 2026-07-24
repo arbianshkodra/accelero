@@ -1491,3 +1491,90 @@ func TestAPIKey_StackGrantsRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, plain.StackGrants)
 }
+
+func TestDockerHost_CRUD(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+	h := &DockerHost{
+		ID: "h1", Name: "edge-1", Endpoint: "tcp://10.0.0.5:2376",
+		TLSCA: "ca-pem", TLSCert: "cert-pem", TLSKey: "key-pem",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	require.NoError(t, s.CreateDockerHost(h))
+
+	got, err := s.GetDockerHost("h1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "edge-1", got.Name)
+	assert.Equal(t, "tcp://10.0.0.5:2376", got.Endpoint)
+	assert.Equal(t, "key-pem", got.TLSKey, "tls_key round-trips (decrypted on read)")
+	assert.True(t, got.TLSEnabled())
+
+	byName, err := s.GetDockerHostByName("edge-1")
+	require.NoError(t, err)
+	require.NotNil(t, byName)
+	assert.Equal(t, "h1", byName.ID)
+
+	missing, err := s.GetDockerHost("nope")
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+
+	list, err := s.ListDockerHosts()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+
+	ok, err := s.DeleteDockerHost("h1")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	ok, err = s.DeleteDockerHost("h1")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestDockerHost_TLSKeyEncryptedAtRest(t *testing.T) {
+	s := newTestStore(t)
+	key := make([]byte, 32)
+	cipher, err := secrets.NewCipher(key)
+	require.NoError(t, err)
+	s.SetCipher(cipher)
+
+	now := time.Now()
+	require.NoError(t, s.CreateDockerHost(&DockerHost{
+		ID: "h1", Name: "edge", Endpoint: "tcp://x:2376",
+		TLSCA: "ca", TLSCert: "cert", TLSKey: "super-secret-key",
+		CreatedAt: now, UpdatedAt: now,
+	}))
+
+	// Raw column must hold ciphertext, not the key material.
+	var raw string
+	require.NoError(t, s.db.QueryRow(`SELECT tls_key FROM docker_hosts WHERE id='h1'`).Scan(&raw))
+	assert.NotEqual(t, "super-secret-key", raw)
+	assert.True(t, strings.HasPrefix(raw, "v1:"), "expected versioned ciphertext, got %q", raw)
+
+	// Read path decrypts.
+	got, err := s.GetDockerHost("h1")
+	require.NoError(t, err)
+	assert.Equal(t, "super-secret-key", got.TLSKey)
+}
+
+func TestStackHostID_PersistedAndCounted(t *testing.T) {
+	s := newTestStore(t)
+	st := makeStack("s1", "one")
+	st.HostID = "h1"
+	require.NoError(t, s.CreateStack(st))
+
+	got, err := s.GetStack("s1")
+	require.NoError(t, err)
+	assert.Equal(t, "h1", got.HostID)
+
+	n, err := s.CountStacksOnHost("h1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	// Moving the stack back to the default host clears the count.
+	got.HostID = ""
+	require.NoError(t, s.UpdateStack(got))
+	n, err = s.CountStacksOnHost("h1")
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+}

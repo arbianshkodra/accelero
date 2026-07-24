@@ -213,6 +213,12 @@ func (h *Handler) RegisterRoutes(r *mux.Router, authMiddleware mux.MiddlewareFun
 	api.HandleFunc("/apikeys", h.ListAPIKeys).Methods("GET")
 	api.HandleFunc("/apikeys/{id}", h.DeleteAPIKey).Methods("DELETE")
 
+	// Docker hosts (multi-host). Admin-only, including reads — the endpoint
+	// list is infrastructure detail. TLS material is never returned.
+	api.HandleFunc("/hosts", h.CreateDockerHost).Methods("POST")
+	api.HandleFunc("/hosts", h.ListDockerHosts).Methods("GET")
+	api.HandleFunc("/hosts/{id}", h.DeleteDockerHost).Methods("DELETE")
+
 	// Per-stack secrets — encrypted at rest via the existing cipher.
 	// List returns names/timestamps only; values never leave via the
 	// API (they're injected into containers at deploy time, follow-up PR).
@@ -293,6 +299,7 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 		AutoDeploy        bool   `json:"auto_deploy"`
 		ReconcileInterval int    `json:"reconcile_interval_seconds"`
 		RequiresApproval  bool   `json:"requires_approval"`
+		HostID            string `json:"host_id"`
 		DockerUsername    string `json:"docker_username"`
 		DockerPassword    string `json:"docker_password"`
 		DockerRegistry    string `json:"docker_registry"`
@@ -304,6 +311,11 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Name == "" || input.RepoURL == "" || input.ComposePath == "" {
 		writeError(w, "name, repo_url, and compose_path are required", http.StatusBadRequest)
+		return
+	}
+	// Resolve host_id (name or id) so a typo fails here rather than at deploy.
+	hostID, ok := h.resolveHostID(w, input.HostID)
+	if !ok {
 		return
 	}
 
@@ -326,6 +338,7 @@ func (h *Handler) CreateStack(w http.ResponseWriter, r *http.Request) {
 		AutoDeploy:        input.AutoDeploy,
 		ReconcileInterval: input.ReconcileInterval,
 		RequiresApproval:  input.RequiresApproval,
+		HostID:            hostID,
 		Status:            store.StackStatusActive,
 		DockerUsername:    input.DockerUsername,
 		DockerPassword:    input.DockerPassword,
@@ -415,6 +428,7 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 		AutoDeploy        *bool   `json:"auto_deploy"`
 		ReconcileInterval *int    `json:"reconcile_interval_seconds"`
 		RequiresApproval  *bool   `json:"requires_approval"`
+		HostID            *string `json:"host_id"`
 		Status            *string `json:"status"`
 		DockerUsername    *string `json:"docker_username"`
 		DockerPassword    *string `json:"docker_password"`
@@ -455,6 +469,14 @@ func (h *Handler) UpdateStack(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.RequiresApproval != nil {
 		stack.RequiresApproval = *input.RequiresApproval
+	}
+	if input.HostID != nil {
+		// "" explicitly moves the stack back to the default host.
+		hostID, ok := h.resolveHostID(w, *input.HostID)
+		if !ok {
+			return
+		}
+		stack.HostID = hostID
 	}
 	if input.Status != nil {
 		stack.Status = *input.Status

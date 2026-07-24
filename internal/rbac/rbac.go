@@ -100,12 +100,17 @@ func IdentityFromContext(ctx context.Context) (Identity, bool) {
 // a per-route table so new routes are covered by default (fail-closed for
 // mutations):
 //
-//   - /api/v1/admin/* and /api/v1/apikeys*     → admin
+//   - /api/v1/admin/*, /api/v1/apikeys*, /api/v1/hosts* → admin
 //   - a path ending in /exec (a mutating GET)  → operator
 //   - any other GET                            → viewer
 //   - any other method (POST/PUT/DELETE/PATCH) → operator
+//
+// Docker hosts are infrastructure (and their TLS material is sensitive), so the
+// whole /hosts surface — reads included — is admin-only.
 func RequiredRole(method, path string) Role {
-	if strings.HasPrefix(path, "/api/v1/admin/") || strings.HasPrefix(path, "/api/v1/apikeys") {
+	if strings.HasPrefix(path, "/api/v1/admin/") ||
+		strings.HasPrefix(path, "/api/v1/apikeys") ||
+		strings.HasPrefix(path, "/api/v1/hosts") {
 		return RoleAdmin
 	}
 	// Container exec is a mutation delivered over a WebSocket GET upgrade, so

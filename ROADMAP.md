@@ -242,6 +242,9 @@ Goal: a browser UI that makes GitOps concrete. Not a Portainer clone — a GitOp
 
 Goal: manage multiple Docker hosts from a single Accelero control plane.
 
+- [x] **Direct multi-host (no agent)** — register Docker daemons via `POST /api/v1/hosts` (`unix://` / `tcp://`, optional mutual TLS with `tls_key` encrypted at rest) and target one per stack with `host_id`. The `DOCKER_SOCK` daemon remains the implicit default host, so existing stacks are unaffected. Clients are built lazily and cached per host (`internal/dockerhost.Manager`); deploys, reconciliation, drift, and `/preview` run against the stack's host. Host registration pings before persisting, and deleting an in-use host is refused. Admin-only surface. *Still on the default host: container introspection (logs/stats/exec/events/restart), root resource browsers, and the resource-cleanup loop — next increment. `ssh://` endpoints also pending.*
+- [ ] Make container introspection + root browsers + cleanup loop host-aware (follow-up to the above)
+- [ ] `ssh://` host endpoints
 - [ ] Lightweight Accelero agent binary per Docker host
 - [ ] Central controller orchestrates agents (mTLS between controller and agents)
 - [ ] Environment grouping: hosts grouped as `prod-us-east`, `staging`, etc.
