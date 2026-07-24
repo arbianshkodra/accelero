@@ -270,6 +270,7 @@ func (s *SQLiteStore) applyColumnMigrations() error {
 	cols := []addCol{
 		{"stacks", "secrets_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"stacks", "requires_approval", "INTEGER NOT NULL DEFAULT 0"},
+		{"api_keys", "stack_grants", "TEXT NOT NULL DEFAULT '{}'"},
 	}
 	for _, c := range cols {
 		present, err := s.columnExists(c.table, c.col)
@@ -508,12 +509,27 @@ func (s *SQLiteStore) ListPendingApprovals() ([]*Deployment, error) {
 // --- API keys -------------------------------------------------------------
 
 func (s *SQLiteStore) CreateAPIKey(k *APIKey) error {
-	_, err := s.db.Exec(`
-		INSERT INTO api_keys (id, name, role, key_hash, created_at, last_used_at, disabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		k.ID, k.Name, k.Role, k.KeyHash, k.CreatedAt, k.LastUsedAt, boolToInt(k.Disabled),
+	grants, err := marshalGrants(k.StackGrants)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO api_keys (id, name, role, key_hash, created_at, last_used_at, disabled, stack_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.Name, k.Role, k.KeyHash, k.CreatedAt, k.LastUsedAt, boolToInt(k.Disabled), grants,
 	)
 	return err
+}
+
+func marshalGrants(g map[string]string) (string, error) {
+	if len(g) == 0 {
+		return "{}", nil
+	}
+	b, err := json.Marshal(g)
+	if err != nil {
+		return "", fmt.Errorf("marshal stack_grants: %w", err)
+	}
+	return string(b), nil
 }
 
 func (s *SQLiteStore) GetAPIKeyByHash(hash string) (*APIKey, error) {
@@ -558,7 +574,10 @@ func (s *SQLiteStore) scanAPIKey(row scannable) (*APIKey, error) {
 	k := &APIKey{}
 	var lastUsed sql.NullTime
 	var disabled int
-	err := row.Scan(&k.ID, &k.Name, &k.Role, &k.KeyHash, &k.CreatedAt, &lastUsed, &disabled)
+	// stack_grants is added via applyColumnMigrations, so it's the last
+	// physical column and scans after disabled.
+	var grants string
+	err := row.Scan(&k.ID, &k.Name, &k.Role, &k.KeyHash, &k.CreatedAt, &lastUsed, &disabled, &grants)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -569,6 +588,11 @@ func (s *SQLiteStore) scanAPIKey(row scannable) (*APIKey, error) {
 		k.LastUsedAt = &lastUsed.Time
 	}
 	k.Disabled = disabled != 0
+	if grants != "" && grants != "{}" {
+		if err := json.Unmarshal([]byte(grants), &k.StackGrants); err != nil {
+			return nil, fmt.Errorf("unmarshal stack_grants for key %s: %w", k.ID, err)
+		}
+	}
 	return k, nil
 }
 

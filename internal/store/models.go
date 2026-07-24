@@ -95,13 +95,17 @@ type StackSecret struct {
 // never stored — only its SHA-256 hash (KeyHash). The plaintext is returned to
 // the caller exactly once, at creation.
 type APIKey struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Role       string     `json:"role"`
-	KeyHash    string     `json:"-"` // never serialised
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	Disabled   bool       `json:"disabled"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	KeyHash   string `json:"-"` // never serialised
+	// StackGrants maps a stack ID to the role this key holds on that stack,
+	// overriding Role there. Empty = Role applies everywhere. Persisted as a
+	// JSON object in the stack_grants column.
+	StackGrants map[string]string `json:"stack_grants,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	LastUsedAt  *time.Time        `json:"last_used_at,omitempty"`
+	Disabled    bool              `json:"disabled"`
 }
 
 // ManagedContainer tracks containers that Accelero manages.
