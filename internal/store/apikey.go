@@ -23,8 +23,16 @@ func GenerateAPIKey() (string, error) {
 }
 
 // HashAPIKey returns the hex SHA-256 of a raw key — the value stored and looked
-// up. Keys are high-entropy, so a plain hash lookup is safe (no timing oracle
-// on a value an attacker can't guess byte-by-byte).
+// up.
+//
+// SHA-256 (not bcrypt/scrypt/argon2) is deliberate and correct here: these keys
+// are 256-bit values from crypto/rand (see GenerateAPIKey), not human-chosen
+// passwords. A slow, salted KDF exists to make low-entropy secrets expensive to
+// brute-force after a DB leak; a 256-bit random token is infeasible to brute
+// force regardless of hash speed, so a fast hash adds no attack surface while
+// keeping per-request auth cheap. This is the same approach GitHub/Stripe use
+// for API tokens. (CodeQL flags this as "weak password hashing" — a false
+// positive: the input is a random token, not a password.)
 func HashAPIKey(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
