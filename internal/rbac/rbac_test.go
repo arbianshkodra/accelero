@@ -47,6 +47,10 @@ func TestRequiredRole(t *testing.T) {
 		{http.MethodPost, "/api/v1/apikeys", RoleAdmin},
 		{http.MethodGet, "/api/v1/apikeys", RoleAdmin},
 		{http.MethodDelete, "/api/v1/apikeys/abc", RoleAdmin},
+		// Docker hosts are infrastructure: admin-only, reads included.
+		{http.MethodPost, "/api/v1/hosts", RoleAdmin},
+		{http.MethodGet, "/api/v1/hosts", RoleAdmin},
+		{http.MethodDelete, "/api/v1/hosts/h1", RoleAdmin},
 	}
 	for _, c := range cases {
 		assert.Equal(t, c.want, RequiredRole(c.method, c.path), "%s %s", c.method, c.path)

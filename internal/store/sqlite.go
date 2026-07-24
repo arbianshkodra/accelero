@@ -169,6 +169,20 @@ func (s *SQLiteStore) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_stack_id ON managed_containers(stack_id);
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_container_id ON managed_containers(container_id);
 
+	-- Registered Docker hosts. The DOCKER_SOCK daemon is the implicit default
+	-- host and has no row here (stacks with host_id='' target it). tls_key is
+	-- private key material and is encrypted at rest like other secrets.
+	CREATE TABLE IF NOT EXISTS docker_hosts (
+		id TEXT PRIMARY KEY,
+		name TEXT UNIQUE NOT NULL,
+		endpoint TEXT NOT NULL,
+		tls_ca TEXT NOT NULL DEFAULT '',
+		tls_cert TEXT NOT NULL DEFAULT '',
+		tls_key TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
@@ -271,6 +285,7 @@ func (s *SQLiteStore) applyColumnMigrations() error {
 		{"stacks", "secrets_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"stacks", "requires_approval", "INTEGER NOT NULL DEFAULT 0"},
 		{"api_keys", "stack_grants", "TEXT NOT NULL DEFAULT '{}'"},
+		{"stacks", "host_id", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range cols {
 		present, err := s.columnExists(c.table, c.col)
@@ -316,14 +331,14 @@ func (s *SQLiteStore) CreateStack(stack *Stack) error {
 		INSERT INTO stacks (id, name, repo_url, repo_username, repo_token, repo_branch,
 			compose_path, service_filter, auto_deploy, reconcile_interval_seconds, status,
 			docker_username, docker_password, docker_registry, created_at, updated_at, secrets_hash,
-			requires_approval)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			requires_approval, host_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stack.ID, stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval, stack.Status,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
 		stack.CreatedAt, stack.UpdatedAt, stack.SecretsHash,
-		boolToInt(stack.RequiresApproval),
+		boolToInt(stack.RequiresApproval), stack.HostID,
 	)
 	return err
 }
@@ -369,14 +384,14 @@ func (s *SQLiteStore) UpdateStack(stack *Stack) error {
 			compose_path=?, service_filter=?, auto_deploy=?, reconcile_interval_seconds=?,
 			status=?, last_deployed_at=?, last_reconciled_at=?, git_commit=?,
 			docker_username=?, docker_password=?, docker_registry=?, updated_at=?, secrets_hash=?,
-			requires_approval=?
+			requires_approval=?, host_id=?
 		WHERE id=?`,
 		stack.Name, stack.RepoURL, stack.RepoUsername, encToken,
 		stack.RepoBranch, stack.ComposePath, stack.ServiceFilter,
 		boolToInt(stack.AutoDeploy), stack.ReconcileInterval,
 		stack.Status, stack.LastDeployedAt, stack.LastReconciledAt, stack.GitCommit,
 		stack.DockerUsername, encDockerPw, stack.DockerRegistry,
-		stack.UpdatedAt, stack.SecretsHash, boolToInt(stack.RequiresApproval), stack.ID,
+		stack.UpdatedAt, stack.SecretsHash, boolToInt(stack.RequiresApproval), stack.HostID, stack.ID,
 	)
 	return err
 }
@@ -504,6 +519,81 @@ func (s *SQLiteStore) ListPendingApprovals() ([]*Deployment, error) {
 		deployments = append(deployments, d)
 	}
 	return deployments, rows.Err()
+}
+
+// --- Docker hosts ---------------------------------------------------------
+
+func (s *SQLiteStore) CreateDockerHost(h *DockerHost) error {
+	encKey, err := s.encryptField(h.TLSKey)
+	if err != nil {
+		return fmt.Errorf("encrypt tls_key: %w", err)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO docker_hosts (id, name, endpoint, tls_ca, tls_cert, tls_key, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		h.ID, h.Name, h.Endpoint, h.TLSCA, h.TLSCert, encKey, h.CreatedAt, h.UpdatedAt,
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetDockerHost(id string) (*DockerHost, error) {
+	return s.scanDockerHost(s.db.QueryRow(`SELECT * FROM docker_hosts WHERE id = ?`, id))
+}
+
+func (s *SQLiteStore) GetDockerHostByName(name string) (*DockerHost, error) {
+	return s.scanDockerHost(s.db.QueryRow(`SELECT * FROM docker_hosts WHERE name = ?`, name))
+}
+
+func (s *SQLiteStore) ListDockerHosts() ([]*DockerHost, error) {
+	rows, err := s.db.Query(`SELECT * FROM docker_hosts ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hosts []*DockerHost
+	for rows.Next() {
+		h, err := s.scanDockerHost(rows)
+		if err != nil {
+			return nil, err
+		}
+		hosts = append(hosts, h)
+	}
+	return hosts, rows.Err()
+}
+
+// DeleteDockerHost removes a host by ID, reporting whether a row was deleted.
+// Callers must check no stack still targets the host first (the handler does).
+func (s *SQLiteStore) DeleteDockerHost(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM docker_hosts WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// CountStacksOnHost reports how many stacks target a host — used to refuse
+// deleting a host that's still in use.
+func (s *SQLiteStore) CountStacksOnHost(hostID string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM stacks WHERE host_id = ?`, hostID).Scan(&n)
+	return n, err
+}
+
+func (s *SQLiteStore) scanDockerHost(row scannable) (*DockerHost, error) {
+	h := &DockerHost{}
+	err := row.Scan(&h.ID, &h.Name, &h.Endpoint, &h.TLSCA, &h.TLSCert, &h.TLSKey, &h.CreatedAt, &h.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if h.TLSKey, err = s.decryptField(h.TLSKey); err != nil {
+		return nil, fmt.Errorf("decrypt tls_key for host %s: %w", h.ID, err)
+	}
+	return h, nil
 }
 
 // --- API keys -------------------------------------------------------------
@@ -1002,9 +1092,10 @@ func (s *SQLiteStore) scanStack(row scannable) (*Stack, error) {
 		&st.CreatedAt, &st.UpdatedAt,
 		// Columns added via applyColumnMigrations land at the end of the
 		// table in the order they were added, so they scan here after the
-		// base columns: secrets_hash, then requires_approval.
+		// base columns: secrets_hash, requires_approval, then host_id.
 		&st.SecretsHash,
 		&requiresApproval,
+		&st.HostID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

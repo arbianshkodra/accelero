@@ -16,6 +16,11 @@ type Stack struct {
 	ReconcileInterval int        `json:"reconcile_interval_seconds"` // seconds, 0 = disabled
 	Status            string     `json:"status"`                     // active, paused, deploying, error
 
+	// HostID targets a registered Docker host (see DockerHost). Empty means
+	// the default host (DOCKER_SOCK) — the behaviour of every stack created
+	// before multi-host support.
+	HostID string `json:"host_id,omitempty"`
+
 	// RequiresApproval gates deploys behind a manual approval step. When
 	// true, any deploy trigger (manual, webhook, or reconcile auto-deploy)
 	// creates a deployment in the pending_approval state and notifies
@@ -89,6 +94,31 @@ type StackSecret struct {
 	Value     string    `json:"-"` // never serialised back to clients
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// DockerHost is a registered Docker daemon that stacks can target. The daemon
+// at DOCKER_SOCK is the implicit "default host" and has no row here — a stack
+// with an empty HostID deploys there, which is every stack that predates
+// multi-host support.
+//
+// The TLS fields are PEM blobs for talking to a tcp:// daemon with mutual TLS.
+// TLSKey is private key material, so it's encrypted at rest via the same cipher
+// as repo_token / docker_password and never serialised back to clients.
+type DockerHost struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Endpoint  string    `json:"endpoint"` // unix:///... or tcp://host:port
+	TLSCA     string    `json:"-"`
+	TLSCert   string    `json:"-"`
+	TLSKey    string    `json:"-"` // encrypted at rest
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TLSEnabled reports whether this host carries a full mutual-TLS triple. Used
+// by the API to tell clients that TLS is configured without exposing material.
+func (h *DockerHost) TLSEnabled() bool {
+	return h.TLSCA != "" && h.TLSCert != "" && h.TLSKey != ""
 }
 
 // APIKey is a named, role-scoped credential for the HTTP API. The raw key is
@@ -240,4 +270,9 @@ const (
 	// only the name, role, and id.
 	AuditOpAPIKeyCreate = "apikey.create"
 	AuditOpAPIKeyDelete = "apikey.delete"
+
+	// Docker host (multi-host) management. TLS material never appears in
+	// metadata — only the name, endpoint, and whether TLS is configured.
+	AuditOpHostCreate = "host.create"
+	AuditOpHostDelete = "host.delete"
 )

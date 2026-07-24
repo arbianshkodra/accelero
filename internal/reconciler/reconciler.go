@@ -106,6 +106,36 @@ type Reconciler struct {
 	// reconcile cycles. Defaults to a disabled breaker (never trips)
 	// until SetCircuitBreaker is called from config in main.
 	breaker *breaker.Breaker
+
+	// hosts resolves a stack's HostID to that host's Docker client. nil (or
+	// an empty HostID) means "use r.docker" — the single-daemon behaviour
+	// that predates multi-host support.
+	hosts HostClients
+}
+
+// HostClients resolves a registered Docker host ID to a client for that host.
+// Implemented by dockerhost.Manager.
+type HostClients interface {
+	ClientFor(hostID string) (*client.Client, error)
+}
+
+// SetHostClients enables per-stack host targeting for drift checks. Setter
+// rather than constructor param to avoid churning every New() call site.
+func (r *Reconciler) SetHostClients(h HostClients) {
+	r.hosts = h
+}
+
+// dockerFor returns the Docker client for a stack's host, falling back to the
+// default client when multi-host isn't configured or the stack has no host.
+func (r *Reconciler) dockerFor(hostID string) (*client.Client, error) {
+	if hostID == "" || r.hosts == nil {
+		return r.docker, nil
+	}
+	cli, err := r.hosts.ClientFor(hostID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve docker host %s: %w", hostID, err)
+	}
+	return cli, nil
 }
 
 // SetRetryPolicy configures the exponential-backoff retry applied to the
@@ -473,6 +503,12 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 		CheckedAt: time.Now(),
 	}
 
+	// Actual state must be read from the host this stack deploys to.
+	cli, err := r.dockerFor(stack.HostID)
+	if err != nil {
+		return nil, err
+	}
+
 	// ---- 1. Clone the repository (shallow) and parse the compose file ----
 	desiredServices, desiredNetworks, desiredVolumes, err := r.fetchDesiredState(ctx, stack)
 	if err != nil {
@@ -480,7 +516,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 	}
 
 	// ---- 2. List running containers managed by Accelero for this stack ----
-	actualContainers, err := r.listStackContainers(ctx, stack.Name)
+	actualContainers, err := r.listStackContainers(ctx, cli, stack.Name)
 	if err != nil {
 		return nil, fmt.Errorf("list stack containers: %w", err)
 	}
@@ -516,7 +552,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 		}
 
 		// Inspect for health status.
-		inspect, inspectErr := r.docker.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+		inspect, inspectErr := cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
 		if inspectErr == nil && inspect.Container.State != nil && inspect.Container.State.Health != nil {
 			info.health = string(inspect.Container.State.Health.Status)
 		}
@@ -622,7 +658,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 
 	// ---- 5. Check network drift (desired networks that don't exist) ----
 	if len(desiredNetworks) > 0 {
-		existingNetworks, netErr := r.docker.NetworkList(ctx, client.NetworkListOptions{})
+		existingNetworks, netErr := cli.NetworkList(ctx, client.NetworkListOptions{})
 		if netErr == nil {
 			existingSet := make(map[string]bool, len(existingNetworks.Items))
 			for _, n := range existingNetworks.Items {
@@ -645,7 +681,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, stack *store.Stack) (*Drift
 
 	// ---- 6. Check volume drift (declared named volumes that don't exist) ----
 	if len(desiredVolumes) > 0 {
-		volRes, volErr := r.docker.VolumeList(ctx, client.VolumeListOptions{})
+		volRes, volErr := cli.VolumeList(ctx, client.VolumeListOptions{})
 		if volErr == nil {
 			existingSet := make(map[string]bool, len(volRes.Items))
 			for _, v := range volRes.Items {
@@ -818,12 +854,12 @@ func loadDotEnv(repoDir, composeFilePath string) (map[string]string, string, err
 
 // listStackContainers returns all containers on the Docker host that carry the
 // Accelero management labels for the given stack name.
-func (r *Reconciler) listStackContainers(ctx context.Context, stackName string) ([]container.Summary, error) {
+func (r *Reconciler) listStackContainers(ctx context.Context, cli *client.Client, stackName string) ([]container.Summary, error) {
 	f := make(client.Filters).
 		Add("label", fmt.Sprintf("%s=%s", labelManagedBy, labelManagedByValue)).
 		Add("label", fmt.Sprintf("%s=%s", labelStackName, stackName))
 
-	res, err := r.docker.ContainerList(ctx, client.ContainerListOptions{
+	res, err := cli.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: f,
 	})

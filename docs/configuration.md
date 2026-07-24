@@ -231,6 +231,38 @@ Setting both variables is a fatal configuration error — the two sources are mu
 
 Without either, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
 
+## Multi-host
+
+By default Accelero manages the single Docker daemon at `DOCKER_SOCK`. That daemon is the **default host**. You can additionally register remote daemons and point individual stacks at them, so one Accelero instance drives several hosts.
+
+| Endpoint | Effect |
+|----------|--------|
+| `POST /api/v1/hosts` | Register a host `{name, endpoint, tls_ca?, tls_cert?, tls_key?}`. The endpoint is **pinged before it's stored**, so a bad address fails immediately instead of at first deploy. Audited `host.create`. |
+| `GET /api/v1/hosts` | List hosts. TLS material is never returned — only `tls_enabled`. |
+| `DELETE /api/v1/hosts/{id}` | Remove a host. Refused with `409` while any stack still targets it. Audited `host.delete`. |
+
+All `/hosts` endpoints are **admin-only** (reads included — the endpoint list is infrastructure detail).
+
+Endpoints must be `unix://…` or `tcp://host:port`. For a TLS-protected daemon, supply all three of `tls_ca` / `tls_cert` / `tls_key` as PEM strings (a partial triple is rejected); `tls_key` is **encrypted at rest** with the same cipher as other secrets and never leaves via the API. `ssh://` endpoints are not supported yet.
+
+Point a stack at a host with `host_id` on create or update, using the host's **name or id**:
+
+```bash
+curl -sX POST $ACCELERO/api/v1/hosts -H "X-API-KEY: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"edge-1","endpoint":"tcp://10.0.0.5:2376",
+       "tls_ca":"-----BEGIN CERTIFICATE-----\n...","tls_cert":"...","tls_key":"..."}'
+
+curl -sX POST $ACCELERO/api/v1/stacks -H "X-API-KEY: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"web","repo_url":"...","compose_path":"docker-compose.yaml","host_id":"edge-1"}'
+```
+
+An empty `host_id` means the default host, so **existing stacks are unaffected** — they keep deploying to `DOCKER_SOCK`. Setting `host_id: ""` on update moves a stack back to the default host.
+
+!!! note "What is host-aware today"
+    **Deploys, reconciliation, drift checks, and `/preview` run against the stack's host.** Container introspection (`/containers`, `logs`, `stats`, `exec`, `events`, `restart`) and the root resource browsers (`/images`, `/volumes`, `/networks`) plus the periodic Docker resource cleanup still operate on the **default host** — making those host-aware is the next step. If you deploy a stack to a remote host, its containers won't appear in those views yet.
+
 ## Approval gates
 
 A stack created (or updated) with `requires_approval: true` holds every deploy behind a manual approval step instead of running it immediately. This applies to all triggers — manual `POST /deploy`, the legacy webhook, and reconcile auto-deploy.

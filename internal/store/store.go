@@ -26,6 +26,15 @@ type Store interface {
 	GetPendingApproval(stackID string) (*Deployment, error)
 	ListPendingApprovals() ([]*Deployment, error)
 
+	// Docker hosts (multi-host). The DOCKER_SOCK daemon is the implicit
+	// default host and has no row; stacks with host_id="" target it.
+	CreateDockerHost(h *DockerHost) error
+	GetDockerHost(id string) (*DockerHost, error)
+	GetDockerHostByName(name string) (*DockerHost, error)
+	ListDockerHosts() ([]*DockerHost, error)
+	DeleteDockerHost(id string) (bool, error)
+	CountStacksOnHost(hostID string) (int, error)
+
 	// API keys (RBAC). Keys are stored hashed; GetAPIKeyByHash returns
 	// (nil, nil) when no key matches.
 	CreateAPIKey(k *APIKey) error

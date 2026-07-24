@@ -30,6 +30,7 @@ type mockStore struct {
 	deployments  []*store.Deployment
 	auditEntries []*store.AuditEntry
 	apiKeys      []*store.APIKey
+	dockerHosts  []*store.DockerHost
 
 	// plaintextStackIDs lets encryption-migration tests simulate
 	// "these rows are still plaintext" without modelling the cipher.
@@ -108,6 +109,46 @@ func (m *mockStore) CleanupOldDeployments(maxAge time.Duration) (int, error) { r
 func (m *mockStore) GetPendingApproval(stackID string) (*store.Deployment, error) {
 	return nil, nil
 }
+func (m *mockStore) CreateDockerHost(h *store.DockerHost) error {
+	m.dockerHosts = append(m.dockerHosts, h)
+	return nil
+}
+func (m *mockStore) GetDockerHost(id string) (*store.DockerHost, error) {
+	for _, h := range m.dockerHosts {
+		if h.ID == id {
+			return h, nil
+		}
+	}
+	return nil, nil
+}
+func (m *mockStore) GetDockerHostByName(name string) (*store.DockerHost, error) {
+	for _, h := range m.dockerHosts {
+		if h.Name == name {
+			return h, nil
+		}
+	}
+	return nil, nil
+}
+func (m *mockStore) ListDockerHosts() ([]*store.DockerHost, error) { return m.dockerHosts, nil }
+func (m *mockStore) DeleteDockerHost(id string) (bool, error) {
+	for i, h := range m.dockerHosts {
+		if h.ID == id {
+			m.dockerHosts = append(m.dockerHosts[:i], m.dockerHosts[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (m *mockStore) CountStacksOnHost(hostID string) (int, error) {
+	n := 0
+	for _, st := range m.stacks {
+		if st.HostID == hostID {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *mockStore) CreateAPIKey(k *store.APIKey) error {
 	m.apiKeys = append(m.apiKeys, k)
 	return nil

@@ -83,9 +83,15 @@ type Deployer struct {
 	// nil means no audit (tests, minimal setups).
 	audit audit.Recorder
 
-	// Per-service mutex prevents concurrent deploys of the same service.
-	serviceMu   sync.Mutex
-	serviceLocks map[string]*sync.Mutex
+	// locks guards per-service deploy exclusivity. Held behind a pointer so a
+	// host-scoped copy of the Deployer (see forHost) shares the same lock
+	// state rather than copying a mutex.
+	locks *serviceLocks
+
+	// hosts resolves a stack's HostID to the Docker client for that host.
+	// nil (or an empty HostID) means "use cli" — the single-daemon behaviour
+	// that predates multi-host support.
+	hosts HostClients
 
 	// retryPolicy bounds the exponential-backoff retries applied to
 	// transient operations (image pulls, git clones, network creation).
@@ -99,10 +105,10 @@ type Deployer struct {
 // lazily during the first deploy.
 func NewDeployer(cli *client.Client, s store.Store, stacksDir string) *Deployer {
 	return &Deployer{
-		cli:          cli,
-		store:        s,
-		stacksDir:    stacksDir,
-		serviceLocks: make(map[string]*sync.Mutex),
+		cli:       cli,
+		store:     s,
+		stacksDir: stacksDir,
+		locks:     &serviceLocks{m: make(map[string]*sync.Mutex)},
 		// One attempt = no retry, matching pre-retry behaviour until an
 		// operator opts in via SetRetryPolicy (wired from config in main).
 		retryPolicy: retry.Policy{MaxAttempts: 1},
@@ -154,16 +160,53 @@ func (d *Deployer) stackRepoDir(stackID string) string {
 	return filepath.Join(d.stacksDir, stackID, "repo")
 }
 
+// serviceLocks holds the per-service mutexes that prevent concurrent deploys
+// of the same service. Shared by reference across host-scoped Deployer copies.
+type serviceLocks struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
 // lockService returns a per-service mutex, creating one if it does not yet exist.
 func (d *Deployer) lockService(name string) *sync.Mutex {
-	d.serviceMu.Lock()
-	defer d.serviceMu.Unlock()
-	mu, ok := d.serviceLocks[name]
+	d.locks.mu.Lock()
+	defer d.locks.mu.Unlock()
+	mu, ok := d.locks.m[name]
 	if !ok {
 		mu = &sync.Mutex{}
-		d.serviceLocks[name] = mu
+		d.locks.m[name] = mu
 	}
 	return mu
+}
+
+// HostClients resolves a registered Docker host ID to a client for that host.
+// Implemented by dockerhost.Manager; an interface here keeps this package free
+// of the host-management wiring.
+type HostClients interface {
+	ClientFor(hostID string) (*client.Client, error)
+}
+
+// SetHostClients enables multi-host deploys. Without it (or for a stack with an
+// empty HostID) the deployer talks to the single client it was built with.
+func (d *Deployer) SetHostClients(h HostClients) {
+	d.hosts = h
+}
+
+// forHost returns a Deployer whose Docker client targets the stack's host. It's
+// a shallow copy: every unexported helper keeps using d.cli, so host selection
+// happens once here instead of threading a client through ~20 call sites. The
+// mutable lock state is a pointer, so exclusivity still holds across copies.
+func (d *Deployer) forHost(hostID string) (*Deployer, error) {
+	if hostID == "" || d.hosts == nil {
+		return d, nil
+	}
+	cli, err := d.hosts.ClientFor(hostID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve docker host %s: %w", hostID, err)
+	}
+	scoped := *d
+	scoped.cli = cli
+	return &scoped, nil
 }
 
 // --------------------------------------------------------------------------
@@ -344,6 +387,22 @@ func (d *Deployer) ExpirePendingApprovals(ctx context.Context, maxAge time.Durat
 // measures execution time, not the time it spent waiting for approval.
 func (d *Deployer) runDeployment(ctx context.Context, stack *store.Stack, deployment *store.Deployment) (*store.Deployment, error) {
 	trigger := deployment.Trigger
+
+	// Point every Docker call in this rollout at the stack's host. Resolving
+	// here (rather than per call) means a bad/unreachable host fails the
+	// deployment cleanly before anything is mutated.
+	hostScoped, err := d.forHost(stack.HostID)
+	if err != nil {
+		now := time.Now()
+		deployment.Status = store.DeploymentFailed
+		deployment.ErrorMessage = err.Error()
+		deployment.CompletedAt = &now
+		_ = d.store.UpdateDeployment(deployment)
+		stack.Status = store.StackStatusError
+		_ = d.store.UpdateStack(stack)
+		return deployment, err
+	}
+	d = hostScoped
 
 	// Enrich the context so every log line from this deployment carries
 	// the deployment/stack/trigger fields, including in downstream helpers.
