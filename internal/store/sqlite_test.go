@@ -1413,3 +1413,56 @@ func TestPendingApprovals(t *testing.T) {
 	assert.Equal(t, "d-pend1", all[0].ID, "oldest first")
 	assert.Equal(t, "d-pend2", all[1].ID)
 }
+
+func TestAPIKey_CRUD(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	raw, err := GenerateAPIKey()
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(raw, "acc_"), "keys carry the acc_ prefix")
+
+	k := &APIKey{ID: "k1", Name: "ci", Role: "operator", KeyHash: HashAPIKey(raw), CreatedAt: now}
+	require.NoError(t, s.CreateAPIKey(k))
+
+	// Lookup by hash of the raw key.
+	got, err := s.GetAPIKeyByHash(HashAPIKey(raw))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "ci", got.Name)
+	assert.Equal(t, "operator", got.Role)
+	assert.False(t, got.Disabled)
+	assert.Nil(t, got.LastUsedAt)
+
+	// Unknown hash → (nil, nil).
+	miss, err := s.GetAPIKeyByHash(HashAPIKey("acc_other"))
+	require.NoError(t, err)
+	assert.Nil(t, miss)
+
+	// Touch records last_used_at.
+	require.NoError(t, s.TouchAPIKey("k1", now.Add(time.Minute)))
+	got, _ = s.GetAPIKeyByHash(HashAPIKey(raw))
+	require.NotNil(t, got.LastUsedAt)
+
+	// List.
+	list, err := s.ListAPIKeys()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+
+	// Delete: true then false.
+	ok, err := s.DeleteAPIKey("k1")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	ok, err = s.DeleteAPIKey("k1")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestGenerateAPIKey_Unique(t *testing.T) {
+	a, err := GenerateAPIKey()
+	require.NoError(t, err)
+	b, err := GenerateAPIKey()
+	require.NoError(t, err)
+	assert.NotEqual(t, a, b)
+	assert.NotEqual(t, HashAPIKey(a), HashAPIKey(b))
+}

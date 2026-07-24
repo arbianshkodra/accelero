@@ -169,6 +169,18 @@ func (s *SQLiteStore) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_stack_id ON managed_containers(stack_id);
 	CREATE INDEX IF NOT EXISTS idx_managed_containers_container_id ON managed_containers(container_id);
 
+	CREATE TABLE IF NOT EXISTS api_keys (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		role TEXT NOT NULL,
+		key_hash TEXT NOT NULL UNIQUE,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		last_used_at DATETIME,
+		disabled INTEGER NOT NULL DEFAULT 0
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+
 	-- audit_entries is append-only; no foreign keys on stack_id because
 	-- entries outlive the stack they describe (that's the whole point of
 	-- an audit trail). Retention is time-based, handled by the app, not
@@ -491,6 +503,73 @@ func (s *SQLiteStore) ListPendingApprovals() ([]*Deployment, error) {
 		deployments = append(deployments, d)
 	}
 	return deployments, rows.Err()
+}
+
+// --- API keys -------------------------------------------------------------
+
+func (s *SQLiteStore) CreateAPIKey(k *APIKey) error {
+	_, err := s.db.Exec(`
+		INSERT INTO api_keys (id, name, role, key_hash, created_at, last_used_at, disabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.Name, k.Role, k.KeyHash, k.CreatedAt, k.LastUsedAt, boolToInt(k.Disabled),
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetAPIKeyByHash(hash string) (*APIKey, error) {
+	return s.scanAPIKey(s.db.QueryRow(`SELECT * FROM api_keys WHERE key_hash = ?`, hash))
+}
+
+func (s *SQLiteStore) ListAPIKeys() ([]*APIKey, error) {
+	rows, err := s.db.Query(`SELECT * FROM api_keys ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []*APIKey
+	for rows.Next() {
+		k, err := s.scanAPIKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// DeleteAPIKey removes a key by ID, returning whether a row was deleted.
+func (s *SQLiteStore) DeleteAPIKey(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// TouchAPIKey records the last time a key authenticated a request.
+func (s *SQLiteStore) TouchAPIKey(id string, t time.Time) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET last_used_at = ? WHERE id = ?`, t, id)
+	return err
+}
+
+func (s *SQLiteStore) scanAPIKey(row scannable) (*APIKey, error) {
+	k := &APIKey{}
+	var lastUsed sql.NullTime
+	var disabled int
+	err := row.Scan(&k.ID, &k.Name, &k.Role, &k.KeyHash, &k.CreatedAt, &lastUsed, &disabled)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if lastUsed.Valid {
+		k.LastUsedAt = &lastUsed.Time
+	}
+	k.Disabled = disabled != 0
+	return k, nil
 }
 
 func (s *SQLiteStore) UpdateDeployment(d *Deployment) error {

@@ -6,7 +6,7 @@ Accelero is configured through environment variables. Only `API_KEY` is required
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `API_KEY` | *(required)* | API key for authenticating all API requests. Sent via `X-API-KEY` header. |
+| `API_KEY` | *(required)* | Bootstrap **admin** API key, sent via the `X-API-KEY` header. Always has full access. Create additional role-scoped keys at runtime (see [Roles & API keys](#roles--api-keys-rbac)). |
 | `SERVER_PORT` | `8000` | HTTP server port |
 | `DOCKER_SOCK` | `unix:///var/run/docker.sock` | Docker daemon socket path |
 | `DATABASE_PATH` | `./data/accelero.db` | Path to the SQLite database file |
@@ -48,6 +48,34 @@ When a caller exhausts their bucket, Accelero responds with `429 Too Many Reques
 ```
 
 The rejection is counted in the `accelero_rate_limited_requests_total` Prometheus counter, labelled by mux route template (so high-cardinality stack IDs don't explode the label set).
+
+## Roles & API keys (RBAC)
+
+Every request authenticates with an API key in the `X-API-KEY` header. Keys carry one of three hierarchical roles:
+
+| Role | Can do |
+|------|--------|
+| `viewer` | Read-only — all `GET` endpoints (stacks, deployments, logs, stats, metrics). |
+| `operator` | Everything a viewer can, plus mutations: deploy, approve/reject, stack/secret/registry CRUD, container restart & exec. |
+| `admin` | Everything — including `/admin/*` (backup/restore/encrypt-existing) and API-key management. |
+
+Authorization is derived from the request's method and path: `GET` → `viewer`, other methods → `operator`, `/admin/*` and `/apikeys` → `admin`. Container `exec` requires `operator` even though it's a WebSocket `GET` (it's a mutation).
+
+**Bootstrap key.** The `API_KEY` env var is the bootstrap admin key — it always has full access and is how you create the first managed key. Keep it safe; treat it like a root credential.
+
+**Managed keys.** Additional keys are created at runtime, stored as a SHA-256 hash (the plaintext is shown **once**, at creation, and cannot be recovered):
+
+```bash
+# Create an operator key (admin only)
+curl -sX POST $ACCELERO/api/v1/apikeys -H "X-API-KEY: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' -d '{"name":"ci-bot","role":"operator"}'
+# → {"id":"...","name":"ci-bot","role":"operator","key":"acc_...","created_at":"..."}
+
+curl -s $ACCELERO/api/v1/apikeys -H "X-API-KEY: $ADMIN_KEY"        # list (no key/hash)
+curl -sX DELETE $ACCELERO/api/v1/apikeys/<id> -H "X-API-KEY: $ADMIN_KEY"  # revoke
+```
+
+A missing key returns `401`; an unknown key or a valid key with an insufficient role returns `403`. Key create/delete are audited (`apikey.create` / `apikey.delete`), and the audit **actor** for every action is now the key's name (the bootstrap key is `env-admin`).
 
 ## Scheduled backups
 

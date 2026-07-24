@@ -121,7 +121,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 - [ ] LDAP integration (optional, via plugin)
 
 **RBAC:**
-- [ ] Roles: `admin`, `operator`, `viewer`, `none`
+- [x] Roles: `admin` ⊇ `operator` ⊇ `viewer`. Named, role-scoped API keys stored hashed (SHA-256) in SQLite; the `API_KEY` env stays as the bootstrap admin key. Per-request authorization by method+path policy (`internal/rbac.RequiredRole`): GET → viewer, mutations → operator, `/admin/*` + `/apikeys` → admin, `/exec` → operator. Managed via `POST/GET/DELETE /api/v1/apikeys` (admin-only; raw key shown once). Audit actor is now the key name. Enforced in `middleware.NewAPIKeyAuth`.
 - [ ] Per-stack permissions (team X can deploy stack A but only view stack B)
 - [ ] Team grouping
 - [ ] Environment-based scoping (`prod` stacks require `admin` role)

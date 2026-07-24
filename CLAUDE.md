@@ -67,7 +67,8 @@ mkdocs build
 - **`internal/compose/`**: Compose-file preprocessing — `.env` loading (`LoadDotEnv`) and docker-compose-compatible `${VAR}` interpolation (`Expand`, `ExpandBytes`). Used by both stack/ and reconciler/ before `yaml.Unmarshal`.
 - **`internal/reconciler/`**: GitOps reconciliation engine — per-stack loops that detect drift and optionally auto-deploy
 - **`internal/handler/`**: HTTP API handlers — stack CRUD, deployment triggers, drift checks, legacy webhook, health/status
-- **`internal/middleware/`**: HTTP middleware — API key authentication with constant-time comparison, and Prometheus metrics recorder (request count + latency, labelled by mux route template so `/stacks/{id}` doesn't explode cardinality)
+- **`internal/middleware/`**: HTTP middleware — RBAC authentication + authorization (`NewAPIKeyAuth`: env key = admin, store-backed role-scoped keys, per-request role check), and Prometheus metrics recorder (request count + latency, labelled by mux route template so `/stacks/{id}` doesn't explode cardinality)
+- **`internal/rbac/`**: role model (`admin`⊇`operator`⊇`viewer`), request `Identity` on context, and the method+path authorization policy (`RequiredRole`). No internal deps, so middleware/handler/audit/store import it freely.
 - **`internal/metrics/`**: Prometheus collectors and helpers. Own registry (not the default), exposing deployment counters/duration, drift events, HTTP traffic, and gauges for active reconciler loops + stack counts by status. `Handler()` returns the `/metrics` exposition handler.
 - **`internal/service/`**: Shared types (ComposeService, HealthCheck) and Docker resource cleanup
 - **`internal/network/`**: Docker network management (idempotent creation)
@@ -95,13 +96,14 @@ mkdocs build
 - **Legacy compatibility**: Old env-var config (REPO_URL etc.) auto-migrated to a "default" stack
 - **Prometheus metrics**: `/metrics` (unauthenticated, scrape convention) exposes deployment counters/duration, drift events by type, HTTP traffic keyed by route template, and gauges for active reconcile loops + stack counts. Drift counters only increment from reconciler observations, not `/preview` calls.
 - **Notifications**: notable deploy/drift/approval lifecycle events pushed to a generic JSON webhook, Slack, Discord, Microsoft Teams, and/or email (`NOTIFY_WEBHOOK_URL` / `NOTIFY_SLACK_WEBHOOK_URL` / `NOTIFY_DISCORD_WEBHOOK_URL` / `NOTIFY_TEAMS_WEBHOOK_URL` / `NOTIFY_SMTP_*`+`NOTIFY_EMAIL_*`). Each sink fires independently, best-effort, async, never blocks a deploy. Implemented as an `audit.Recorder` wrapper (`internal/notify`, `notify.New(notify.Config{...})`) so no deployer/reconciler changes were needed.
+- **RBAC**: named, role-scoped API keys (`admin` ⊇ `operator` ⊇ `viewer`). The `API_KEY` env is the bootstrap admin key; additional keys are stored SHA-256-hashed in SQLite (raw value shown once). Per-request authorization by method+path (`internal/rbac.RequiredRole`): GET→viewer, mutations→operator, `/admin/*`+`/apikeys`→admin, `/exec`→operator. Enforced in `middleware.NewAPIKeyAuth`; the caller identity rides on the request context and becomes the audit actor. Keys managed via `/api/v1/apikeys` (admin-only).
 - **Approval gates**: stacks with `requires_approval=true` hold every deploy (manual/webhook/reconcile) as a `pending_approval` deployment + notification; an operator approves (runs it) or rejects via the API, and unactioned approvals auto-expire after `APPROVAL_TIMEOUT`. Deduped to one open approval per stack. See the `APPROVAL_TIMEOUT` entry for internals.
 - **Deploy preview**: `POST /api/v1/stacks/{id}/preview` is a read-only dry run that reuses the reconciler's drift check and maps each drift item to the action the next deploy would take (`create`, `recreate`, `restart`, `remove`, `error`).
 
 ### Environment Variables
 
 Required:
-- `API_KEY`: **REQUIRED** — Secure API key for authentication
+- `API_KEY`: **REQUIRED** — Secure API key for authentication. This is the bootstrap **admin** key (always full access). Additional role-scoped keys (`admin`/`operator`/`viewer`) are created at runtime via `POST /api/v1/apikeys` and stored SHA-256-hashed. See RBAC under Key Features.
 
 Optional:
 - `SERVER_PORT`: HTTP server port (default: 8000)
@@ -192,6 +194,11 @@ Legacy (backward-compatible, auto-creates "default" stack):
 - `DELETE /api/v1/stacks/{id}/registries/{server}` — 204 / 404. Audited as `stack.registry.delete` in both outcomes.
 - **Image pull credential selection:** the deployer derives a registry hostname from the image reference (`ghcr.io/foo/bar` → `ghcr.io`; bare `nginx:1.27` or `library/nginx` → `docker.io`) and picks the matching per-stack credential. Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`, `registry.hub.docker.com`) are treated as equivalent so operators don't have to know which one `docker login` produced. If no per-stack credential matches, the legacy single-credential fields on the stack record are tried; if those don't match either, the pull is anonymous (which is the right thing for public images). Per-stack entries always win over the legacy fields when both match the same registry.
 
+**API keys (RBAC, admin-only):**
+- `POST /api/v1/apikeys` — Create a role-scoped key `{name, role}` (role ∈ admin/operator/viewer). Returns the raw key **once** (`acc_<hex>`); only its SHA-256 hash is stored. Audited `apikey.create`.
+- `GET /api/v1/apikeys` — List keys (name/role/timestamps; key + hash never returned).
+- `DELETE /api/v1/apikeys/{id}` — Revoke a key. 204/404. Audited `apikey.delete` (failure audited too).
+
 **Admin:**
 - `POST /api/v1/admin/encrypt-existing` — one-shot migration that re-saves any stack whose `repo_token` or `docker_password` is still in pre-encryption plaintext. Requires `ACCELERO_ENCRYPTION_KEY`; returns 400 when encryption is disabled. Idempotent (second call returns `stacks_migrated: 0`). Audited as `admin.encrypt-existing`.
 - `POST /api/v1/admin/restore` — upload a snapshot (plaintext `.db` or age `.db.age`) to replace the DB. Gated by `ALLOW_RESTORE`; validates + stages, applies on next restart (see `ALLOW_RESTORE` above). Audited as `admin.restore`.
@@ -199,7 +206,7 @@ Legacy (backward-compatible, auto-creates "default" stack):
 
 **Audit log (append-only):**
 - `GET /api/v1/audit` — filters: stack (id or name), actor, operation, since (Go duration), limit (≤1000). Newest first. Immutable at the store layer — no write/update/delete path.
-- Entries emitted today: stack.create/update/delete (actor api-key); deploy.start (api-key, in_progress; suppressed for approval-gated stacks); deploy.complete/failed/rolled_back (system:deployer, with duration + changes metadata); drift.detected (system:reconciler, one per cycle with drift, per-type counts in metadata); drift.auto_deployed (system:reconciler, when auto-deploy fires); approval.requested (system:deployer, in_progress) / approval.granted / approval.rejected (actor api-key) / approval.timed_out (system:deployer) for the approval-gate lifecycle.
+- Entries emitted today: stack.create/update/delete (actor api-key); deploy.start (api-key, in_progress; suppressed for approval-gated stacks); deploy.complete/failed/rolled_back (system:deployer, with duration + changes metadata); drift.detected (system:reconciler, one per cycle with drift, per-type counts in metadata); drift.auto_deployed (system:reconciler, when auto-deploy fires); approval.requested (system:deployer, in_progress) / approval.granted / approval.rejected (actor = key name) / approval.timed_out (system:deployer) for the approval-gate lifecycle; apikey.create / apikey.delete (RBAC key management). The **actor** on request-derived entries is now the authenticated key's name (bootstrap env key = `env-admin`), not the old `api-key` placeholder.
 - Retention: time-based cleanup on the existing deployment-cleanup cadence. Keep 90 days by default (`AUDIT_MAX_AGE`); set to 0 to disable.
 
 **Legacy:**
@@ -251,6 +258,10 @@ Both `active` and `error` stacks are reconciled (`reconciler.shouldReconcile`); 
 - `utils/utils_test.go`: Tests SplitServiceNames and ContainsServiceName
 - `secrets/secrets_test.go`: AES-256-GCM round-trips, tamper detection, legacy plaintext passthrough, fail-closed when the key is missing, malformed-key handling in `LoadCipherFromEnv`
 - `store/sqlite_test.go`: `TestEncryption_*` verifies DB columns actually hold `v1:` ciphertext (raw SQL) and that legacy plaintext rows stay readable after attaching a cipher
+- `rbac/rbac_test.go`: `Role.Satisfies` hierarchy (incl. unknown role grants nothing); `ParseRole` normalisation/validation; `RequiredRole` policy table (GET→viewer, mutations→operator, `/admin/*`+`/apikeys`→admin, `/exec`→operator); identity context round-trip
+- `middleware/auth_test.go`: env key → admin identity; missing→401; unknown→403; viewer blocked from mutations; operator blocked from `/admin/*` and `/apikeys`; `/exec` requires operator; lookup error→500; unauthorized log carries request_id
+- `store/sqlite_test.go`: `TestAPIKey_CRUD` (create/get-by-hash/nil-miss/touch/list/delete-true-then-false, `acc_` prefix) and `TestGenerateAPIKey_Unique`
+- `handler/apikeys_test.go`: create returns raw `acc_` key once + persists only the hash + audits `apikey.create`; name/role validation (400); list redacts the hash; delete 204 then 404 (both audited)
 - `middleware/ratelimit_test.go`: disabled → identity middleware; burst-then-block with 429 + `Retry-After`; per-key isolation; refill over time (via injected clock); missing API key passes through
 - `middleware/webhook_signature_test.go`: empty secret → identity middleware; valid HMAC passes and body is restored for the handler; missing/malformed/wrong-algo/wrong-length/tampered/wrong-secret all 401; empty body with empty-body signature passes; oversized body returns 413
 - `middleware/hsts_test.go`: maxAge≤0 → identity middleware (no header); enabled sets `Strict-Transport-Security: max-age=<n>`; header value matches the configured number; no `includeSubDomains` / `preload` (left to edge config)

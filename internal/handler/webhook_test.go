@@ -29,6 +29,7 @@ type mockStore struct {
 	stacks       []*store.Stack
 	deployments  []*store.Deployment
 	auditEntries []*store.AuditEntry
+	apiKeys      []*store.APIKey
 
 	// plaintextStackIDs lets encryption-migration tests simulate
 	// "these rows are still plaintext" without modelling the cipher.
@@ -107,6 +108,30 @@ func (m *mockStore) CleanupOldDeployments(maxAge time.Duration) (int, error) { r
 func (m *mockStore) GetPendingApproval(stackID string) (*store.Deployment, error) {
 	return nil, nil
 }
+func (m *mockStore) CreateAPIKey(k *store.APIKey) error {
+	m.apiKeys = append(m.apiKeys, k)
+	return nil
+}
+func (m *mockStore) GetAPIKeyByHash(hash string) (*store.APIKey, error) {
+	for _, k := range m.apiKeys {
+		if k.KeyHash == hash {
+			return k, nil
+		}
+	}
+	return nil, nil
+}
+func (m *mockStore) ListAPIKeys() ([]*store.APIKey, error) { return m.apiKeys, nil }
+func (m *mockStore) DeleteAPIKey(id string) (bool, error) {
+	for i, k := range m.apiKeys {
+		if k.ID == id {
+			m.apiKeys = append(m.apiKeys[:i], m.apiKeys[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (m *mockStore) TouchAPIKey(id string, t time.Time) error { return nil }
+
 func (m *mockStore) ListPendingApprovals() ([]*store.Deployment, error) {
 	var out []*store.Deployment
 	for _, d := range m.deployments {

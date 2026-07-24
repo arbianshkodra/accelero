@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/arbianshkodra/accelero/internal/logctx"
+	"github.com/arbianshkodra/accelero/internal/rbac"
 	"github.com/arbianshkodra/accelero/internal/store"
 	"github.com/sirupsen/logrus"
 )
@@ -104,10 +105,14 @@ func FromRequest(r *http.Request, op string) store.AuditEntry {
 	return entry
 }
 
-// ActorFromRequest identifies who made a request. Until multi-user auth
-// exists, every authenticated request collapses to "api-key" — we store
-// it anyway so the field has stable semantics once real identities arrive.
+// ActorFromRequest identifies who made a request. With RBAC in place the
+// authenticated caller's identity (key name) is on the context — that's the
+// actor. The header/"api-key" fallback covers any authenticated path that
+// predates identity propagation; "anonymous" is the unauthenticated case.
 func ActorFromRequest(r *http.Request) string {
+	if id, ok := rbac.IdentityFromContext(r.Context()); ok && id.Name != "" {
+		return id.Name
+	}
 	if r.Header.Get("X-API-Key") != "" || r.Header.Get("X-API-KEY") != "" {
 		return "api-key"
 	}

@@ -91,6 +91,19 @@ type StackSecret struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// APIKey is a named, role-scoped credential for the HTTP API. The raw key is
+// never stored — only its SHA-256 hash (KeyHash). The plaintext is returned to
+// the caller exactly once, at creation.
+type APIKey struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Role       string     `json:"role"`
+	KeyHash    string     `json:"-"` // never serialised
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Disabled   bool       `json:"disabled"`
+}
+
 // ManagedContainer tracks containers that Accelero manages.
 type ManagedContainer struct {
 	ID            string    `json:"id"`
@@ -218,4 +231,9 @@ const (
 	AuditOpApprovalGranted   = "approval.granted"
 	AuditOpApprovalRejected  = "approval.rejected"
 	AuditOpApprovalTimedOut  = "approval.timed_out"
+
+	// API key (RBAC) management. The key value never appears in metadata —
+	// only the name, role, and id.
+	AuditOpAPIKeyCreate = "apikey.create"
+	AuditOpAPIKeyDelete = "apikey.delete"
 )
