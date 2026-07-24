@@ -63,3 +63,41 @@ func TestIdentityContext(t *testing.T) {
 	assert.Equal(t, "ops", id.Name)
 	assert.Equal(t, RoleOperator, id.Role)
 }
+
+func TestRoleNone(t *testing.T) {
+	assert.True(t, RoleNone.Valid(), "none is an assignable role")
+	assert.False(t, RoleNone.Satisfies(RoleViewer), "none satisfies nothing")
+	r, ok := ParseRole("none")
+	assert.True(t, ok)
+	assert.Equal(t, RoleNone, r)
+}
+
+func TestEffectiveRole(t *testing.T) {
+	id := Identity{
+		Name: "team", Role: RoleNone,
+		StackGrants: map[string]Role{"sid-prod": RoleOperator, "sid-stg": RoleViewer},
+	}
+	assert.Equal(t, RoleOperator, id.EffectiveRole("sid-prod"), "grant overrides base")
+	assert.Equal(t, RoleViewer, id.EffectiveRole("sid-stg"))
+	assert.Equal(t, RoleNone, id.EffectiveRole("sid-other"), "no grant → base")
+	assert.Equal(t, RoleNone, id.EffectiveRole(""), "non-stack → base")
+
+	// No grants at all → base everywhere.
+	plain := Identity{Name: "ops", Role: RoleOperator}
+	assert.Equal(t, RoleOperator, plain.EffectiveRole("sid-prod"))
+}
+
+func TestStackTokenFromPath(t *testing.T) {
+	cases := map[string]string{
+		"/api/v1/stacks/prod/deploy":               "prod",
+		"/api/v1/stacks/prod":                      "prod",
+		"/api/v1/stacks/prod/containers/c/logs":    "prod",
+		"/api/v1/stacks":                           "",
+		"/api/v1/apikeys":                          "",
+		"/api/v1/approvals":                        "",
+		"/health":                                  "",
+	}
+	for path, want := range cases {
+		assert.Equal(t, want, StackTokenFromPath(path), path)
+	}
+}

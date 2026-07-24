@@ -275,10 +275,30 @@ func main() {
 		if !ok {
 			return rbac.Identity{}, false, nil
 		}
+		var grants map[string]rbac.Role
+		for stackID, roleStr := range k.StackGrants {
+			if gr, ok := rbac.ParseRole(roleStr); ok {
+				if grants == nil {
+					grants = make(map[string]rbac.Role, len(k.StackGrants))
+				}
+				grants[stackID] = gr
+			}
+		}
 		go func() { _ = db.TouchAPIKey(k.ID, time.Now()) }()
-		return rbac.Identity{Name: k.Name, Role: role}, true, nil
+		return rbac.Identity{Name: k.Name, Role: role, StackGrants: grants}, true, nil
 	}
-	apiKeyAuth := middleware.NewAPIKeyAuth(cfg.APIKey, keyLookup)
+	// Resolve a URL stack token (id or name) to the canonical stack ID for
+	// per-stack grant lookups in the auth middleware.
+	resolveStack := func(token string) (string, bool) {
+		if st, err := db.GetStack(token); err == nil && st != nil {
+			return st.ID, true
+		}
+		if st, _ := db.GetStackByName(token); st != nil {
+			return st.ID, true
+		}
+		return "", false
+	}
+	apiKeyAuth := middleware.NewAPIKeyAuth(cfg.APIKey, keyLookup, resolveStack)
 	authChain := func(next http.Handler) http.Handler {
 		return apiKeyAuth(rateLimit(next))
 	}

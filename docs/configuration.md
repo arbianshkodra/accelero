@@ -51,15 +51,29 @@ The rejection is counted in the `accelero_rate_limited_requests_total` Prometheu
 
 ## Roles & API keys (RBAC)
 
-Every request authenticates with an API key in the `X-API-KEY` header. Keys carry one of three hierarchical roles:
+Every request authenticates with an API key in the `X-API-KEY` header. Keys carry one of four hierarchical roles:
 
 | Role | Can do |
 |------|--------|
+| `none` | Nothing by itself — a deny-all base, only useful with per-stack grants (below). |
 | `viewer` | Read-only — all `GET` endpoints (stacks, deployments, logs, stats, metrics). |
 | `operator` | Everything a viewer can, plus mutations: deploy, approve/reject, stack/secret/registry CRUD, container restart & exec. |
 | `admin` | Everything — including `/admin/*` (backup/restore/encrypt-existing) and API-key management. |
 
 Authorization is derived from the request's method and path: `GET` → `viewer`, other methods → `operator`, `/admin/*` and `/apikeys` → `admin`. Container `exec` requires `operator` even though it's a WebSocket `GET` (it's a mutation).
+
+**Per-stack grants.** A key's `role` is its *base* role — it governs non-stack endpoints (the `/stacks` collection, `/approvals`, `/audit`) and any stack without a specific grant. A key may also carry **per-stack grants** that override the base role on individual stacks. This expresses things like "deploy `prod` but only view `staging`, and nothing else":
+
+```bash
+curl -sX POST $ACCELERO/api/v1/apikeys -H "X-API-KEY: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "name": "team-x",
+    "role": "none",
+    "stack_grants": { "prod": "operator", "staging": "viewer" }
+  }'
+```
+
+Grants are specified by stack **name or id** and stored keyed by the canonical stack **id** (so they survive a rename). Referencing an unknown stack, or an invalid role, is rejected at creation. The effective role for a request is the grant for the target stack if one exists, otherwise the base role. A base role of `none` means the key can *only* touch the stacks it's been granted (and cannot use collection/non-stack endpoints).
 
 **Bootstrap key.** The `API_KEY` env var is the bootstrap admin key — it always has full access and is how you create the first managed key. Keep it safe; treat it like a root credential.
 

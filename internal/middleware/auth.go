@@ -14,16 +14,26 @@ import (
 // and a non-nil error only on an infrastructure failure (e.g. DB down).
 type KeyLookup func(rawKey string) (rbac.Identity, bool, error)
 
+// StackResolver maps a stack id-or-name (as it appears in a URL) to the
+// canonical stack ID used for per-stack grant lookups. Returns ok=false when
+// no such stack exists.
+type StackResolver func(idOrName string) (stackID string, ok bool)
+
 // NewAPIKeyAuth builds the authentication + authorization middleware.
 //
 // Authentication: the presented X-API-KEY is matched first (constant-time)
 // against envKey — the bootstrap key, which always maps to the admin role — and
 // otherwise handed to lookup for a store-backed, role-scoped key.
 //
-// Authorization: the caller's role must satisfy rbac.RequiredRole for the
-// request's method and path. Missing key → 401; unknown key or insufficient
-// role → 403. On success the identity is attached to the request context.
-func NewAPIKeyAuth(envKey string, lookup KeyLookup) func(http.Handler) http.Handler {
+// Authorization: the caller's *effective* role for the request must satisfy
+// rbac.RequiredRole for the method and path. The effective role is the caller's
+// per-stack grant when the path targets a stack (resolved via resolveStack),
+// otherwise the base role. Missing key → 401; unknown key or insufficient role
+// → 403. On success the identity is attached to the request context.
+//
+// resolveStack may be nil (per-stack grants then never apply — base role is
+// used everywhere).
+func NewAPIKeyAuth(envKey string, lookup KeyLookup, resolveStack StackResolver) func(http.Handler) http.Handler {
 	if envKey == "" {
 		logrus.Fatal("API_KEY environment variable must be set for security")
 	}
@@ -62,11 +72,24 @@ func NewAPIKeyAuth(envKey string, lookup KeyLookup) func(http.Handler) http.Hand
 			}
 
 			required := rbac.RequiredRole(r.Method, r.URL.Path)
-			if !id.Role.Satisfies(required) {
+
+			// Resolve the target stack (if any) so per-stack grants can
+			// override the base role for that stack.
+			var stackID string
+			if token := rbac.StackTokenFromPath(r.URL.Path); token != "" && resolveStack != nil {
+				if resolved, ok := resolveStack(token); ok {
+					stackID = resolved
+				}
+			}
+			effective := id.EffectiveRole(stackID)
+
+			if !effective.Satisfies(required) {
 				log.WithFields(logrus.Fields{
-					"actor":         id.Name,
-					"role":          id.Role,
-					"required_role": required,
+					"actor":          id.Name,
+					"base_role":      id.Role,
+					"effective_role": effective,
+					"stack_id":       stackID,
+					"required_role":  required,
 				}).Warn("Forbidden: insufficient role")
 				http.Error(w, "insufficient role", http.StatusForbidden)
 				return

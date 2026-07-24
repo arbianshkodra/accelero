@@ -1466,3 +1466,28 @@ func TestGenerateAPIKey_Unique(t *testing.T) {
 	assert.NotEqual(t, a, b)
 	assert.NotEqual(t, HashAPIKey(a), HashAPIKey(b))
 }
+
+func TestAPIKey_StackGrantsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	raw, _ := GenerateAPIKey()
+	k := &APIKey{
+		ID: "k-scoped", Name: "team", Role: "none",
+		KeyHash:     HashAPIKey(raw),
+		StackGrants: map[string]string{"sid-prod": "operator", "sid-stg": "viewer"},
+		CreatedAt:   time.Now(),
+	}
+	require.NoError(t, s.CreateAPIKey(k))
+
+	got, err := s.GetAPIKeyByHash(HashAPIKey(raw))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "none", got.Role)
+	assert.Equal(t, map[string]string{"sid-prod": "operator", "sid-stg": "viewer"}, got.StackGrants)
+
+	// A key with no grants round-trips as an empty/nil map (not an error).
+	raw2, _ := GenerateAPIKey()
+	require.NoError(t, s.CreateAPIKey(&APIKey{ID: "k-plain", Name: "p", Role: "viewer", KeyHash: HashAPIKey(raw2), CreatedAt: time.Now()}))
+	plain, err := s.GetAPIKeyByHash(HashAPIKey(raw2))
+	require.NoError(t, err)
+	assert.Empty(t, plain.StackGrants)
+}

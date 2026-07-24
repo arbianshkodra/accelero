@@ -122,7 +122,7 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 
 **RBAC:**
 - [x] Roles: `admin` ⊇ `operator` ⊇ `viewer`. Named, role-scoped API keys stored hashed (SHA-256) in SQLite; the `API_KEY` env stays as the bootstrap admin key. Per-request authorization by method+path policy (`internal/rbac.RequiredRole`): GET → viewer, mutations → operator, `/admin/*` + `/apikeys` → admin, `/exec` → operator. Managed via `POST/GET/DELETE /api/v1/apikeys` (admin-only; raw key shown once). Audit actor is now the key name. Enforced in `middleware.NewAPIKeyAuth`.
-- [ ] Per-stack permissions (team X can deploy stack A but only view stack B)
+- [x] Per-stack permissions (team X can deploy stack A but only view stack B) — API keys carry a base role plus optional per-stack grants (`stack_grants: {stack: role}`); the effective role for a stack request is the grant or the base role. A `none` base makes a strictly-scoped key. Grants stored by canonical stack ID; the auth middleware resolves the URL stack token and applies `Identity.EffectiveRole`.
 - [ ] Team grouping
 - [ ] Environment-based scoping (`prod` stacks require `admin` role)
 

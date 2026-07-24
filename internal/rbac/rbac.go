@@ -15,13 +15,15 @@ import (
 type Role string
 
 const (
+	RoleNone     Role = "none"     // deny-all base; only per-stack grants can elevate
 	RoleViewer   Role = "viewer"   // read-only
 	RoleOperator Role = "operator" // deploy, approve, manage stacks/secrets/registries
 	RoleAdmin    Role = "admin"    // everything, incl. /admin/* and key management
 )
 
-// level ranks roles for the ⊇ comparison. Unknown roles rank below viewer so a
-// malformed role never grants access.
+// level ranks roles for the ⊇ comparison. none (and any unknown role) ranks
+// below viewer so it never satisfies a requirement — a deny-all base or a
+// malformed value fails closed.
 func (r Role) level() int {
 	switch r {
 	case RoleAdmin:
@@ -30,19 +32,27 @@ func (r Role) level() int {
 		return 2
 	case RoleViewer:
 		return 1
-	default:
+	default: // none + unknown
 		return 0
 	}
 }
 
-// Valid reports whether r is one of the known roles.
-func (r Role) Valid() bool { return r.level() > 0 }
+// Valid reports whether r is an assignable role (none, viewer, operator,
+// admin). Note none is valid-but-powerless: it satisfies no requirement.
+func (r Role) Valid() bool {
+	switch r {
+	case RoleNone, RoleViewer, RoleOperator, RoleAdmin:
+		return true
+	default:
+		return false
+	}
+}
 
 // Satisfies reports whether a caller holding role r meets requirement req.
 func (r Role) Satisfies(req Role) bool { return r.level() >= req.level() }
 
 // ParseRole normalises and validates a role string. The empty string and any
-// unknown value return (", false).
+// unknown value return ("", false).
 func ParseRole(s string) (Role, bool) {
 	role := Role(strings.ToLower(strings.TrimSpace(s)))
 	if !role.Valid() {
@@ -54,7 +64,22 @@ func ParseRole(s string) (Role, bool) {
 // Identity is the authenticated caller attached to a request context.
 type Identity struct {
 	Name string // key name (or "env-admin" for the bootstrap env key)
-	Role Role
+	Role Role    // base role: governs non-stack endpoints and stacks with no grant
+	// StackGrants maps a stack ID to the role this caller has on that stack,
+	// overriding the base role there. nil/empty means "base role everywhere".
+	StackGrants map[string]Role
+}
+
+// EffectiveRole returns the caller's role for a specific stack: the per-stack
+// grant if one exists, otherwise the base role. An empty stackID (non-stack or
+// collection endpoint) always uses the base role.
+func (id Identity) EffectiveRole(stackID string) Role {
+	if stackID != "" && id.StackGrants != nil {
+		if r, ok := id.StackGrants[stackID]; ok {
+			return r
+		}
+	}
+	return id.Role
 }
 
 type ctxKey struct{}
@@ -92,4 +117,20 @@ func RequiredRole(method, path string) Role {
 		return RoleViewer
 	}
 	return RoleOperator
+}
+
+// StackTokenFromPath returns the stack id-or-name segment of a stack-scoped
+// path (/api/v1/stacks/{token}[/...]), or "" for the collection endpoint
+// (/api/v1/stacks) and any non-stack path. The token still needs resolving to
+// a canonical stack ID (it may be a name) before a grant lookup.
+func StackTokenFromPath(path string) string {
+	const prefix = "/api/v1/stacks/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	rest := path[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
