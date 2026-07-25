@@ -90,10 +90,23 @@ type Handler struct {
 	Audit audit.Recorder
 
 	// Docker backs the read-only container introspection endpoints
-	// (/stacks/{id}/containers, .../containers/{cid}, .../logs). Nil
-	// disables those endpoints (they return 503) — useful in tests or
-	// in minimal deploys that don't expose runtime introspection.
+	// (/stacks/{id}/containers, .../containers/{cid}, .../logs) for the
+	// default host. Nil disables those endpoints (they return 503) —
+	// useful in tests or in minimal deploys that don't expose runtime
+	// introspection.
 	Docker DockerClient
+
+	// DockerForHost resolves a registered Docker host ID to a client for
+	// that host, so a stack deployed to a remote host is introspected on
+	// that host rather than the default one. Nil (or a stack with an empty
+	// HostID) means "use Docker" — the single-host behaviour.
+	DockerForHost func(hostID string) (DockerClient, error)
+
+	// DockerHosts enumerates every host to fan the root resource browsers
+	// (/images, /volumes, /networks) across. It returns the default host
+	// first (empty ID) followed by each registered host. Nil means
+	// "default host only".
+	DockerHosts func() ([]HostClient, error)
 
 	// VolumeBrowser backs GET /volumes/{name}/browse. Separated from
 	// DockerClient because the helper-container lifecycle is a bigger
@@ -1858,6 +1871,12 @@ func (h *Handler) ListStackContainers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
 	defer cancel()
 
@@ -1865,7 +1884,7 @@ func (h *Handler) ListStackContainers(w http.ResponseWriter, r *http.Request) {
 		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue)).
 		Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stack.Name))
 
-	res, err := h.Docker.ContainerList(ctx, client.ContainerListOptions{
+	res, err := dkr.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: filters,
 	})
@@ -1912,11 +1931,17 @@ func (h *Handler) GetStackContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), containerOpTimeout)
 	defer cancel()
 
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, ctx, w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -1942,11 +1967,17 @@ func (h *Handler) GetStackContainerLogs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, ctx, w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -1978,7 +2009,7 @@ func (h *Handler) GetStackContainerLogs(w http.ResponseWriter, r *http.Request) 
 
 	timestamps := r.URL.Query().Get("timestamps") == "true"
 
-	stream, err := h.Docker.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
+	stream, err := dkr.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       tailStr,
@@ -2094,11 +2125,17 @@ func (h *Handler) StreamStackContainerLogs(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	// Validate the upgrade before we touch the client connection so
 	// callers that fail auth/membership get a regular JSON error,
 	// not a half-completed handshake.
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, r.Context(), w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -2141,7 +2178,7 @@ func (h *Handler) StreamStackContainerLogs(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	stream, err := h.Docker.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
+	stream, err := dkr.ContainerLogs(ctx, insp.Container.ID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       tailStr,
@@ -2258,18 +2295,24 @@ func (h *Handler) GetStackContainerStats(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	// The daemon sleeps ~1s for the previous-sample gather; give the call
 	// enough headroom for a slow host plus network.
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, ctx, w, stack.Name, cid)
 	if !ok {
 		return
 	}
 
-	res, err := h.Docker.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
+	res, err := dkr.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
 		Stream:                false,
 		IncludePreviousSample: true,
 	})
@@ -2318,11 +2361,17 @@ func (h *Handler) RestartStackContainer(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(ctx, w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, ctx, w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -2339,7 +2388,7 @@ func (h *Handler) RestartStackContainer(w http.ResponseWriter, r *http.Request) 
 
 	// Fire off the restart. Record the audit row regardless of outcome
 	// so operators see "someone tried to restart this" even on failures.
-	_, restartErr := h.Docker.ContainerRestart(ctx, insp.Container.ID, opts)
+	_, restartErr := dkr.ContainerRestart(ctx, insp.Container.ID, opts)
 
 	entry := audit.FromRequest(r, store.AuditOpContainerRestart)
 	entry.ResourceType = "container"
@@ -2410,6 +2459,12 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	// Parse params before touching the socket so failures are clean
 	// JSON errors, not half-complete WS handshakes.
 	cmd := r.URL.Query()["cmd"]
@@ -2422,7 +2477,7 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 	workdir := r.URL.Query().Get("workdir")
 
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, r.Context(), w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -2431,7 +2486,7 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 	// clean 500/JSON response, not a half-open WS. Requires a timeout
 	// context that outlives only the setup phase.
 	setupCtx, setupCancel := context.WithTimeout(r.Context(), 10*time.Second)
-	createRes, err := h.Docker.ExecCreate(setupCtx, insp.Container.ID, client.ExecCreateOptions{
+	createRes, err := dkr.ExecCreate(setupCtx, insp.Container.ID, client.ExecCreateOptions{
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
@@ -2480,7 +2535,7 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 	attachCtx, attachCancel := context.WithCancel(r.Context())
 	defer attachCancel()
 
-	attachRes, err := h.Docker.ExecAttach(attachCtx, createRes.ID, client.ExecAttachOptions{
+	attachRes, err := dkr.ExecAttach(attachCtx, createRes.ID, client.ExecAttachOptions{
 		TTY: useTTY,
 	})
 	if err != nil {
@@ -2504,7 +2559,7 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 			}
 			rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer rcancel()
-			if _, err := h.Docker.ExecResize(rctx, execID, client.ExecResizeOptions{
+			if _, err := dkr.ExecResize(rctx, execID, client.ExecResizeOptions{
 				Height: rows, Width: cols,
 			}); err != nil {
 				logctx.FromContext(r.Context()).WithError(err).Debug("exec resize failed")
@@ -2520,7 +2575,7 @@ func (h *Handler) ExecStackContainer(w http.ResponseWriter, r *http.Request) {
 	// on errors). Exit code wedged at -1 means we couldn't determine.
 	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer inspectCancel()
-	if ins, err := h.Docker.ExecInspect(inspectCtx, createRes.ID, client.ExecInspectOptions{}); err == nil {
+	if ins, err := dkr.ExecInspect(inspectCtx, createRes.ID, client.ExecInspectOptions{}); err == nil {
 		exitCode = ins.ExitCode
 	}
 
@@ -2714,8 +2769,14 @@ func (h *Handler) StreamStackContainerStats(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	cid := mux.Vars(r)["cid"]
-	insp, ok := h.resolveStackContainer(r.Context(), w, stack.Name, cid)
+	insp, ok := h.resolveStackContainer(dkr, r.Context(), w, stack.Name, cid)
 	if !ok {
 		return
 	}
@@ -2733,7 +2794,7 @@ func (h *Handler) StreamStackContainerStats(w http.ResponseWriter, r *http.Reque
 	// Stream=true asks the daemon to emit samples on its own cadence
 	// (~1s). No IncludePreviousSample — each subsequent sample already
 	// carries the prior one in PreCPUStats.
-	res, err := h.Docker.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
+	res, err := dkr.ContainerStats(ctx, insp.Container.ID, client.ContainerStatsOptions{
 		Stream: true,
 	})
 	if err != nil {
@@ -2954,6 +3015,12 @@ func (h *Handler) StreamStackEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Introspect on the host this stack deploys to, not always the default.
+	dkr, ok := h.dockerForStack(w, stack)
+	if !ok {
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, "streaming unsupported by this server", http.StatusInternalServerError)
@@ -2991,7 +3058,7 @@ func (h *Handler) StreamStackEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	res := h.Docker.Events(ctx, client.EventsListOptions{
+	res := dkr.Events(ctx, client.EventsListOptions{
 		Since:   since,
 		Filters: filters,
 	})
@@ -3094,6 +3161,9 @@ func projectEvent(m events.Message) StackEvent {
 // with managed-by=accelero" — Docker images themselves don't carry our
 // labels, so we derive usage by walking managed containers.
 type ManagedImage struct {
+	// Host names the Docker host this image is present on ("default" for the
+	// DOCKER_SOCK daemon). The same image can exist on several hosts.
+	Host      string        `json:"host"`
 	ID        string        `json:"id"`
 	RepoTags  []string      `json:"repo_tags,omitempty"`
 	SizeBytes int64         `json:"size_bytes"`
@@ -3113,6 +3183,9 @@ type ImageUsage struct {
 // ManagedVolume is the projected view of a Docker volume filtered to
 // accelero-managed resources.
 type ManagedVolume struct {
+	// Host names the Docker host this volume lives on ("default" for the
+	// DOCKER_SOCK daemon). Volume names are only unique per host.
+	Host       string            `json:"host"`
 	Name       string            `json:"name"`
 	Driver     string            `json:"driver"`
 	Stack      string            `json:"stack,omitempty"`
@@ -3128,6 +3201,9 @@ type ManagedVolume struct {
 // stack. If a view of "who's on this network" becomes load-bearing we
 // can add a verbose mode that hits NetworkInspect.
 type ManagedNetwork struct {
+	// Host names the Docker host this network lives on ("default" for the
+	// DOCKER_SOCK daemon).
+	Host      string            `json:"host"`
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
 	Driver    string            `json:"driver"`
@@ -3156,14 +3232,48 @@ func (h *Handler) ListManagedImages(w http.ResponseWriter, r *http.Request) {
 		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
 	}
 
-	containers, err := h.Docker.ContainerList(ctx, client.ContainerListOptions{
+	hosts, err := h.hostClients()
+	if err != nil {
+		writeError(w, "failed to enumerate docker hosts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]ManagedImage, 0)
+	failures := 0
+	for _, host := range hosts {
+		imgs, err := managedImagesOnHost(ctx, host, filters)
+		if err != nil {
+			logctx.FromContext(ctx).WithError(err).Warnf("image listing failed on host %s", host.Name)
+			failures++
+			continue
+		}
+		out = append(out, imgs...)
+	}
+	if failures == len(hosts) && len(hosts) > 0 {
+		writeError(w, "failed to list images on any host", http.StatusInternalServerError)
+		return
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host != out[j].Host {
+			return out[i].Host < out[j].Host
+		}
+		return firstTag(out[i].RepoTags) < firstTag(out[j].RepoTags)
+	})
+
+	writeJSON(w, out, http.StatusOK)
+}
+
+// managedImagesOnHost derives the accelero-referenced images for one host by
+// walking that host's managed containers (images carry no accelero labels of
+// their own, so container back-references are the only way to scope them).
+func managedImagesOnHost(ctx context.Context, host HostClient, filters client.Filters) ([]ManagedImage, error) {
+	containers, err := host.Docker.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: filters,
 	})
 	if err != nil {
-		logctx.FromContext(ctx).WithError(err).Error("container list failed")
-		writeError(w, "failed to list containers", http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("list containers: %w", err)
 	}
 
 	// Map each image ID to the containers that reference it.
@@ -3177,20 +3287,16 @@ func (h *Handler) ListManagedImages(w http.ResponseWriter, r *http.Request) {
 		}
 		usageByImage[c.ImageID] = append(usageByImage[c.ImageID], use)
 	}
-
 	if len(usageByImage) == 0 {
-		writeJSON(w, []ManagedImage{}, http.StatusOK)
-		return
+		return nil, nil
 	}
 
 	// Docker has no "filter by image id" option on ImageList, so we list
 	// all and intersect. On a typical host this is cheap — only images
 	// we actually care about get projected into the response.
-	imageList, err := h.Docker.ImageList(ctx, client.ImageListOptions{All: false})
+	imageList, err := host.Docker.ImageList(ctx, client.ImageListOptions{All: false})
 	if err != nil {
-		logctx.FromContext(ctx).WithError(err).Error("image list failed")
-		writeError(w, "failed to list images", http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("list images: %w", err)
 	}
 
 	out := make([]ManagedImage, 0, len(usageByImage))
@@ -3209,6 +3315,7 @@ func (h *Handler) ListManagedImages(w http.ResponseWriter, r *http.Request) {
 			return usage[i].Container < usage[j].Container
 		})
 		out = append(out, ManagedImage{
+			Host:      host.Name,
 			ID:        img.ID,
 			RepoTags:  img.RepoTags,
 			SizeBytes: img.Size,
@@ -3216,12 +3323,7 @@ func (h *Handler) ListManagedImages(w http.ResponseWriter, r *http.Request) {
 			UsedBy:    usage,
 		})
 	}
-
-	sort.Slice(out, func(i, j int) bool {
-		return firstTag(out[i].RepoTags) < firstTag(out[j].RepoTags)
-	})
-
-	writeJSON(w, out, http.StatusOK)
+	return out, nil
 }
 
 // firstTag returns the first repo tag for deterministic sort, or empty.
@@ -3250,29 +3352,49 @@ func (h *Handler) ListManagedVolumes(w http.ResponseWriter, r *http.Request) {
 		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
 	}
 
-	res, err := h.Docker.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
+	hosts, err := h.hostClients()
 	if err != nil {
-		logctx.FromContext(ctx).WithError(err).Error("volume list failed")
-		writeError(w, "failed to list volumes", http.StatusInternalServerError)
+		writeError(w, "failed to enumerate docker hosts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	for _, warn := range res.Warnings {
-		logctx.FromContext(ctx).Warnf("docker volume list warning: %s", warn)
-	}
 
-	out := make([]ManagedVolume, 0, len(res.Items))
-	for _, v := range res.Items {
-		out = append(out, ManagedVolume{
-			Name:       v.Name,
-			Driver:     v.Driver,
-			Stack:      v.Labels[containerLabelStackName],
-			MountPoint: v.Mountpoint,
-			CreatedAt:  v.CreatedAt,
-			Labels:     v.Labels,
-			Options:    v.Options,
-		})
+	out := make([]ManagedVolume, 0)
+	failures := 0
+	for _, host := range hosts {
+		res, err := host.Docker.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
+		if err != nil {
+			// One unreachable host shouldn't blank the whole listing; skip it
+			// and report only if every host failed.
+			logctx.FromContext(ctx).WithError(err).Warnf("volume list failed on host %s", host.Name)
+			failures++
+			continue
+		}
+		for _, warn := range res.Warnings {
+			logctx.FromContext(ctx).Warnf("docker volume list warning (host %s): %s", host.Name, warn)
+		}
+		for _, v := range res.Items {
+			out = append(out, ManagedVolume{
+				Host:       host.Name,
+				Name:       v.Name,
+				Driver:     v.Driver,
+				Stack:      v.Labels[containerLabelStackName],
+				MountPoint: v.Mountpoint,
+				CreatedAt:  v.CreatedAt,
+				Labels:     v.Labels,
+				Options:    v.Options,
+			})
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if failures == len(hosts) && len(hosts) > 0 {
+		writeError(w, "failed to list volumes on any host", http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host != out[j].Host {
+			return out[i].Host < out[j].Host
+		}
+		return out[i].Name < out[j].Name
+	})
 
 	writeJSON(w, out, http.StatusOK)
 }
@@ -3289,6 +3411,14 @@ const maxVolumeFileDownload = 10 * 1024 * 1024 // 10 MB
 // it. Same defense-in-depth rule as every other stack-scoped endpoint:
 // never return information (or spawn helpers for) resources we don't
 // claim.
+// volumeIsManaged gates the volume browse/write endpoints.
+//
+// Deliberately scoped to the DEFAULT host: the browse/write helper container is
+// launched by volumepkg.Browser, which only talks to the default daemon. If this
+// check spanned every host we could approve a name that exists remotely and then
+// operate on a same-named volume on the default host — silently touching the
+// wrong data. Volume names are only unique per host, so until the browser takes
+// a host client, browse/write stay default-host-only (see docs).
 func (h *Handler) volumeIsManaged(ctx context.Context, name string) (bool, error) {
 	if h.Docker == nil {
 		return false, nil
@@ -3527,27 +3657,45 @@ func (h *Handler) ListManagedNetworks(w http.ResponseWriter, r *http.Request) {
 		filters = filters.Add("label", fmt.Sprintf("%s=%s", containerLabelStackName, stackName))
 	}
 
-	res, err := h.Docker.NetworkList(ctx, client.NetworkListOptions{Filters: filters})
+	hosts, err := h.hostClients()
 	if err != nil {
-		logctx.FromContext(ctx).WithError(err).Error("network list failed")
-		writeError(w, "failed to list networks", http.StatusInternalServerError)
+		writeError(w, "failed to enumerate docker hosts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	out := make([]ManagedNetwork, 0, len(res.Items))
-	for _, n := range res.Items {
-		out = append(out, ManagedNetwork{
-			ID:        n.ID,
-			Name:      n.Name,
-			Driver:    n.Driver,
-			Scope:     n.Scope,
-			Stack:     n.Labels[containerLabelStackName],
-			CreatedAt: n.Created.UTC(),
-			Labels:    n.Labels,
-			Options:   n.Options,
-		})
+	out := make([]ManagedNetwork, 0)
+	failures := 0
+	for _, host := range hosts {
+		res, err := host.Docker.NetworkList(ctx, client.NetworkListOptions{Filters: filters})
+		if err != nil {
+			logctx.FromContext(ctx).WithError(err).Warnf("network list failed on host %s", host.Name)
+			failures++
+			continue
+		}
+		for _, n := range res.Items {
+			out = append(out, ManagedNetwork{
+				Host:      host.Name,
+				ID:        n.ID,
+				Name:      n.Name,
+				Driver:    n.Driver,
+				Scope:     n.Scope,
+				Stack:     n.Labels[containerLabelStackName],
+				CreatedAt: n.Created.UTC(),
+				Labels:    n.Labels,
+				Options:   n.Options,
+			})
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if failures == len(hosts) && len(hosts) > 0 {
+		writeError(w, "failed to list networks on any host", http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host != out[j].Host {
+			return out[i].Host < out[j].Host
+		}
+		return out[i].Name < out[j].Name
+	})
 
 	writeJSON(w, out, http.StatusOK)
 }
@@ -3576,12 +3724,13 @@ func (h *Handler) resolveStack(w http.ResponseWriter, r *http.Request) (*store.S
 // a 404 so callers probing foreign IDs cannot distinguish "doesn't exist"
 // from "exists but isn't yours". Writes the error on failure.
 func (h *Handler) resolveStackContainer(
+	dkr DockerClient,
 	ctx context.Context,
 	w http.ResponseWriter,
 	stackName, containerID string,
 ) (client.ContainerInspectResult, bool) {
 	var empty client.ContainerInspectResult
-	insp, err := h.Docker.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	insp, err := dkr.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		if cerrdefs.IsNotFound(err) {
 			writeError(w, "container not found", http.StatusNotFound)

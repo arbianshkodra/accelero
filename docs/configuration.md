@@ -260,8 +260,12 @@ curl -sX POST $ACCELERO/api/v1/stacks -H "X-API-KEY: $ADMIN_KEY" \
 
 An empty `host_id` means the default host, so **existing stacks are unaffected** — they keep deploying to `DOCKER_SOCK`. Setting `host_id: ""` on update moves a stack back to the default host.
 
-!!! note "What is host-aware today"
-    **Deploys, reconciliation, drift checks, and `/preview` run against the stack's host.** Container introspection (`/containers`, `logs`, `stats`, `exec`, `events`, `restart`) and the root resource browsers (`/images`, `/volumes`, `/networks`) plus the periodic Docker resource cleanup still operate on the **default host** — making those host-aware is the next step. If you deploy a stack to a remote host, its containers won't appear in those views yet.
+**Everything stack-scoped follows the stack's host.** Deploys, reconciliation, drift, `/preview`, and all container introspection (`/containers`, `logs` + `logs/stream`, `stats` + `stats/stream`, `exec`, `events`, `restart`) run against the host the stack is deployed to. If a stack's host is unreachable, those endpoints return `502` rather than silently reading the wrong daemon.
+
+**The root resource browsers span every host.** `/images`, `/volumes`, and `/networks` query the default host plus every registered host, and each result carries a `host` field naming where it lives (`default` for the `DOCKER_SOCK` daemon). `?stack=` still narrows as before. If one host is unreachable it's skipped with a logged warning and the rest are returned — you only get a `500` if *every* host fails. The periodic Docker resource cleanup likewise prunes on every host.
+
+!!! note "Volume browse/write is default-host-only"
+    `GET /volumes/{name}/browse` and `POST /volumes/{name}/files` still operate on the **default host**, because the helper container that reads the volume is launched there. Volume names are only unique per host, so allowing a remote name here could silently act on a same-named volume on the default host. Remote volumes therefore appear in `GET /volumes` (tagged with their host) but can't be browsed yet.
 
 ## Approval gates
 

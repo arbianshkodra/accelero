@@ -184,7 +184,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		cleanupLoop(ctx, cli, cfg)
+		cleanupLoop(ctx, db, hostManager, cfg)
 	}()
 
 	// 9. Start the deployment cleanup routine (prune old DB records).
@@ -251,6 +251,19 @@ func main() {
 		Reconciler:        rec,
 		Audit:             auditRecorder,
 		Docker:            cli,
+		// Multi-host: introspect a stack on the host it deploys to, and fan
+		// the root resource browsers across every host.
+		DockerForHost: func(hostID string) (handler.DockerClient, error) {
+			return hostManager.ClientFor(hostID)
+		},
+		DockerHosts: func() ([]handler.HostClient, error) {
+			entries := allHostClients(db, hostManager)
+			out := make([]handler.HostClient, 0, len(entries))
+			for _, e := range entries {
+				out = append(out, handler.HostClient{ID: e.id, Name: e.name, Docker: e.cli})
+			}
+			return out, nil
+		},
 		VolumeBrowser:     volumepkg.NewDockerBrowser(cli, ""),
 		AllowVolumeWrites: cfg.AllowVolumeWrites,
 		EncryptionEnabled: cipher.Enabled(),
@@ -441,7 +454,11 @@ func migrateLegacyConfig(cfg *config.Config, db store.Store) {
 
 // cleanupLoop runs Docker resource cleanup on a 24h interval, scoped to
 // accelero-managed resources only.
-func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
+// cleanupLoop prunes accelero-labelled Docker resources on every host — the
+// default daemon plus each registered one — so a remote host doesn't accumulate
+// dangling images/volumes forever. A failure on one host is logged and the
+// sweep continues to the rest.
+func cleanupLoop(ctx context.Context, db store.Store, hostManager *dockerhost.Manager, cfg *config.Config) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 
@@ -452,11 +469,42 @@ func cleanupLoop(ctx context.Context, cli *client.Client, cfg *config.Config) {
 			return
 		case <-ticker.C:
 			logrus.Info("Running Docker resource cleanup")
-			if err := service.CleanupResources(ctx, cli); err != nil {
-				logrus.Errorf("Cleanup error: %v", err)
+			for _, host := range allHostClients(db, hostManager) {
+				if err := service.CleanupResources(ctx, host.cli); err != nil {
+					logrus.Errorf("Cleanup error on host %s: %v", host.name, err)
+				}
 			}
 		}
 	}
+}
+
+// hostEntry is a Docker host paired with its client.
+type hostEntry struct {
+	id   string
+	name string
+	cli  *client.Client
+}
+
+// allHostClients returns the default host first, then every registered host
+// whose client can be built. Hosts that fail to resolve are logged and skipped
+// so one bad entry can't break a whole sweep or listing.
+func allHostClients(db store.Store, hostManager *dockerhost.Manager) []hostEntry {
+	out := []hostEntry{{id: "", name: handler.DefaultHostName, cli: hostManager.Default()}}
+
+	hosts, err := db.ListDockerHosts()
+	if err != nil {
+		logrus.Errorf("failed to list docker hosts: %v", err)
+		return out
+	}
+	for _, h := range hosts {
+		cli, err := hostManager.ClientFor(h.ID)
+		if err != nil {
+			logrus.Warnf("skipping docker host %s (%s): %v", h.Name, h.Endpoint, err)
+			continue
+		}
+		out = append(out, hostEntry{id: h.ID, name: h.Name, cli: cli})
+	}
+	return out
 }
 
 // deploymentCleanupLoop prunes old deployment and audit records on the

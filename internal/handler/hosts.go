@@ -118,6 +118,44 @@ func (h *Handler) CreateDockerHost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, toHostResponse(host), http.StatusCreated)
 }
 
+// HostClient pairs a Docker host with its client, for endpoints that span
+// every host (the root resource browsers). The default host has an empty ID and
+// the name "default".
+type HostClient struct {
+	ID     string
+	Name   string
+	Docker DockerClient
+}
+
+// DefaultHostName labels results that came from the DOCKER_SOCK daemon.
+const DefaultHostName = "default"
+
+// dockerForStack returns the Docker client for the stack's host. A stack on the
+// default host (or a server without multi-host wiring) gets h.Docker. An
+// unreachable/unknown host is a 502 — the request can't be served, and that's
+// an infrastructure failure rather than a client error.
+func (h *Handler) dockerForStack(w http.ResponseWriter, stack *store.Stack) (DockerClient, bool) {
+	if stack.HostID == "" || h.DockerForHost == nil {
+		return h.Docker, true
+	}
+	dkr, err := h.DockerForHost(stack.HostID)
+	if err != nil {
+		writeError(w, "stack's docker host is unavailable: "+err.Error(), http.StatusBadGateway)
+		return nil, false
+	}
+	return dkr, true
+}
+
+// hostClients returns every host to fan a root-level browse across: the default
+// host first, then each registered host. Without multi-host wiring this is just
+// the default host, so callers need no special case.
+func (h *Handler) hostClients() ([]HostClient, error) {
+	if h.DockerHosts == nil {
+		return []HostClient{{ID: "", Name: DefaultHostName, Docker: h.Docker}}, nil
+	}
+	return h.DockerHosts()
+}
+
 // resolveHostID maps a caller-supplied host token (id or name) to a canonical
 // host ID. An empty token means the default host and resolves to "". Writes a
 // 400 and returns ok=false for an unknown host.
