@@ -16,18 +16,24 @@
 //     later. Storing as text means we don't have to modify column types
 //     in the schema.
 //
-//   - Master key sources, in precedence order:
-//       1. ACCELERO_ENCRYPTION_KEY_FILE — path to a file containing
-//          the base64-encoded 32-byte key. Preferred in production:
+//   - Master key sources (mutually exclusive):
+//       1. ACCELERO_ENCRYPTION_KEY_VAULT — the key *wrapped* by a
+//          HashiCorp Vault Transit key. Unwrapped at startup and held
+//          in memory only, so the key is never at rest in plaintext;
+//          rotating the Transit KEK needs no DB re-encryption. Strongest
+//          option; see vault.go.
+//       2. ACCELERO_ENCRYPTION_KEY_FILE — path to a file containing
+//          the base64-encoded 32-byte key. Good in production:
 //          env vars leak through `docker inspect`, process listings,
 //          systemd unit files, and shell history; a file mounted as a
 //          Docker/K8s secret does not.
-//       2. ACCELERO_ENCRYPTION_KEY — the base64 key inline. Fine for
+//       3. ACCELERO_ENCRYPTION_KEY — the base64 key inline. Fine for
 //          local development.
-//     Setting both is a configuration error (ambiguous). Setting
-//     neither disables encryption — existing deployments keep working
-//     through an upgrade but get a loud warning at startup telling
-//     the operator they aren't getting encryption until they set a key.
+//     Setting more than one is a configuration error (ambiguous).
+//     Setting none disables encryption — existing deployments keep
+//     working through an upgrade but get a loud warning at startup
+//     telling the operator they aren't getting encryption until they
+//     set a key.
 //
 //   - Future key rotation is handled by the v1 prefix: v2 ciphertext
 //     can be produced by a newer cipher, and the decrypt path picks
@@ -103,16 +109,21 @@ func NewCipher(key []byte) (*Cipher, error) {
 	return &Cipher{aead: aead}, nil
 }
 
-// LoadCipherFromEnv builds a Cipher from the environment. Precedence:
+// LoadCipherFromEnv builds a Cipher from the environment:
 //
-//   - Both ACCELERO_ENCRYPTION_KEY and ACCELERO_ENCRYPTION_KEY_FILE set:
-//     error — the configuration is ambiguous and the operator should
-//     pick one.
-//   - Only ACCELERO_ENCRYPTION_KEY_FILE set: read that file, trim
+//   - More than one source set: error — the configuration is ambiguous
+//     and the operator should pick one. Checked first, on selector
+//     presence alone, so "two sources" is reported ahead of any
+//     completeness problem inside one of them.
+//   - ACCELERO_ENCRYPTION_KEY_VAULT set: unwrap the key via Vault
+//     Transit (needs VAULT_ADDR, VAULT_TOKEN and
+//     ACCELERO_VAULT_TRANSIT_KEY; see vault.go). A missing variable,
+//     unreachable Vault, or a token that can't decrypt is an error.
+//   - ACCELERO_ENCRYPTION_KEY_FILE set: read that file, trim
 //     whitespace, base64-decode. Empty file or unreadable path is an
 //     error (the operator intended to provide a key and didn't).
-//   - Only ACCELERO_ENCRYPTION_KEY set: base64-decode the inline value.
-//   - Neither set: (nil, nil) — matches NewCipher's "encryption
+//   - ACCELERO_ENCRYPTION_KEY set: base64-decode the inline value.
+//   - None set: (nil, nil) — matches NewCipher's "encryption
 //     disabled" signal.
 //
 // Any set-but-malformed value is a startup error rather than a silent
