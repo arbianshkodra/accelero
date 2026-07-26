@@ -131,7 +131,8 @@ Goal: run Accelero in team/enterprise environments with multiple users, scoped p
 **Secrets at rest (inside Accelero):**
 - [x] Encrypt `repo_token` and `docker_password` in SQLite with AES-256-GCM, versioned ciphertext (`v1:<nonce>:<ct>`), master key from `ACCELERO_ENCRYPTION_KEY` (base64-encoded 32 bytes). Legacy plaintext rows read transparently. User-password encryption will ride on the identity work above.
 - [x] File-path master key source — `ACCELERO_ENCRYPTION_KEY_FILE` points at a file whose contents are the base64-encoded key. Docker/K8s-secret friendly; trailing whitespace trimmed; empty/missing file is a startup error. Setting both the file and the inline env var is rejected.
-- [ ] KMS master key sources (AWS KMS, GCP KMS, HashiCorp Vault Transit).
+- [x] **HashiCorp Vault Transit master-key source** — `ACCELERO_ENCRYPTION_KEY_VAULT` holds the master key *wrapped* by a Transit key (`vault:v1:…`); Accelero calls Transit `decrypt` once at startup and keeps the plaintext in memory only, so the master key is never at rest in plaintext and rotating the KEK never requires re-encrypting the DB. Configured via `VAULT_ADDR` / `VAULT_TOKEN` / `ACCELERO_VAULT_TRANSIT_KEY` (+ optional mount/namespace). Fails closed on missing vars, unreachable Vault, or a token that can't decrypt. Plain `net/http` — no new dependency. Verified live against Vault 1.18.
+- [ ] AWS KMS and GCP KMS master-key sources (same shape as the Vault source above)
 - [ ] Automatic key rotation: new writes use the current key; old reads transparently re-encrypt on next write.
 - [x] Online migration path from existing plaintext rows — `POST /api/v1/admin/encrypt-existing` re-saves any row still in plaintext so the cipher kicks in on write. Idempotent; 400 if the server has no key attached.
 
