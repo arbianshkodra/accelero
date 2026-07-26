@@ -75,8 +75,11 @@ func main() {
 	if cipher.Enabled() {
 		db.SetCipher(cipher)
 		source := "ACCELERO_ENCRYPTION_KEY"
-		if os.Getenv("ACCELERO_ENCRYPTION_KEY_FILE") != "" {
+		switch {
+		case os.Getenv("ACCELERO_ENCRYPTION_KEY_FILE") != "":
 			source = "ACCELERO_ENCRYPTION_KEY_FILE"
+		case os.Getenv("ACCELERO_ENCRYPTION_KEY_VAULT") != "":
+			source = "ACCELERO_ENCRYPTION_KEY_VAULT (unwrapped via Vault Transit)"
 		}
 		logrus.Infof("At-rest encryption enabled (%s)", source)
 	} else {

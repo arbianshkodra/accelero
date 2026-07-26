@@ -227,9 +227,40 @@ printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET"
 | `ACCELERO_ENCRYPTION_KEY` | *(unset — encryption disabled)* | Base64-encoded 32-byte master key, **inline**. When set, `repo_token` and `docker_password` are encrypted before being written to SQLite (AES-256-GCM) and decrypted on read. Generate with `openssl rand -base64 32`. |
 | `ACCELERO_ENCRYPTION_KEY_FILE` | *(unset)* | **Path** to a file whose contents are the base64-encoded 32-byte key. Preferred in production — env vars leak through `docker inspect`, `ps`, systemd unit files, and shell history, while a file mounted as a Docker/K8s secret doesn't. Trailing whitespace/newlines are trimmed. Empty file = startup error (likely a broken secret mount). |
 
-Setting both variables is a fatal configuration error — the two sources are mutually exclusive so a key rotation via the file can't silently be ignored.
+| `ACCELERO_ENCRYPTION_KEY_VAULT` | *(unset)* | The master key **wrapped by HashiCorp Vault Transit** (a `vault:v1:…` ciphertext). Accelero asks Vault to unwrap it at startup and keeps the plaintext in memory only. See below. |
 
-Without either, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
+Setting more than one of these is a fatal configuration error — the sources are mutually exclusive so a key rotation via one can't silently be ignored.
+
+### Vault Transit as the key source
+
+Rather than storing the master key anywhere, you can store only its **Vault-wrapped** form. Accelero calls Transit's `decrypt` endpoint once at startup to recover the key, so the master key is never at rest in plaintext — and rotating the Transit key (the KEK) never requires re-encrypting Accelero's database.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ACCELERO_ENCRYPTION_KEY_VAULT` | *(unset — source disabled)* | The `vault:v1:…` ciphertext of the master key. Setting it selects this source. |
+| `VAULT_ADDR` | — | **Required.** e.g. `https://vault.internal:8200`. |
+| `VAULT_TOKEN` | — | **Required.** Token needing only `update` on `<mount>/decrypt/<key>`. |
+| `ACCELERO_VAULT_TRANSIT_KEY` | — | **Required.** The Transit key that wrapped the master key. |
+| `ACCELERO_VAULT_TRANSIT_MOUNT` | `transit` | Transit mount path. |
+| `ACCELERO_VAULT_NAMESPACE` | *(unset)* | Vault Enterprise namespace. |
+
+One-time setup:
+
+```bash
+vault secrets enable transit
+vault write -f transit/keys/accelero
+
+# Generate a master key and wrap it. Keep ONLY the ciphertext.
+MASTER_KEY=$(openssl rand -base64 32)
+vault write -field=ciphertext transit/encrypt/accelero plaintext="$MASTER_KEY"
+# → vault:v1:AbCdEf...   ← this is ACCELERO_ENCRYPTION_KEY_VAULT
+```
+
+Then run Accelero with `ACCELERO_ENCRYPTION_KEY_VAULT` plus `VAULT_ADDR`, `VAULT_TOKEN`, and `ACCELERO_VAULT_TRANSIT_KEY`. Startup logs which source was used.
+
+This **fails closed**: if `ACCELERO_ENCRYPTION_KEY_VAULT` is set but the other required variables are missing, or Vault is unreachable, or the token can't decrypt, Accelero exits rather than starting with encryption silently disabled. Vault must be reachable at every start (the unwrap is not cached to disk). AWS KMS and GCP KMS sources are planned and will follow the same shape.
+
+Without any of these, these fields are stored as plaintext — fine for local development, strongly discouraged in shared/production environments. After setting the key for the first time on an existing deployment, call `POST /api/v1/admin/encrypt-existing` to migrate legacy plaintext rows. See [at-rest encryption](./api-reference.md#at-rest-encryption--how-it-works) for the full behaviour, including the fail-closed policy when the key is removed later.
 
 ## Multi-host
 

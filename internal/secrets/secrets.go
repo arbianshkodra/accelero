@@ -36,6 +36,7 @@
 package secrets
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -44,6 +45,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // envKeyName / envKeyFileName are the two places we look for the master
@@ -120,8 +122,33 @@ func LoadCipherFromEnv() (*Cipher, error) {
 	inline := strings.TrimSpace(os.Getenv(envKeyName))
 	filePath := strings.TrimSpace(os.Getenv(envKeyFileName))
 
-	if inline != "" && filePath != "" {
-		return nil, fmt.Errorf("set only one of %s or %s, not both", envKeyName, envKeyFileName)
+	// The three sources are mutually exclusive: having more than one set is
+	// ambiguous, and silently preferring one could mean a key rotation the
+	// operator performed is quietly ignored. Judged on *selector presence*
+	// only, so "two sources configured" is reported ahead of any
+	// completeness problem within one of them — it's the likelier mistake.
+	vaultSelected := strings.TrimSpace(os.Getenv(envKeyVaultName)) != ""
+	sources := 0
+	for _, set := range []bool{inline != "", filePath != "", vaultSelected} {
+		if set {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return nil, fmt.Errorf("set only one of %s, %s or %s, not several",
+			envKeyName, envKeyFileName, envKeyVaultName)
+	}
+
+	vaultCfg, useVault, err := vaultConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	if useVault {
+		// Bounded: a hung Vault must not wedge startup forever.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return loadCipherFromVault(ctx, vaultCfg)
 	}
 
 	if filePath != "" {
