@@ -114,6 +114,12 @@ type Handler struct {
 	// the browse endpoint (503).
 	VolumeBrowser volumepkg.Browser
 
+	// VolumeBrowserForHost returns a Browser whose helper container runs on
+	// the given registered host, so volumes on a remote daemon can be
+	// browsed too. Nil (or an empty host ID) means "use VolumeBrowser" —
+	// the default-host behaviour.
+	VolumeBrowserForHost func(hostID string) (volumepkg.Browser, error)
+
 	// AllowVolumeWrites gates POST /volumes/{name}/files. Defaults to
 	// false; an operator opts in via ALLOW_VOLUME_WRITES=true only on
 	// hosts where the trade-off (emergency-write capability vs. one
@@ -3411,22 +3417,21 @@ const maxVolumeFileDownload = 10 * 1024 * 1024 // 10 MB
 // it. Same defense-in-depth rule as every other stack-scoped endpoint:
 // never return information (or spawn helpers for) resources we don't
 // claim.
-// volumeIsManaged gates the volume browse/write endpoints.
+// volumeIsManaged reports whether the named volume is accelero-managed on the
+// given host's daemon.
 //
-// Deliberately scoped to the DEFAULT host: the browse/write helper container is
-// launched by volumepkg.Browser, which only talks to the default daemon. If this
-// check spanned every host we could approve a name that exists remotely and then
-// operate on a same-named volume on the default host — silently touching the
-// wrong data. Volume names are only unique per host, so until the browser takes
-// a host client, browse/write stay default-host-only (see docs).
-func (h *Handler) volumeIsManaged(ctx context.Context, name string) (bool, error) {
-	if h.Docker == nil {
+// The check MUST run on the same host the browse/write helper will run on:
+// volume names are only unique per host, so verifying on one daemon and then
+// operating on another could silently touch the wrong data. Callers pass the
+// client from resolveVolumeHost to keep the two in lockstep.
+func (h *Handler) volumeIsManaged(ctx context.Context, dkr DockerClient, name string) (bool, error) {
+	if dkr == nil {
 		return false, nil
 	}
 	filters := make(client.Filters).
 		Add("label", fmt.Sprintf("%s=%s", containerLabelManagedBy, containerLabelManagedValue)).
 		Add("name", name)
-	res, err := h.Docker.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
+	res, err := dkr.VolumeList(ctx, client.VolumeListOptions{Filters: filters})
 	if err != nil {
 		return false, err
 	}
@@ -3459,7 +3464,13 @@ func (h *Handler) BrowseVolume(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	managed, err := h.volumeIsManaged(ctx, name)
+	// Which daemon's volume are we talking about? (?host=, default host if absent)
+	vh, ok := h.resolveVolumeHost(w, r)
+	if !ok {
+		return
+	}
+
+	managed, err := h.volumeIsManaged(ctx, vh.Docker, name)
 	if err != nil {
 		logctx.FromContext(ctx).WithError(err).Error("check volume managed")
 		writeError(w, "failed to verify volume", http.StatusInternalServerError)
@@ -3477,20 +3488,20 @@ func (h *Handler) BrowseVolume(w http.ResponseWriter, r *http.Request) {
 	download := r.URL.Query().Get("download") == "true"
 
 	if download {
-		h.downloadVolumeFile(ctx, w, r, name, reqPath)
+		h.downloadVolumeFile(ctx, w, r, vh, name, reqPath)
 		return
 	}
-	h.listVolumePath(ctx, w, r, name, reqPath)
+	h.listVolumePath(ctx, w, r, vh, name, reqPath)
 }
 
-func (h *Handler) listVolumePath(ctx context.Context, w http.ResponseWriter, r *http.Request, volumeName, path string) {
-	entries, err := h.VolumeBrowser.ListPath(ctx, volumeName, path)
+func (h *Handler) listVolumePath(ctx context.Context, w http.ResponseWriter, r *http.Request, vh volumeHost, volumeName, path string) {
+	entries, err := vh.Browse.ListPath(ctx, volumeName, path)
 	// Audit the browse attempt regardless of outcome — the intent is
 	// worth recording even if the underlying call errored.
 	audit := audit.FromRequest(r, store.AuditOpVolumeBrowse)
 	audit.ResourceType = "volume"
 	audit.ResourceID = volumeName
-	audit.Metadata = map[string]string{"path": path}
+	audit.Metadata = map[string]string{"path": path, "host": vh.Name}
 	if err != nil {
 		audit.Outcome = store.AuditOutcomeFailure
 		audit.ErrorMessage = err.Error()
@@ -3507,12 +3518,12 @@ func (h *Handler) listVolumePath(ctx context.Context, w http.ResponseWriter, r *
 	writeJSON(w, entries, http.StatusOK)
 }
 
-func (h *Handler) downloadVolumeFile(ctx context.Context, w http.ResponseWriter, r *http.Request, volumeName, path string) {
-	res, err := h.VolumeBrowser.ReadFile(ctx, volumeName, path, maxVolumeFileDownload)
+func (h *Handler) downloadVolumeFile(ctx context.Context, w http.ResponseWriter, r *http.Request, vh volumeHost, volumeName, path string) {
+	res, err := vh.Browse.ReadFile(ctx, volumeName, path, maxVolumeFileDownload)
 	auditEntry := audit.FromRequest(r, store.AuditOpVolumeRead)
 	auditEntry.ResourceType = "volume"
 	auditEntry.ResourceID = volumeName
-	auditEntry.Metadata = map[string]string{"path": path}
+	auditEntry.Metadata = map[string]string{"path": path, "host": vh.Name}
 
 	if err != nil {
 		auditEntry.Outcome = store.AuditOutcomeFailure
@@ -3570,7 +3581,13 @@ func (h *Handler) WriteVolumeFile(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	managed, err := h.volumeIsManaged(ctx, name)
+	// Which daemon's volume are we writing to? (?host=, default host if absent)
+	vh, ok := h.resolveVolumeHost(w, r)
+	if !ok {
+		return
+	}
+
+	managed, err := h.volumeIsManaged(ctx, vh.Docker, name)
 	if err != nil {
 		logctx.FromContext(ctx).WithError(err).Error("check volume managed")
 		writeError(w, "failed to verify volume", http.StatusInternalServerError)
@@ -3612,7 +3629,7 @@ func (h *Handler) WriteVolumeFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeErr := h.VolumeBrowser.WriteFile(ctx, name, reqPath, mode, bytes.NewReader(buf), int64(len(buf)))
+	writeErr := vh.Browse.WriteFile(ctx, name, reqPath, mode, bytes.NewReader(buf), int64(len(buf)))
 
 	entry := audit.FromRequest(r, store.AuditOpVolumeWrite)
 	entry.ResourceType = "volume"
@@ -3621,6 +3638,7 @@ func (h *Handler) WriteVolumeFile(w http.ResponseWriter, r *http.Request) {
 		"path":       reqPath,
 		"size_bytes": strconv.Itoa(len(buf)),
 		"mode":       fmt.Sprintf("0%o", mode),
+		"host":       vh.Name,
 	}
 	if writeErr != nil {
 		entry.Outcome = store.AuditOutcomeFailure

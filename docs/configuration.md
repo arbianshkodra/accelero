@@ -295,8 +295,14 @@ An empty `host_id` means the default host, so **existing stacks are unaffected**
 
 **The root resource browsers span every host.** `/images`, `/volumes`, and `/networks` query the default host plus every registered host, and each result carries a `host` field naming where it lives (`default` for the `DOCKER_SOCK` daemon). `?stack=` still narrows as before. If one host is unreachable it's skipped with a logged warning and the rest are returned — you only get a `500` if *every* host fails. The periodic Docker resource cleanup likewise prunes on every host.
 
-!!! note "Volume browse/write is default-host-only"
-    `GET /volumes/{name}/browse` and `POST /volumes/{name}/files` still operate on the **default host**, because the helper container that reads the volume is launched there. Volume names are only unique per host, so allowing a remote name here could silently act on a same-named volume on the default host. Remote volumes therefore appear in `GET /volumes` (tagged with their host) but can't be browsed yet.
+**Volume browse/write is host-aware too.** `GET /volumes/{name}/browse` and `POST /volumes/{name}/files` accept an optional **`?host=`** parameter (a host name or id) selecting which daemon's volume to operate on. Omitting it — or passing `default` — targets the `DOCKER_SOCK` daemon, so existing calls are unchanged.
+
+```bash
+# browse a volume on a remote host
+curl -s "$ACCELERO/api/v1/volumes/pg_data/browse?host=edge-1&path=/" -H "X-API-KEY: $KEY"
+```
+
+The host is **explicit rather than inferred**: volume names are only unique per host, so guessing would risk operating on a same-named volume on the wrong daemon. The "is this volume accelero-managed?" check and the helper container both run on the *selected* host, so a name that exists only on the default host returns `404` when a remote host is named (and vice versa). The host is recorded in the `volume.browse` / `volume.read` / `volume.write` audit entries. Naming a host on a server without multi-host wiring is a `503` rather than a silent fallback.
 
 ## Approval gates
 
