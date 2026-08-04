@@ -268,6 +268,16 @@ func main() {
 			return out, nil
 		},
 		VolumeBrowser:     volumepkg.NewDockerBrowser(cli, ""),
+		// The browse/write helper container must run on the same daemon the
+		// volume lives on, so build a browser per host on demand (cheap — the
+		// underlying client is already cached by the host manager).
+		VolumeBrowserForHost: func(hostID string) (volumepkg.Browser, error) {
+			hostCli, err := hostManager.ClientFor(hostID)
+			if err != nil {
+				return nil, err
+			}
+			return volumepkg.NewDockerBrowser(hostCli, ""), nil
+		},
 		AllowVolumeWrites: cfg.AllowVolumeWrites,
 		EncryptionEnabled: cipher.Enabled(),
 		BackupEncryptor:   backup.NewEncryptor(cfg.BackupEncryptionPassphrase),

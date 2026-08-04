@@ -9,6 +9,7 @@ import (
 	"github.com/arbianshkodra/accelero/internal/audit"
 	"github.com/arbianshkodra/accelero/internal/dockerhost"
 	"github.com/arbianshkodra/accelero/internal/store"
+	volumepkg "github.com/arbianshkodra/accelero/internal/volume"
 	"github.com/gorilla/mux"
 )
 
@@ -154,6 +155,58 @@ func (h *Handler) hostClients() ([]HostClient, error) {
 		return []HostClient{{ID: "", Name: DefaultHostName, Docker: h.Docker}}, nil
 	}
 	return h.DockerHosts()
+}
+
+// volumeHost bundles everything the volume endpoints need for one host: the
+// Docker client (to verify the volume is accelero-managed *there*) and the
+// Browser (whose helper container runs on that host).
+type volumeHost struct {
+	ID     string
+	Name   string
+	Docker DockerClient
+	Browse volumepkg.Browser
+}
+
+// resolveVolumeHost picks the host a volume request targets from the optional
+// `?host=` query parameter (a host name or id; omitted means the default host).
+// It's the mirror of the `host` field returned by GET /volumes, so a client can
+// feed a listing result straight back in.
+//
+// Explicit rather than inferred: volume names are only unique per host, so
+// guessing which daemon the caller meant could operate on the wrong data.
+func (h *Handler) resolveVolumeHost(w http.ResponseWriter, r *http.Request) (volumeHost, bool) {
+	token := strings.TrimSpace(r.URL.Query().Get("host"))
+
+	// Default host — either not specified, or explicitly named "default".
+	if token == "" || token == DefaultHostName {
+		return volumeHost{Name: DefaultHostName, Docker: h.Docker, Browse: h.VolumeBrowser}, true
+	}
+
+	if h.VolumeBrowserForHost == nil || h.DockerForHost == nil {
+		writeError(w, "multi-host volume access is not configured on this server", http.StatusServiceUnavailable)
+		return volumeHost{}, false
+	}
+
+	host, err := h.Store.GetDockerHost(token)
+	if err != nil || host == nil {
+		host, _ = h.Store.GetDockerHostByName(token)
+	}
+	if host == nil {
+		writeError(w, "unknown host: "+token, http.StatusBadRequest)
+		return volumeHost{}, false
+	}
+
+	dkr, err := h.DockerForHost(host.ID)
+	if err != nil {
+		writeError(w, "docker host is unavailable: "+err.Error(), http.StatusBadGateway)
+		return volumeHost{}, false
+	}
+	browser, err := h.VolumeBrowserForHost(host.ID)
+	if err != nil {
+		writeError(w, "docker host is unavailable: "+err.Error(), http.StatusBadGateway)
+		return volumeHost{}, false
+	}
+	return volumeHost{ID: host.ID, Name: host.Name, Docker: dkr, Browse: browser}, true
 }
 
 // resolveHostID maps a caller-supplied host token (id or name) to a canonical

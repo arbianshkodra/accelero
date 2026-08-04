@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/api/types/volume"
 	"github.com/moby/moby/client"
+	volumepkg "github.com/arbianshkodra/accelero/internal/volume"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -221,4 +223,168 @@ func TestHostClients_DefaultOnlyWhenUnwired(t *testing.T) {
 	assert.Equal(t, "", hosts[0].ID)
 	assert.Equal(t, DefaultHostName, hosts[0].Name)
 	assert.Same(t, def, hosts[0].Docker)
+}
+
+// --- host-aware volume browse / write ---------------------------------------
+
+// managedVolumeDocker returns a mockDocker reporting one accelero-managed
+// volume with the given name.
+func managedVolumeDocker(name string) *mockDocker {
+	return &mockDocker{volumeResult: client.VolumeListResult{
+		Items: []volume.Volume{{Name: name, Driver: "local", Labels: map[string]string{
+			containerLabelManagedBy: containerLabelManagedValue,
+		}}},
+	}}
+}
+
+// volumeHostHandler wires a default host and one registered remote host, each
+// with its own docker client and browser.
+func volumeHostHandler(defDocker, remoteDocker *mockDocker, defBr, remoteBr *stubBrowser) *Handler {
+	return &Handler{
+		Store: &mockStore{dockerHosts: []*store.DockerHost{
+			{ID: "h1", Name: "edge-1", Endpoint: "tcp://x:2376"},
+		}},
+		Deployer:      &mockDeployer{},
+		Docker:        defDocker,
+		VolumeBrowser: defBr,
+		DockerForHost: func(hostID string) (DockerClient, error) {
+			if hostID == "h1" {
+				return remoteDocker, nil
+			}
+			return nil, errors.New("unknown host " + hostID)
+		},
+		VolumeBrowserForHost: func(hostID string) (volumepkg.Browser, error) {
+			if hostID == "h1" {
+				return remoteBr, nil
+			}
+			return nil, errors.New("unknown host " + hostID)
+		},
+		AllowVolumeWrites: true,
+	}
+}
+
+// The whole point of this change: ?host= routes the browse to that host's
+// browser, and the "is it managed" check runs on the SAME host.
+func TestBrowseVolume_UsesRequestedHost(t *testing.T) {
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	// The volume exists ONLY on the remote host.
+	h := volumeHostHandler(&mockDocker{}, managedVolumeDocker("shared-name"), defBr, remoteBr)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/shared-name/browse?host=edge-1&path=/data", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Len(t, remoteBr.listCalls, 1, "remote host's browser must be used")
+	assert.Equal(t, "shared-name", remoteBr.listCalls[0].Volume)
+	assert.Equal(t, "/data", remoteBr.listCalls[0].Path)
+	assert.Empty(t, defBr.listCalls, "default host's browser must NOT be used")
+}
+
+// A volume that exists only on the default host must not be reachable by naming
+// a remote host — this is the same-name-different-host trap.
+func TestBrowseVolume_ManagedCheckRunsOnRequestedHost(t *testing.T) {
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	h := volumeHostHandler(managedVolumeDocker("only-local"), &mockDocker{}, defBr, remoteBr)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/only-local/browse?host=edge-1", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code,
+		"a volume present only on the default host is not found on the remote host")
+	assert.Empty(t, remoteBr.listCalls)
+	assert.Empty(t, defBr.listCalls)
+}
+
+func TestBrowseVolume_DefaultHostWhenNoHostParam(t *testing.T) {
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	h := volumeHostHandler(managedVolumeDocker("vol"), &mockDocker{}, defBr, remoteBr)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/vol/browse", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Len(t, defBr.listCalls, 1, "omitting ?host= keeps the pre-existing default-host behaviour")
+	assert.Empty(t, remoteBr.listCalls)
+}
+
+// "default" is accepted explicitly so a client can round-trip the host field
+// from GET /volumes without special-casing.
+func TestBrowseVolume_ExplicitDefaultHostName(t *testing.T) {
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	h := volumeHostHandler(managedVolumeDocker("vol"), &mockDocker{}, defBr, remoteBr)
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/vol/browse?host=default", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Len(t, defBr.listCalls, 1)
+}
+
+func TestBrowseVolume_UnknownHostRejected(t *testing.T) {
+	h := volumeHostHandler(&mockDocker{}, &mockDocker{}, &stubBrowser{}, &stubBrowser{})
+	req := httptest.NewRequest("GET", "/api/v1/volumes/vol/browse?host=ghost", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unknown host")
+}
+
+func TestWriteVolumeFile_UsesRequestedHost(t *testing.T) {
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	h := volumeHostHandler(&mockDocker{}, managedVolumeDocker("cfg"), defBr, remoteBr)
+
+	req := httptest.NewRequest("POST", "/api/v1/volumes/cfg/files?host=edge-1&path=/etc/app.conf",
+		bytes.NewReader([]byte("key=value")))
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Len(t, remoteBr.writeCalls, 1, "write must land on the remote host's browser")
+	assert.Equal(t, "cfg", remoteBr.writeCalls[0].Volume)
+	assert.Equal(t, "/etc/app.conf", remoteBr.writeCalls[0].Path)
+	assert.Equal(t, []byte("key=value"), remoteBr.writeCalls[0].Body)
+	assert.Empty(t, defBr.writeCalls)
+}
+
+// The audit trail must say WHICH daemon was touched.
+func TestVolumeAudit_RecordsHost(t *testing.T) {
+	rec := &captureRecorder{}
+	defBr, remoteBr := &stubBrowser{}, &stubBrowser{}
+	h := volumeHostHandler(&mockDocker{}, managedVolumeDocker("vol"), defBr, remoteBr)
+	h.Audit = rec
+
+	req := httptest.NewRequest("GET", "/api/v1/volumes/vol/browse?host=edge-1", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var found bool
+	for _, e := range rec.entries {
+		if e.Operation == store.AuditOpVolumeBrowse {
+			found = true
+			assert.Equal(t, "edge-1", e.Metadata["host"])
+		}
+	}
+	assert.True(t, found, "volume.browse must be audited with the host")
+}
+
+// Without multi-host wiring, naming a host is refused rather than silently
+// falling back to the default daemon.
+func TestBrowseVolume_RemoteHostWithoutWiringIs503(t *testing.T) {
+	h := &Handler{
+		Store: &mockStore{dockerHosts: []*store.DockerHost{{ID: "h1", Name: "edge-1"}}},
+		Deployer: &mockDeployer{}, Docker: &mockDocker{}, VolumeBrowser: &stubBrowser{},
+		// DockerForHost / VolumeBrowserForHost deliberately nil.
+	}
+	req := httptest.NewRequest("GET", "/api/v1/volumes/vol/browse?host=edge-1", nil)
+	rr := httptest.NewRecorder()
+	apikeyRouter(h).ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	assert.Contains(t, rr.Body.String(), "multi-host volume access is not configured")
 }
